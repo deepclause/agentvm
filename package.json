@@ -1,0 +1,12 @@
+{
+  "name": "agentvm",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test/basic.test.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": ""
+}
