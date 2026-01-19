@@ -16,18 +16,18 @@ The entire project, including network stack and hacks for making host directory 
 ## Installation
 
 ```bash
-npm install agentvm
+npm install deepclause-agentvm
 ```
 
 ## Usage
 
 ```javascript
-const { AgentVM } = require('agentvm');
+const { AgentVM } = require('deepclause-agentvm');
 
 async function main() {
     const vm = new AgentVM({
-        // Path to the provided WASM file (optional if in default location)
-        wasmPath: './agentvm-alpine-python.wasm' 
+        // Path to the VM WASM file (optional, will be installed automatically with npm)
+        // wasmPath: './agentvm-alpine-python.wasm' 
     });
 
     await vm.start();
@@ -44,7 +44,7 @@ main();
 ### With Host Filesystem Mount
 
 ```javascript
-const { AgentVM } = require('agentvm');
+const { AgentVM } = require('deepclause-agentvm');
 
 async function main() {
     const vm = new AgentVM({
@@ -69,7 +69,7 @@ main();
 ### With Networking
 
 ```javascript
-const { AgentVM } = require('agentvm');
+const { AgentVM } = require('deepclause-agentvm');
 
 async function main() {
     const vm = new AgentVM({ network: true }); // network is enabled by default
@@ -89,7 +89,7 @@ main();
 ## API
 
 ### `new AgentVM(options)`
-- `options.wasmPath`: Path to the `agentvm-alpine-python.wasm` file.
+- `options.wasmPath`: Path to the `agentvm-alpine-python.wasm` file. Part of the npm package by default.
 - `options.mounts`: Object mapping VM paths to host paths (e.g., `{ '/mnt/data': './data' }`). Supports reading and writing files from the VM to the host filesystem.
 - `options.network`: Enable networking (default: `true`). Provides full TCP/UDP NAT for internet access.
 - `options.mac`: MAC address for the VM (default: `02:00:00:00:00:01`).

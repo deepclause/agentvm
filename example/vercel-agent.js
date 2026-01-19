@@ -1,4 +1,4 @@
-const { AgentVM } = require('../src/index');
+const { AgentVM } = require('deepclause-agentvm');
 const { generateText, tool } = require('ai');
 const { openai } = require('@ai-sdk/openai'); // Hypothetical usage
 const dotenv = require('dotenv');
@@ -9,7 +9,7 @@ dotenv.config();
 // Note: You need an OPENAI_API_KEY in .env to run this effectively.
 
 async function runAgent() {
-    const vm = new AgentVM({ wasmPath: '../agentvm-alpine-python.wasm' });
+    const vm = new AgentVM({});
     console.log("Booting VM...");
     await vm.start();
     console.log("VM Ready.");
