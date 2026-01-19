@@ -30,21 +30,28 @@ class AgentVM {
         this.isReady = false;
         this.destroyed = false;
         
-        // UDP NAT: Main thread handles UDP sockets, worker polls for responses
+        // NAT: Main thread handles sockets, worker polls for responses via MessageChannel
         this.udpSessions = new Map(); // key -> { socket, lastActive }
-        this.udpChannel = null;
+        this.tcpSessions = new Map(); // key -> { socket, state, ... }
+        this.netChannel = null;
     }
 
     async start() {
         if (this.worker) return;
         
-        // Create MessageChannel for UDP communication
-        this.udpChannel = new MessageChannel();
+        // Create MessageChannel for network communication (UDP + TCP)
+        this.netChannel = new MessageChannel();
         
-        // Handle UDP requests from worker
-        this.udpChannel.port2.on('message', (msg) => {
+        // Handle network requests from worker
+        this.netChannel.port2.on('message', (msg) => {
             if (msg.type === 'udp-send') {
                 this._handleUdpSend(msg);
+            } else if (msg.type === 'tcp-connect') {
+                this._handleTcpConnect(msg);
+            } else if (msg.type === 'tcp-send') {
+                this._handleTcpSend(msg);
+            } else if (msg.type === 'tcp-close') {
+                this._handleTcpClose(msg);
             }
         });
 
@@ -56,9 +63,9 @@ class AgentVM {
                     sharedInputBuffer: this.sharedBuffer,
                     network: this.network,
                     mac: this.mac,
-                    udpPort: this.udpChannel.port1
+                    netPort: this.netChannel.port1
                 },
-                transferList: [this.udpChannel.port1]
+                transferList: [this.netChannel.port1]
             });
 
             this.worker.on('message', (msg) => {
@@ -113,10 +120,18 @@ class AgentVM {
         }
         this.udpSessions.clear();
         
-        // Close UDP channel
-        if (this.udpChannel) {
-            this.udpChannel.port2.close();
-            this.udpChannel = null;
+        // Close all TCP sockets
+        for (const [key, session] of this.tcpSessions) {
+            try {
+                session.socket.destroy();
+            } catch (e) {}
+        }
+        this.tcpSessions.clear();
+        
+        // Close network channel
+        if (this.netChannel) {
+            this.netChannel.port2.close();
+            this.netChannel = null;
         }
         
         if (this.worker) {
@@ -140,7 +155,7 @@ class AgentVM {
             
             socket.on('message', (data, rinfo) => {
                 // Send response back to worker
-                this.udpChannel.port2.postMessage({
+                this.netChannel.port2.postMessage({
                     type: 'udp-recv',
                     key,
                     data: Array.from(data),
@@ -161,6 +176,93 @@ class AgentVM {
         session.lastActive = Date.now();
         const payloadBuf = Buffer.from(payload);
         session.socket.send(payloadBuf, dstPort, dstIP);
+    }
+    
+    /**
+     * Handle TCP connect request from worker
+     * @private
+     */
+    _handleTcpConnect(msg) {
+        const { key, dstIP, dstPort, srcIP, srcPort } = msg;
+        const net = require('net');
+        
+        const socket = new net.Socket();
+        const session = { socket, srcIP, srcPort, dstIP, dstPort };
+        this.tcpSessions.set(key, session);
+        
+        socket.connect(dstPort, dstIP, () => {
+            if (!this.netChannel) return;
+            this.netChannel.port2.postMessage({
+                type: 'tcp-connected',
+                key
+            });
+        });
+        
+        socket.on('data', (data) => {
+            if (!this.netChannel) return;
+            this.netChannel.port2.postMessage({
+                type: 'tcp-data',
+                key,
+                data: Array.from(data)
+            });
+        });
+        
+        socket.on('end', () => {
+            if (!this.netChannel) return;
+            this.netChannel.port2.postMessage({
+                type: 'tcp-end',
+                key
+            });
+        });
+        
+        socket.on('close', () => {
+            if (this.netChannel) {
+                this.netChannel.port2.postMessage({
+                    type: 'tcp-close',
+                    key
+                });
+            }
+            this.tcpSessions.delete(key);
+        });
+        
+        socket.on('error', (err) => {
+            if (this.netChannel) {
+                this.netChannel.port2.postMessage({
+                    type: 'tcp-error',
+                    key,
+                    error: err.message
+                });
+            }
+            this.tcpSessions.delete(key);
+        });
+    }
+    
+    /**
+     * Handle TCP send request from worker
+     * @private
+     */
+    _handleTcpSend(msg) {
+        const { key, data } = msg;
+        const session = this.tcpSessions.get(key);
+        if (session && session.socket.writable) {
+            session.socket.write(Buffer.from(data));
+        }
+    }
+    
+    /**
+     * Handle TCP close request from worker
+     * @private
+     */
+    _handleTcpClose(msg) {
+        const { key, destroy } = msg;
+        const session = this.tcpSessions.get(key);
+        if (session) {
+            if (destroy) {
+                session.socket.destroy();
+            } else {
+                session.socket.end();
+            }
+        }
     }
 
     /**

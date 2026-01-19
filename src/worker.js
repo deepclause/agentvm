@@ -3,7 +3,7 @@ const { WASI } = require('node:wasi');
 const fs = require('node:fs');
 const { NetworkStack } = require('./network');
 
-const { wasmPath, sharedInputBuffer, mounts, network, mac, udpPort } = workerData;
+const { wasmPath, sharedInputBuffer, mounts, network, mac, netPort } = workerData;
 const inputInt32 = new Int32Array(sharedInputBuffer);
 const INPUT_FLAG_INDEX = 0;
 const INPUT_SIZE_INDEX = 1;
@@ -14,8 +14,8 @@ let localBuffer = new Uint8Array(0);
 // Buffer for sock_recv to handle partial reads
 let sockRecvBuffer = Buffer.alloc(0);
 
-// Initialize Network Stack with UDP port for main-thread communication
-const netStack = new NetworkStack({ udpPort });
+// Initialize Network Stack with net port for main-thread communication
+const netStack = new NetworkStack({ netPort });
 const NET_FD = 3; // Standard for LISTEN_FDS=1 (listening socket)
 const NET_CONN_FD = 4; // Connected socket for actual I/O
 let netConnectionAccepted = false;
@@ -298,8 +298,8 @@ async function start() {
                      Atomics.wait(inputInt32, INPUT_FLAG_INDEX, 0, waitChunk);
                      remaining -= waitChunk;
                      
-                     // Poll for UDP responses from main thread (synchronous)
-                     netStack.pollUdpResponses();
+                     // Poll for network responses from main thread (synchronous)
+                     netStack.pollNetResponses();
                      
                      // Check if stdin became available
                      if (Atomics.load(inputInt32, INPUT_FLAG_INDEX) !== 0) break;

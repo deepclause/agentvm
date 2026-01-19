@@ -40,10 +40,10 @@ class NetworkStack extends EventEmitter {
         this.gatewayMac = options.gatewayMac || Buffer.from([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xdd]);
         this.vmMac = Buffer.from([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]); // Default VM MAC
         
-        this.natTable = new Map(); // key -> { ... } (for TCP state, UDP doesn't need local state)
+        this.natTable = new Map(); // key -> { state, mySeq, myAck, ... } for TCP state tracking
         
-        // UDP is handled by main thread via MessagePort
-        this.udpPort = options.udpPort || null;
+        // Network I/O is handled by main thread via MessagePort
+        this.netPort = options.netPort || null;
         
         // QEMU Framing Buffer
         this.txBuffer = Buffer.alloc(0); // Data sending TO the VM (queued)
@@ -51,19 +51,30 @@ class NetworkStack extends EventEmitter {
     }
     
     /**
-     * Poll for UDP responses from main thread (synchronous)
-     * Call this during poll_oneoff to check for incoming UDP data
+     * Poll for network responses from main thread (synchronous)
+     * Call this during poll_oneoff to check for incoming data
      */
-    pollUdpResponses() {
-        if (!this.udpPort) return;
+    pollNetResponses() {
+        if (!this.netPort) return;
         
         const { receiveMessageOnPort } = require('node:worker_threads');
         
-        // Check for pending UDP messages
+        // Check for pending messages
         let msg;
-        while ((msg = receiveMessageOnPort(this.udpPort))) {
-            if (msg.message.type === 'udp-recv') {
-                this._handleUdpResponse(msg.message);
+        while ((msg = receiveMessageOnPort(this.netPort))) {
+            const m = msg.message;
+            if (m.type === 'udp-recv') {
+                this._handleUdpResponse(m);
+            } else if (m.type === 'tcp-connected') {
+                this._handleTcpConnected(m);
+            } else if (m.type === 'tcp-data') {
+                this._handleTcpData(m);
+            } else if (m.type === 'tcp-end') {
+                this._handleTcpEnd(m);
+            } else if (m.type === 'tcp-error') {
+                this._handleTcpError(m);
+            } else if (m.type === 'tcp-close') {
+                this._handleTcpClosed(m);
             }
         }
     }
@@ -75,8 +86,6 @@ class NetworkStack extends EventEmitter {
     _handleUdpResponse(msg) {
         const { data, srcIP, srcPort, dstIP, dstPort } = msg;
         
-        // this.emit('debug', `[UDP RX] Got ${data.length} bytes for ${srcIP}:${srcPort}`);
-        
         // Build UDP response packet
         const udpHeader = Buffer.alloc(8);
         udpHeader.writeUInt16BE(dstPort, 0); // src port (from external server)
@@ -87,11 +96,82 @@ class NetworkStack extends EventEmitter {
         const payload = Buffer.concat([udpHeader, Buffer.from(data)]);
         
         // Send IP packet back to VM
-        // dstIP becomes src (external server), srcIP becomes dst (VM)
         const dstIPBuf = Buffer.from(dstIP.split('.').map(Number));
         const srcIPBuf = Buffer.from(srcIP.split('.').map(Number));
         
         this.sendIP(payload, IP_PROTO_UDP, dstIPBuf, srcIPBuf);
+    }
+    
+    /**
+     * Handle TCP connected event from main thread
+     * @private
+     */
+    _handleTcpConnected(msg) {
+        const { key } = msg;
+        const session = this.natTable.get(key);
+        if (!session) return;
+        
+        session.state = 'ESTABLISHED';
+        // Send SYN-ACK to VM
+        this.sendTCP(session.srcIP, session.srcPort, session.dstIP, session.dstPort, 
+                     session.mySeq, session.myAck, 0x12); // SYN | ACK
+        session.mySeq++;
+    }
+    
+    /**
+     * Handle TCP data from main thread
+     * @private
+     */
+    _handleTcpData(msg) {
+        const { key, data } = msg;
+        const session = this.natTable.get(key);
+        if (!session) return;
+        
+        const payload = Buffer.from(data);
+        // Send PSH-ACK to VM
+        this.sendTCP(session.srcIP, session.srcPort, session.dstIP, session.dstPort,
+                     session.mySeq, session.myAck, 0x18, payload); // PSH | ACK
+        session.mySeq += payload.length;
+    }
+    
+    /**
+     * Handle TCP end (FIN from remote) from main thread
+     * @private
+     */
+    _handleTcpEnd(msg) {
+        const { key } = msg;
+        const session = this.natTable.get(key);
+        if (!session) return;
+        
+        // Send FIN-ACK to VM
+        this.sendTCP(session.srcIP, session.srcPort, session.dstIP, session.dstPort,
+                     session.mySeq, session.myAck, 0x11); // FIN | ACK
+        session.mySeq++;
+        session.state = 'FIN_WAIT';
+    }
+    
+    /**
+     * Handle TCP error from main thread
+     * @private
+     */
+    _handleTcpError(msg) {
+        const { key } = msg;
+        const session = this.natTable.get(key);
+        if (!session) return;
+        
+        // Send RST to VM
+        this.sendTCP(session.srcIP, session.srcPort, session.dstIP, session.dstPort,
+                     session.mySeq, session.myAck, 0x04); // RST
+        this.natTable.delete(key);
+    }
+    
+    /**
+     * Handle TCP connection closed from main thread
+     * @private
+     */
+    _handleTcpClosed(msg) {
+        const { key } = msg;
+        this.natTable.delete(key);
     }
 
     // Called when VM writes data to the network interface (FD 3)
@@ -292,7 +372,6 @@ class NetworkStack extends EventEmitter {
     }
     
     handleTCP(segment, srcIP, dstIP, fullIPPacket) {
-        const net = require('net');
         const srcPort = segment.readUInt16BE(0);
         const dstPort = segment.readUInt16BE(2);
         const seq = segment.readUInt32BE(4);
@@ -312,18 +391,23 @@ class NetworkStack extends EventEmitter {
 
         if (RST) {
             if (session) {
-                session.socket.destroy();
+                // Tell main thread to destroy the socket
+                if (this.netPort) {
+                    this.netPort.postMessage({ type: 'tcp-close', key, destroy: true });
+                }
                 this.natTable.delete(key);
             }
             return;
         }
 
         if (SYN && !session) {
-            // New Connection
-            const socket = new net.Socket();
+            // New Connection - create session state and tell main thread to connect
             session = { 
-                socket, 
                 state: 'SYN_SENT', 
+                srcIP: Buffer.from(srcIP),
+                srcPort,
+                dstIP: Buffer.from(dstIP),
+                dstPort,
                 vmSeq: seq, 
                 vmAck: ack,
                 mySeq: Math.floor(Math.random() * 0xFFFFFFF),
@@ -331,59 +415,53 @@ class NetworkStack extends EventEmitter {
             };
             this.natTable.set(key, session);
             
-            socket.connect(dstPort, dstIP.join('.'), () => {
-                session.state = 'ESTABLISHED';
-                // Send SYN-ACK
-                this.sendTCP(srcIP, srcPort, dstIP, dstPort, session.mySeq, session.myAck, 0x12); // SYN | ACK
-                session.mySeq++;
-            });
-            
-            socket.on('data', (data) => {
-                // Send PSH-ACK
-                this.sendTCP(srcIP, srcPort, dstIP, dstPort, session.mySeq, session.myAck, 0x18, data); // PSH | ACK
-                session.mySeq += data.length;
-            });
-            
-            socket.on('end', () => {
-                this.sendTCP(srcIP, srcPort, dstIP, dstPort, session.mySeq, session.myAck, 0x11); // FIN | ACK
-                session.mySeq++;
-            });
-            
-            socket.on('error', (err) => {
-                this.sendTCP(srcIP, srcPort, dstIP, dstPort, session.mySeq, session.myAck, 0x04); // RST
-                this.natTable.delete(key);
-            });
-            
+            // Request connection via main thread
+            if (this.netPort) {
+                this.netPort.postMessage({
+                    type: 'tcp-connect',
+                    key,
+                    dstIP: dstIP.join('.'),
+                    dstPort,
+                    srcIP: srcIP.join('.'),
+                    srcPort
+                });
+            }
             return;
         }
 
         if (!session) {
-            // Unknown session, send RST?
-            // Or maybe it's a retransmit?
+            // Unknown session, send RST
             if (!SYN) {
                  this.sendTCP(srcIP, srcPort, dstIP, dstPort, 0, seq + (payload.length || 1), 0x04);
             }
             return;
         }
 
-        // Update ACK tracking
-        if (ACK) {
-             // session.mySeq = ack; // ?
-        }
-        
-        // Handle Data
+        // Handle Data from VM
         if (payload.length > 0) {
-            session.socket.write(payload);
+            // Forward data to main thread
+            if (this.netPort) {
+                this.netPort.postMessage({
+                    type: 'tcp-send',
+                    key,
+                    data: Array.from(payload)
+                });
+            }
             session.vmSeq += payload.length;
-            session.myAck += payload.length; // We acknowledge their data
-            // Send ACK
-            this.sendTCP(srcIP, srcPort, dstIP, dstPort, session.mySeq, session.myAck, 0x10); // ACK
+            session.myAck += payload.length;
+            // Send ACK back to VM
+            this.sendTCP(session.srcIP, session.srcPort, session.dstIP, session.dstPort, 
+                         session.mySeq, session.myAck, 0x10); // ACK
         }
         
         if (FIN) {
-            session.socket.end();
+            // Tell main thread to close the connection
+            if (this.netPort) {
+                this.netPort.postMessage({ type: 'tcp-close', key, destroy: false });
+            }
             session.myAck++;
-            this.sendTCP(srcIP, srcPort, dstIP, dstPort, session.mySeq, session.myAck, 0x10); // ACK
+            this.sendTCP(session.srcIP, session.srcPort, session.dstIP, session.dstPort,
+                         session.mySeq, session.myAck, 0x10); // ACK
         }
     }
 
@@ -428,11 +506,11 @@ class NetworkStack extends EventEmitter {
         }
         
         // Send UDP via main thread (which has access to event loop for async responses)
-        if (this.udpPort) {
+        if (this.netPort) {
             const key = `UDP:${srcIP.join('.')}:${srcPort}:${dstIP.join('.')}:${dstPort}`;
             // this.emit('debug', `[UDP NAT] Sending ${payload.length} bytes to ${dstIP.join('.')}:${dstPort} via main thread`);
             
-            this.udpPort.postMessage({
+            this.netPort.postMessage({
                 type: 'udp-send',
                 key,
                 dstIP: dstIP.join('.'),
