@@ -8,5 +8,10 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": ""
+  "description": "",
+  "devDependencies": {
+    "@ai-sdk/openai": "^3.0.12",
+    "ai": "^6.0.39",
+    "dotenv": "^17.2.3"
+  }
 }

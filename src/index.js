@@ -1,6 +1,7 @@
-const { Worker } = require('node:worker_threads');
+const { Worker, MessageChannel } = require('node:worker_threads');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
+const dgram = require('node:dgram');
 
 // Buffer layout:
 // Int32[0]: Flag (0 = Free/Empty, 1 = Data Ready)
@@ -12,10 +13,14 @@ class AgentVM {
     /**
      * @param {Object} options
      * @param {string} [options.wasmPath] - Path to the .wasm file.
+     * @param {boolean} [options.network] - Enable networking (default: true).
+     * @param {string} [options.mac] - MAC address for the VM (default: 02:00:00:00:00:01).
      */
     constructor(options = {}) {
         this.wasmPath = options.wasmPath || path.resolve(__dirname, '../agentvm-alpine-python.wasm');
         this.mounts = options.mounts || {};
+        this.network = options.network !== false; // Default to true
+        this.mac = options.mac || '02:00:00:00:00:01';
         this.sharedBuffer = new SharedArrayBuffer(SHARED_BUFFER_SIZE);
         this.inputInt32 = new Int32Array(this.sharedBuffer);
         this.inputData = new Uint8Array(this.sharedBuffer, 8);
@@ -24,18 +29,36 @@ class AgentVM {
         this.pendingCommand = null; // { resolve, reject, marker, outputStr, stderrStr }
         this.isReady = false;
         this.destroyed = false;
+        
+        // UDP NAT: Main thread handles UDP sockets, worker polls for responses
+        this.udpSessions = new Map(); // key -> { socket, lastActive }
+        this.udpChannel = null;
     }
 
     async start() {
         if (this.worker) return;
+        
+        // Create MessageChannel for UDP communication
+        this.udpChannel = new MessageChannel();
+        
+        // Handle UDP requests from worker
+        this.udpChannel.port2.on('message', (msg) => {
+            if (msg.type === 'udp-send') {
+                this._handleUdpSend(msg);
+            }
+        });
 
         return new Promise((resolve, reject) => {
             this.worker = new Worker(path.join(__dirname, 'worker.js'), {
                 workerData: {
                     wasmPath: this.wasmPath,
                     mounts: this.mounts,
-                    sharedInputBuffer: this.sharedBuffer
-                }
+                    sharedInputBuffer: this.sharedBuffer,
+                    network: this.network,
+                    mac: this.mac,
+                    udpPort: this.udpChannel.port1
+                },
+                transferList: [this.udpChannel.port1]
             });
 
             this.worker.on('message', (msg) => {
@@ -81,10 +104,63 @@ class AgentVM {
 
     async stop() {
         this.destroyed = true;
+        
+        // Close all UDP sockets
+        for (const [key, session] of this.udpSessions) {
+            try {
+                session.socket.close();
+            } catch (e) {}
+        }
+        this.udpSessions.clear();
+        
+        // Close UDP channel
+        if (this.udpChannel) {
+            this.udpChannel.port2.close();
+            this.udpChannel = null;
+        }
+        
         if (this.worker) {
             await this.worker.terminate();
             this.worker = null;
         }
+    }
+    
+    /**
+     * Handle UDP send request from worker
+     * @private
+     */
+    _handleUdpSend(msg) {
+        const { key, dstIP, dstPort, payload, srcIP, srcPort } = msg;
+        
+        let session = this.udpSessions.get(key);
+        if (!session) {
+            const socket = dgram.createSocket('udp4');
+            session = { socket, lastActive: Date.now(), srcIP, srcPort, dstIP, dstPort };
+            this.udpSessions.set(key, session);
+            
+            socket.on('message', (data, rinfo) => {
+                // Send response back to worker
+                this.udpChannel.port2.postMessage({
+                    type: 'udp-recv',
+                    key,
+                    data: Array.from(data),
+                    fromIP: rinfo.address,
+                    fromPort: rinfo.port,
+                    srcIP,
+                    srcPort,
+                    dstIP,
+                    dstPort
+                });
+            });
+            
+            socket.on('error', (err) => {
+                console.error(`UDP socket error for ${key}:`, err.message);
+            });
+        }
+        
+        session.lastActive = Date.now();
+        const payloadBuf = Buffer.from(payload);
+        session.socket.send(payloadBuf, dstPort, dstIP);
     }
 
     /**
