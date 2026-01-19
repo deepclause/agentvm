@@ -34,7 +34,9 @@ main();
 
 ### `new AgentVM(options)`
 - `options.wasmPath`: Path to the `agentvm-alpine-python.wasm` file.
-- `options.mounts`: Object mapping VM paths to host paths (e.g., `{ '/mnt/data': './data' }`).
+- `options.mounts`: Object mapping VM paths to host paths (e.g., `{ '/mnt/data': './data' }`). **Note:** Directory mounts are currently not working due to a compatibility issue between Node.js WASI and the c2w virtio-9p driver.
+- `options.network`: Enable networking (default: `true`). Provides full TCP/UDP NAT for internet access.
+- `options.mac`: MAC address for the VM (default: `02:00:00:00:00:01`).
 
 ### `vm.start()`
 Starts the VM worker. Returns a Promise.
@@ -45,6 +47,13 @@ Executes a shell command.
 
 ### `vm.stop()`
 Terminates the VM.
+
+## Features
+
+- **Full Linux VM**: Runs Alpine Linux with Python in a WASM-based emulator
+- **Networking**: Built-in DHCP, DNS, and TCP/UDP NAT for internet access
+- **Command Execution**: Execute shell commands and capture stdout/stderr
+- **Worker Thread**: Runs in a separate thread to avoid blocking the main event loop
 
 ## Vercel AI SDK Example
 

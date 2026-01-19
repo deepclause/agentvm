@@ -78,14 +78,521 @@ async function start() {
     
     // parentPort.postMessage({ type: 'debug', msg: `WASI args: ${wasiArgs.join(' ')}` });
     
+    // Store preopens for our custom path_open implementation
+    const preopenPaths = mounts || {};
+    // Map wasi fd to host path (fd 3 onwards)
+    const fdToHostPath = new Map();
+    let preopen_fd = 3;
+    for (const [wasiPath, hostPath] of Object.entries(preopenPaths)) {
+        fdToHostPath.set(preopen_fd, { wasiPath, hostPath: require('path').resolve(hostPath) });
+        preopen_fd++;
+    }
+    
     const wasi = new WASI({
         version: 'preview1',
         args: wasiArgs,
         env: { 'TERM': 'xterm-256color', 'LISTEN_FDS': '1' },
-        preopens: mounts || {} 
+        preopens: preopenPaths 
     });
 
     const wasiImport = wasi.wasiImport;
+    
+    // Track next available fd for our fake duplicates and custom file handles
+    let nextFakeFd = 100; // Start high to avoid conflicts
+    const fakeFdMap = new Map(); // fake fd -> original fd (for directory duplicates)
+    const customFdHandles = new Map(); // fd -> {type: 'file', handle: fs.FileHandle, hostPath: string}
+    
+    // Fix for path_open: Node.js WASI has multiple bugs with preopened directories
+    // We implement our own file opening for preopened directory contents
+    const origPathOpen = wasiImport.path_open;
+    wasiImport.path_open = (fd, dirflags, path_ptr, path_len, oflags, fs_rights_base, fs_rights_inheriting, fdflags, opened_fd_ptr) => {
+        // Get the path string
+        let pathStr = '';
+        if (instance) {
+            const mem = new Uint8Array(instance.exports.memory.buffer);
+            const pathBytes = mem.slice(path_ptr, path_ptr + path_len);
+            pathStr = new TextDecoder().decode(pathBytes);
+        }
+        
+        // Resolve fake fd to real fd for the base directory
+        let actualFd = fakeFdMap.has(fd) ? fakeFdMap.get(fd) : fd;
+        
+        // Check if this is a preopened directory
+        const preopenInfo = fdToHostPath.get(actualFd);
+        
+        // Fix: Node.js WASI doesn't handle path_open(fd, ".") properly for preopens
+        if (pathStr === '.' && (oflags & 0x2) !== 0 && preopenInfo) {
+            const fakeFd = nextFakeFd++;
+            fakeFdMap.set(fakeFd, actualFd);
+            if (instance) {
+                const view = new DataView(instance.exports.memory.buffer);
+                view.setUint32(opened_fd_ptr, fakeFd, true);
+            }
+            if (process.env.DEBUG_WASI_PATH === '1') {
+                parentPort.postMessage({ 
+                    type: 'debug', 
+                    msg: `WASI path_open(fd=${fd}, path=".") => 0 (faked as fd ${fakeFd})` 
+                });
+            }
+            return 0;
+        }
+        
+        // For files inside preopened directories, implement our own file opening
+        // because Node.js WASI has bugs with 64-bit rights validation
+        if (preopenInfo && pathStr !== '.' && (oflags & 0x2) === 0) {
+            // This is trying to open a file (not a directory) inside a preopen
+            const hostFilePath = require('path').join(preopenInfo.hostPath, pathStr);
+            
+            // WASI oflags
+            const O_CREAT = 1, O_DIRECTORY = 2, O_EXCL = 4, O_TRUNC = 8;
+            // WASI fdflags
+            const FDFLAG_APPEND = 1, FDFLAG_DSYNC = 2, FDFLAG_NONBLOCK = 4, FDFLAG_RSYNC = 8, FDFLAG_SYNC = 16;
+            
+            try {
+                let fileExists = false;
+                let stat = null;
+                try {
+                    stat = fs.statSync(hostFilePath);
+                    fileExists = true;
+                } catch (err) {
+                    if (err.code !== 'ENOENT') throw err;
+                }
+                
+                // Handle O_EXCL: fail if file exists
+                if ((oflags & O_EXCL) && fileExists) {
+                    return 20; // WASI_ERRNO_EXIST
+                }
+                
+                // Handle no O_CREAT and file doesn't exist
+                if (!(oflags & O_CREAT) && !fileExists) {
+                    return 44; // WASI_ERRNO_NOENT
+                }
+                
+                // Determine open flags
+                let fsFlags = 'r'; // Default read-only
+                
+                if (oflags & O_CREAT) {
+                    if (oflags & O_TRUNC) {
+                        fsFlags = 'w+'; // Create/truncate, read/write
+                    } else if (fileExists) {
+                        fsFlags = 'r+'; // Existing file, read/write
+                    } else {
+                        fsFlags = 'w+'; // Create new, read/write
+                    }
+                } else if (oflags & O_TRUNC) {
+                    fsFlags = 'r+'; // Truncate existing (we'll truncate separately)
+                }
+                
+                if (fdflags & FDFLAG_APPEND) {
+                    fsFlags = fileExists ? 'a+' : 'a+'; // Append mode
+                }
+                
+                // Open the file synchronously
+                const nodeFd = fs.openSync(hostFilePath, fsFlags);
+                
+                // Handle O_TRUNC separately to ensure truncation
+                if ((oflags & O_TRUNC) && fileExists) {
+                    fs.ftruncateSync(nodeFd, 0);
+                }
+                
+                // Get stat if we didn't already
+                if (!stat) {
+                    stat = fs.fstatSync(nodeFd);
+                }
+                
+                // Map to our custom fd space
+                const newFd = nextFakeFd++;
+                customFdHandles.set(newFd, { 
+                    type: 'file', 
+                    nodeFd, 
+                    hostPath: hostFilePath,
+                    stat
+                });
+                
+                if (instance) {
+                    const view = new DataView(instance.exports.memory.buffer);
+                    view.setUint32(opened_fd_ptr, newFd, true);
+                }
+                
+                if (process.env.DEBUG_WASI_PATH === '1') {
+                    parentPort.postMessage({ 
+                        type: 'debug', 
+                        msg: `WASI path_open CUSTOM: fd=${fd}, path="${pathStr}" => 0 (custom fd ${newFd}, nodeFd=${nodeFd})` 
+                    });
+                }
+                return 0; // Success
+                
+            } catch (err) {
+                if (process.env.DEBUG_WASI_PATH === '1') {
+                    parentPort.postMessage({ 
+                        type: 'debug', 
+                        msg: `WASI path_open CUSTOM FAIL: fd=${fd}, path="${pathStr}" => ${err.message}` 
+                    });
+                }
+                // Map Node.js errors to WASI errors
+                if (err.code === 'ENOENT') return 44; // WASI_ERRNO_NOENT
+                if (err.code === 'EACCES') return 2;  // WASI_ERRNO_ACCES
+                if (err.code === 'EISDIR') return 31; // WASI_ERRNO_ISDIR
+                return 28; // WASI_ERRNO_INVAL
+            }
+        }
+        
+        // Fallback to original implementation for non-preopens
+        const ALL_RIGHTS = 0x1FFFFFFF;
+        let fixedBase = (actualFd >= 3) ? ALL_RIGHTS : fs_rights_base;
+        let fixedInheriting = (actualFd >= 3) ? ALL_RIGHTS : fs_rights_inheriting;
+        let fixedFdflags = fdflags;
+        
+        // Fix O_NONBLOCK on directories
+        if ((oflags & 0x2) !== 0 && (fdflags & 0x4) !== 0) {
+            fixedFdflags = fdflags & ~0x4;
+        }
+        
+        if (process.env.DEBUG_WASI_PATH === '1') {
+            parentPort.postMessage({ 
+                type: 'debug', 
+                msg: `WASI path_open NATIVE: fd=${actualFd}, dirflags=${dirflags}, path="${pathStr}", oflags=${oflags}` 
+            });
+        }
+        
+        const result = origPathOpen(actualFd, dirflags, path_ptr, path_len, oflags, fixedBase, fixedInheriting, fixedFdflags, opened_fd_ptr);
+        
+        if (process.env.DEBUG_WASI_PATH === '1') {
+            let openedFd = -1;
+            if (result === 0 && instance) {
+                const view = new DataView(instance.exports.memory.buffer);
+                openedFd = view.getUint32(opened_fd_ptr, true);
+            }
+            parentPort.postMessage({ 
+                type: 'debug', 
+                msg: `WASI path_open NATIVE RESULT: ${result}, opened_fd=${openedFd}` 
+            });
+        }
+        
+        return result;
+    };
+    
+    // Custom fd_read for our file handles
+    const origFdRead = wasiImport.fd_read;
+    wasiImport.fd_read = (fd, iovs_ptr, iovs_len, nread_ptr) => {
+        // Check if this is one of our custom file handles
+        if (customFdHandles.has(fd)) {
+            const handle = customFdHandles.get(fd);
+            if (!instance) return 8; // WASI_ERRNO_BADF
+            
+            const view = new DataView(instance.exports.memory.buffer);
+            const mem = new Uint8Array(instance.exports.memory.buffer);
+            
+            let totalRead = 0;
+            for (let i = 0; i < iovs_len; i++) {
+                const buf_ptr = view.getUint32(iovs_ptr + i * 8, true);
+                const buf_len = view.getUint32(iovs_ptr + i * 8 + 4, true);
+                
+                try {
+                    const buffer = Buffer.alloc(buf_len);
+                    const bytesRead = fs.readSync(handle.nodeFd, buffer, 0, buf_len, null);
+                    
+                    // Copy to WASM memory
+                    for (let j = 0; j < bytesRead; j++) {
+                        mem[buf_ptr + j] = buffer[j];
+                    }
+                    totalRead += bytesRead;
+                    
+                    if (bytesRead < buf_len) break; // EOF or partial read
+                } catch (err) {
+                    if (process.env.DEBUG_WASI_PATH === '1') {
+                        parentPort.postMessage({ 
+                            type: 'debug', 
+                            msg: `WASI fd_read CUSTOM ERROR: fd=${fd}, err=${err.message}` 
+                        });
+                    }
+                    return 29; // WASI_ERRNO_IO
+                }
+            }
+            
+            view.setUint32(nread_ptr, totalRead, true);
+            
+            if (process.env.DEBUG_WASI_PATH === '1') {
+                parentPort.postMessage({ 
+                    type: 'debug', 
+                    msg: `WASI fd_read CUSTOM: fd=${fd}, read ${totalRead} bytes` 
+                });
+            }
+            return 0;
+        }
+        
+        // Handle fake directory fds
+        if (fakeFdMap.has(fd)) {
+            return origFdRead(fakeFdMap.get(fd), iovs_ptr, iovs_len, nread_ptr);
+        }
+        
+        return origFdRead(fd, iovs_ptr, iovs_len, nread_ptr);
+    };
+    
+    // Custom fd_pread (positioned read) for our file handles
+    const origFdPread = wasiImport.fd_pread;
+    wasiImport.fd_pread = (fd, iovs_ptr, iovs_len, offset, nread_ptr) => {
+        // Check if this is one of our custom file handles
+        if (customFdHandles.has(fd)) {
+            const handle = customFdHandles.get(fd);
+            if (!instance) return 8; // WASI_ERRNO_BADF
+            
+            const view = new DataView(instance.exports.memory.buffer);
+            const mem = new Uint8Array(instance.exports.memory.buffer);
+            
+            // offset comes as a BigInt in WASI
+            const fileOffset = typeof offset === 'bigint' ? Number(offset) : offset;
+            let currentOffset = fileOffset;
+            let totalRead = 0;
+            
+            for (let i = 0; i < iovs_len; i++) {
+                const buf_ptr = view.getUint32(iovs_ptr + i * 8, true);
+                const buf_len = view.getUint32(iovs_ptr + i * 8 + 4, true);
+                
+                try {
+                    const buffer = Buffer.alloc(buf_len);
+                    const bytesRead = fs.readSync(handle.nodeFd, buffer, 0, buf_len, currentOffset);
+                    
+                    // Copy to WASM memory
+                    for (let j = 0; j < bytesRead; j++) {
+                        mem[buf_ptr + j] = buffer[j];
+                    }
+                    totalRead += bytesRead;
+                    currentOffset += bytesRead;
+                    
+                    if (bytesRead < buf_len) break; // EOF or partial read
+                } catch (err) {
+                    if (process.env.DEBUG_WASI_PATH === '1') {
+                        parentPort.postMessage({ 
+                            type: 'debug', 
+                            msg: `WASI fd_pread CUSTOM ERROR: fd=${fd}, offset=${fileOffset}, err=${err.message}` 
+                        });
+                    }
+                    return 29; // WASI_ERRNO_IO
+                }
+            }
+            
+            view.setUint32(nread_ptr, totalRead, true);
+            
+            if (process.env.DEBUG_WASI_PATH === '1') {
+                parentPort.postMessage({ 
+                    type: 'debug', 
+                    msg: `WASI fd_pread CUSTOM: fd=${fd}, offset=${fileOffset}, read ${totalRead} bytes` 
+                });
+            }
+            return 0;
+        }
+        
+        return origFdPread(fd, iovs_ptr, iovs_len, offset, nread_ptr);
+    };
+    
+    // Custom fd_pwrite (positioned write) for our file handles
+    const origFdPwrite = wasiImport.fd_pwrite;
+    wasiImport.fd_pwrite = (fd, iovs_ptr, iovs_len, offset, nwritten_ptr) => {
+        // Check if this is one of our custom file handles
+        if (customFdHandles.has(fd)) {
+            const handle = customFdHandles.get(fd);
+            if (!instance) return 8; // WASI_ERRNO_BADF
+            
+            const view = new DataView(instance.exports.memory.buffer);
+            const mem = new Uint8Array(instance.exports.memory.buffer);
+            
+            const fileOffset = typeof offset === 'bigint' ? Number(offset) : offset;
+            let currentOffset = fileOffset;
+            let totalWritten = 0;
+            
+            for (let i = 0; i < iovs_len; i++) {
+                const buf_ptr = view.getUint32(iovs_ptr + i * 8, true);
+                const buf_len = view.getUint32(iovs_ptr + i * 8 + 4, true);
+                
+                try {
+                    const buffer = Buffer.from(mem.slice(buf_ptr, buf_ptr + buf_len));
+                    const bytesWritten = fs.writeSync(handle.nodeFd, buffer, 0, buf_len, currentOffset);
+                    
+                    totalWritten += bytesWritten;
+                    currentOffset += bytesWritten;
+                } catch (err) {
+                    if (process.env.DEBUG_WASI_PATH === '1') {
+                        parentPort.postMessage({ 
+                            type: 'debug', 
+                            msg: `WASI fd_pwrite CUSTOM ERROR: fd=${fd}, offset=${fileOffset}, err=${err.message}` 
+                        });
+                    }
+                    return 29; // WASI_ERRNO_IO
+                }
+            }
+            
+            view.setUint32(nwritten_ptr, totalWritten, true);
+            
+            if (process.env.DEBUG_WASI_PATH === '1') {
+                parentPort.postMessage({ 
+                    type: 'debug', 
+                    msg: `WASI fd_pwrite CUSTOM: fd=${fd}, offset=${fileOffset}, wrote ${totalWritten} bytes` 
+                });
+            }
+            return 0;
+        }
+        
+        return origFdPwrite(fd, iovs_ptr, iovs_len, offset, nwritten_ptr);
+    };
+    
+    // Custom fd_write for our file handles (uses current position)
+    const origFdWrite_custom = wasiImport.fd_write;
+    wasiImport.fd_write = (fd, iovs_ptr, iovs_len, nwritten_ptr) => {
+        // Check if this is one of our custom file handles
+        if (customFdHandles.has(fd)) {
+            const handle = customFdHandles.get(fd);
+            if (!instance) return 8; // WASI_ERRNO_BADF
+            
+            const view = new DataView(instance.exports.memory.buffer);
+            const mem = new Uint8Array(instance.exports.memory.buffer);
+            
+            let totalWritten = 0;
+            
+            for (let i = 0; i < iovs_len; i++) {
+                const buf_ptr = view.getUint32(iovs_ptr + i * 8, true);
+                const buf_len = view.getUint32(iovs_ptr + i * 8 + 4, true);
+                
+                try {
+                    const buffer = Buffer.from(mem.slice(buf_ptr, buf_ptr + buf_len));
+                    const bytesWritten = fs.writeSync(handle.nodeFd, buffer);
+                    totalWritten += bytesWritten;
+                } catch (err) {
+                    if (process.env.DEBUG_WASI_PATH === '1') {
+                        parentPort.postMessage({ 
+                            type: 'debug', 
+                            msg: `WASI fd_write CUSTOM ERROR: fd=${fd}, err=${err.message}` 
+                        });
+                    }
+                    return 29; // WASI_ERRNO_IO
+                }
+            }
+            
+            view.setUint32(nwritten_ptr, totalWritten, true);
+            
+            if (process.env.DEBUG_WASI_PATH === '1') {
+                parentPort.postMessage({ 
+                    type: 'debug', 
+                    msg: `WASI fd_write CUSTOM: fd=${fd}, wrote ${totalWritten} bytes` 
+                });
+            }
+            return 0;
+        }
+        
+        // Call the original (which handles NET_FD, stdout, stderr)
+        return origFdWrite_custom(fd, iovs_ptr, iovs_len, nwritten_ptr);
+    };
+    
+    // Custom fd_close for our handles
+    const origFdClose = wasiImport.fd_close;
+    wasiImport.fd_close = (fd) => {
+        if (customFdHandles.has(fd)) {
+            const handle = customFdHandles.get(fd);
+            try {
+                fs.closeSync(handle.nodeFd);
+            } catch (err) { /* ignore */ }
+            customFdHandles.delete(fd);
+            return 0;
+        }
+        if (fakeFdMap.has(fd)) {
+            fakeFdMap.delete(fd);
+            return 0;
+        }
+        return origFdClose(fd);
+    };
+    
+    // Intercept fd operations to redirect fake directory fds
+    const wrapFdOp = (name, orig, fdArgIdx = 0) => {
+        return (...args) => {
+            const fd = args[fdArgIdx];
+            if (fakeFdMap.has(fd)) {
+                args[fdArgIdx] = fakeFdMap.get(fd);
+            }
+            return orig(...args);
+        };
+    };
+    
+    // Wrap fd operations to handle our fake directory fds (not fd_read, we handle that above)
+    wasiImport.fd_readdir = wrapFdOp('fd_readdir', wasiImport.fd_readdir);
+    
+    // Wrap fd_fdstat_get for custom file handles and debugging
+    const origFdstatGet = wasiImport.fd_fdstat_get;
+    wasiImport.fd_fdstat_get = (fd, fdstat_ptr) => {
+        // Handle our custom file handles
+        if (customFdHandles.has(fd)) {
+            if (!instance) return 8; // WASI_ERRNO_BADF
+            const view = new DataView(instance.exports.memory.buffer);
+            const handle = customFdHandles.get(fd);
+            
+            // fdstat structure: filetype(1) + padding(1) + flags(2) + padding(4) + rights_base(8) + rights_inh(8) = 24 bytes
+            // filetype: 4 = REGULAR_FILE, 3 = DIRECTORY
+            view.setUint8(fdstat_ptr, 4); // FILETYPE_REGULAR_FILE
+            view.setUint8(fdstat_ptr + 1, 0); // padding
+            view.setUint16(fdstat_ptr + 2, 0, true); // fs_flags
+            view.setUint32(fdstat_ptr + 4, 0, true); // padding
+            // rights_base (full rights for file)
+            view.setUint32(fdstat_ptr + 8, 0x1FFFFFFF, true); // low 32 bits
+            view.setUint32(fdstat_ptr + 12, 0, true); // high 32 bits
+            // rights_inheriting 
+            view.setUint32(fdstat_ptr + 16, 0x1FFFFFFF, true);
+            view.setUint32(fdstat_ptr + 20, 0, true);
+            
+            return 0;
+        }
+        
+        const actualFd = fakeFdMap.has(fd) ? fakeFdMap.get(fd) : fd;
+        const result = origFdstatGet(actualFd, fdstat_ptr);
+        
+        // Debug: show what rights the fd has according to Node.js WASI
+        if (process.env.DEBUG_WASI_PATH === '1' && instance && fd >= 3) {
+            const view = new DataView(instance.exports.memory.buffer);
+            // fdstat structure: filetype(1) + padding(1) + flags(2) + padding(4) + rights_base(8) + rights_inh(8)
+            const filetype = view.getUint8(fdstat_ptr);
+            const flags = view.getUint16(fdstat_ptr + 2, true);
+            // Read 64-bit values as two 32-bit halves
+            const rights_base_lo = view.getUint32(fdstat_ptr + 8, true);
+            const rights_base_hi = view.getUint32(fdstat_ptr + 12, true);
+            const rights_inh_lo = view.getUint32(fdstat_ptr + 16, true);
+            const rights_inh_hi = view.getUint32(fdstat_ptr + 20, true);
+            
+            parentPort.postMessage({ 
+                type: 'debug', 
+                msg: `WASI fd_fdstat_get(fd=${fd}->${actualFd}) => ${result}, filetype=${filetype}, flags=${flags}, rights_base=0x${rights_base_hi.toString(16)}${rights_base_lo.toString(16).padStart(8,'0')}, rights_inh=0x${rights_inh_hi.toString(16)}${rights_inh_lo.toString(16).padStart(8,'0')}` 
+            });
+        }
+        return result;
+    };
+    
+    wasiImport.fd_filestat_get = wrapFdOp('fd_filestat_get', wasiImport.fd_filestat_get);
+    wasiImport.path_filestat_get = wrapFdOp('path_filestat_get', wasiImport.path_filestat_get);
+    
+    // Debug: trace path operations for mount debugging
+    const DEBUG_WASI_PATH = process.env.DEBUG_WASI_PATH === '1';
+    if (DEBUG_WASI_PATH) {
+        const pathOps = ['path_filestat_get', 'fd_readdir', 'fd_prestat_get', 'fd_prestat_dir_name'];
+        for (const op of pathOps) {
+            const orig = wasiImport[op];
+            wasiImport[op] = (...args) => {
+                const result = orig(...args);
+                parentPort.postMessage({ type: 'debug', msg: `WASI ${op}(${args.slice(0,3).join(', ')}) => ${result}` });
+                return result;
+            };
+        }
+        
+        // Debug all fd_* operations to see what cat uses
+        const fdOps = ['fd_read', 'fd_pread', 'fd_seek', 'fd_tell', 'fd_filestat_get', 'fd_fdstat_set_flags'];
+        for (const op of fdOps) {
+            if (!wasiImport[op]) continue;
+            const orig = wasiImport[op];
+            wasiImport[op] = (...args) => {
+                const result = orig(...args);
+                if (args[0] >= 100) { // Our custom fds start at 100
+                    parentPort.postMessage({ type: 'debug', msg: `WASI ${op}(fd=${args[0]}, ...) => ${result}` });
+                }
+                return result;
+            };
+        }
+    }
 
     const originalFdWrite = wasiImport.fd_write;
     wasiImport.fd_write = (fd, iovs_ptr, iovs_len, nwritten_ptr) => {

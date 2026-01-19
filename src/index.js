@@ -13,6 +13,7 @@ class AgentVM {
     /**
      * @param {Object} options
      * @param {string} [options.wasmPath] - Path to the .wasm file.
+     * @param {Object.<string, string>} [options.mounts] - Mount points mapping VM path to host path (e.g., {'/mnt/data': '/host/path'}).
      * @param {boolean} [options.network] - Enable networking (default: true).
      * @param {string} [options.mac] - MAC address for the VM (default: 02:00:00:00:00:01).
      */

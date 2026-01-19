@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "node test/basic.test.js"
+    "test": "node test/basic.test.js && node test/mount.test.js && node test/network/vm.test.js"
   },
   "keywords": [],
   "author": "",
