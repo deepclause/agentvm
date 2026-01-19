@@ -3,6 +3,11 @@
 ## Overview
 AgentVM is a lightweight Node.js library to run a WASM-based Linux virtual machine (specifically `agentvm-alpine-python.wasm`) in a persistent state. It allows sending shell commands to the VM and capturing the output, making it suitable for AI agents to use as a sandboxed environment.
 
+### Key Features
+- **Networking**: Full TCP/UDP NAT with DHCP and DNS support
+- **Host Filesystem Mounts**: Share directories between host and VM
+- **Worker Thread Isolation**: Non-blocking execution in separate thread
+
 ## Architecture
 
 The library uses Node.js `worker_threads` to isolate the blocking WASM execution loop.
@@ -39,7 +44,10 @@ graph TD
 class AgentVM {
   /**
    * @param {Object} options
-   * @param {string} options.wasmPath - Path to the .wasm file
+   * @param {string} [options.wasmPath] - Path to the .wasm file
+   * @param {Object.<string, string>} [options.mounts] - Mount points mapping VM path to host path
+   * @param {boolean} [options.network] - Enable networking (default: true)
+   * @param {string} [options.mac] - MAC address for the VM (default: 02:00:00:00:00:01)
    */
   constructor(options) {}
 

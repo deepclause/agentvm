@@ -73,7 +73,15 @@ class AgentVM {
                 if (msg.type === 'ready') {
                     this.isReady = true;
                     // Run setup commands
-                    this.exec("stty -echo; export PS1=''").then(() => {
+                    this.exec("stty -echo; export PS1=''").then(async () => {
+                         // Auto-setup network if enabled
+                         if (this.network) {
+                             try {
+                                 await this.setupNetwork();
+                             } catch (err) {
+                                 console.warn("Failed to setup network:", err.message);
+                             }
+                         }
                          resolve();
                     }).catch(err => {
                          console.warn("Failed to configure shell:", err);
@@ -108,6 +116,34 @@ class AgentVM {
                 }
             });
         });
+    }
+
+    /**
+     * Sets up the network interface. Called automatically during start() if network is enabled.
+     * Can also be called manually to re-initialize the network.
+     * @returns {Promise<{ip: string, gateway: string}>} Network configuration
+     */
+    async setupNetwork() {
+        if (!this.network) {
+            throw new Error('Network is not enabled');
+        }
+        
+        // Bring up eth0
+        await this.exec('ip link set eth0 up');
+        
+        // Run DHCP client (with timeout to avoid hanging)
+        const dhcpResult = await this.exec('timeout 15 udhcpc -i eth0 -s /sbin/udhcpc.script 2>&1');
+        
+        // Extract IP address
+        const ipMatch = dhcpResult.stdout.match(/lease of ([\d.]+) obtained/);
+        const ip = ipMatch ? ipMatch[1] : null;
+        
+        // Get gateway from routing table
+        const routeResult = await this.exec('ip route | grep default');
+        const gwMatch = routeResult.stdout.match(/via ([\d.]+)/);
+        const gateway = gwMatch ? gwMatch[1] : null;
+        
+        return { ip, gateway };
     }
 
     async stop() {
