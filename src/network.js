@@ -48,6 +48,12 @@ class NetworkStack extends EventEmitter {
         // QEMU Framing Buffer
         this.txBuffer = Buffer.alloc(0); // Data sending TO the VM (queued)
         this.rxBuffer = Buffer.alloc(0); // Data received FROM the VM (buffering for full frame)
+        
+        // TCP Flow Control: Maximum buffer before requesting pause
+        // Keep buffers small to ensure responsive flow control
+        this.TX_BUFFER_HIGH_WATER = 128 * 1024;  // 128KB - request pause
+        this.TX_BUFFER_LOW_WATER = 32 * 1024;    // 32KB - request resume
+        this.txPaused = new Set(); // Set of TCP session keys that are paused
     }
     
     /**
@@ -129,6 +135,8 @@ class NetworkStack extends EventEmitter {
         
         const payload = Buffer.from(data);
         
+
+        
         // MTU is 1500, IP header is 20, TCP header is 20
         // Maximum Segment Size (MSS) = 1500 - 20 - 20 = 1460
         const MSS = 1460;
@@ -147,6 +155,15 @@ class NetworkStack extends EventEmitter {
             session.mySeq += chunk.length;
             offset += chunkSize;
         }
+        
+        // Flow control: pause main thread socket if buffer is too full
+        if (this.txBuffer.length > this.TX_BUFFER_HIGH_WATER && !this.txPaused.has(key)) {
+            this.txPaused.add(key);
+            this.emit('debug', `[TCP] Pausing ${key}, txBuffer=${this.txBuffer.length}`);
+            if (this.netPort) {
+                this.netPort.postMessage({ type: 'tcp-pause', key });
+            }
+        }
     }
     
     /**
@@ -156,7 +173,12 @@ class NetworkStack extends EventEmitter {
     _handleTcpEnd(msg) {
         const { key } = msg;
         const session = this.natTable.get(key);
-        if (!session) return;
+        if (!session) {
+            this.emit('debug', `[TCP] FIN received for unknown session ${key}`);
+            return;
+        }
+        
+        this.emit('debug', `[TCP] FIN received for ${key}, state=${session.state}, txBuffer=${this.txBuffer.length}, mySeq=${session.mySeq}, myAck=${session.myAck}`);
         
         // Send FIN-ACK to VM
         this.sendTCP(session.srcIP, session.srcPort, session.dstIP, session.dstPort,
@@ -186,7 +208,12 @@ class NetworkStack extends EventEmitter {
      */
     _handleTcpClosed(msg) {
         const { key } = msg;
-        this.natTable.delete(key);
+        const session = this.natTable.get(key);
+        if (session) {
+            // Mark session as closing - don't delete yet
+            // Wait for VM to send FIN before full cleanup
+            session.state = 'CLOSED_BY_REMOTE';
+        }
     }
 
     // Called when VM writes data to the network interface (FD 3)
@@ -213,11 +240,38 @@ class NetworkStack extends EventEmitter {
         
         const chunk = this.txBuffer.subarray(0, maxLen);
         this.txBuffer = this.txBuffer.subarray(chunk.length);
+        
+
+        
+        // Flow control: resume paused TCP sessions when buffer drains
+        if (this.txBuffer.length < this.TX_BUFFER_LOW_WATER && this.txPaused.size > 0) {
+            this.emit('debug', `[TCP] Resuming ${this.txPaused.size} sessions, txBuffer=${this.txBuffer.length}`);
+            for (const key of this.txPaused) {
+                if (this.netPort) {
+                    this.netPort.postMessage({ type: 'tcp-resume', key });
+                }
+            }
+            this.txPaused.clear();
+        }
+        
         return chunk;
     }
     
     hasPendingData() {
         return this.txBuffer.length > 0;
+    }
+    
+    /**
+     * Check if any TCP session has received FIN (for EOF signaling)
+     * @returns {boolean}
+     */
+    hasReceivedFin() {
+        for (const [key, session] of this.natTable) {
+            if (session.state === 'FIN_WAIT' || session.state === 'CLOSED_BY_REMOTE') {
+                return true;
+            }
+        }
+        return false;
     }
 
     // Called internally when we want to send a frame TO the VM
@@ -471,16 +525,33 @@ class NetworkStack extends EventEmitter {
         
         if (FIN) {
             // Tell main thread to close the connection
-            if (this.netPort) {
+            this.emit('debug', `[TCP] VM sent FIN for ${key}, state=${session.state}`);
+            if (this.netPort && session.state !== 'CLOSED_BY_REMOTE') {
                 this.netPort.postMessage({ type: 'tcp-close', key, destroy: false });
             }
             session.myAck++;
             this.sendTCP(session.srcIP, session.srcPort, session.dstIP, session.dstPort,
                          session.mySeq, session.myAck, 0x10); // ACK
+            
+            // If remote already closed, we can now clean up the session
+            if (session.state === 'CLOSED_BY_REMOTE' || session.state === 'FIN_WAIT') {
+                this.natTable.delete(key);
+            } else {
+                session.state = 'FIN_SENT';
+            }
         }
     }
 
     sendTCP(dstIP, dstPort, srcIP, srcPort, seq, ack, flags, payload = Buffer.alloc(0)) {
+        // Debug: log outgoing TCP packets
+        const flagStr = [];
+        if (flags & 0x01) flagStr.push('FIN');
+        if (flags & 0x02) flagStr.push('SYN');
+        if (flags & 0x04) flagStr.push('RST');
+        if (flags & 0x08) flagStr.push('PSH');
+        if (flags & 0x10) flagStr.push('ACK');
+        this.emit('debug', `[TCP OUT] ${srcIP.join('.')}:${srcPort} -> ${dstIP.join('.')}:${dstPort} [${flagStr.join(',')}] seq=${seq} ack=${ack} len=${payload.length}`);
+        
         const header = Buffer.alloc(20);
         header.writeUInt16BE(srcPort, 0);
         header.writeUInt16BE(dstPort, 2);

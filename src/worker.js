@@ -762,7 +762,7 @@ async function start() {
         }
         
         // 2. Check Immediate Status
-        const netReadable = netStack.hasPendingData();
+        const netReadable = netStack.hasPendingData() || netStack.hasReceivedFin();
         const netWritable = true; // Always writable
         const stdinReadable = localBuffer.length > 0 || Atomics.load(inputInt32, INPUT_FLAG_INDEX) !== 0;
         
@@ -811,8 +811,8 @@ async function start() {
                      // Check if stdin became available
                      if (Atomics.load(inputInt32, INPUT_FLAG_INDEX) !== 0) break;
                      
-                     // Check if network data became available (from UDP responses)
-                     if (hasNetRead && netStack.hasPendingData()) break;
+                     // Check if network data became available (from UDP responses or FIN)
+                     if (hasNetRead && (netStack.hasPendingData() || netStack.hasReceivedFin())) break;
                  }
             }
         }
@@ -822,7 +822,7 @@ async function start() {
         
         // Refresh status
         const postStdinReadable = localBuffer.length > 0 || Atomics.load(inputInt32, INPUT_FLAG_INDEX) !== 0;
-        const postNetReadable = netStack.hasPendingData();
+        const postNetReadable = netStack.hasPendingData() || netStack.hasReceivedFin();
         
         for(let i=0; i<nsubscriptions; i++) {
              const base = in_ptr + i * 48;

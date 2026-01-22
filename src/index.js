@@ -53,6 +53,10 @@ class AgentVM {
                 this._handleTcpSend(msg);
             } else if (msg.type === 'tcp-close') {
                 this._handleTcpClose(msg);
+            } else if (msg.type === 'tcp-pause') {
+                this._handleTcpPause(msg);
+            } else if (msg.type === 'tcp-resume') {
+                this._handleTcpResume(msg);
             }
         });
 
@@ -223,11 +227,14 @@ class AgentVM {
         const { key, dstIP, dstPort, srcIP, srcPort } = msg;
         const net = require('net');
         
+        // Translate gateway IP to localhost for local server access
+        const connectIP = (dstIP === '192.168.127.1') ? '127.0.0.1' : dstIP;
+        
         const socket = new net.Socket();
         const session = { socket, srcIP, srcPort, dstIP, dstPort };
         this.tcpSessions.set(key, session);
         
-        socket.connect(dstPort, dstIP, () => {
+        socket.connect(dstPort, connectIP, () => {
             if (!this.netChannel) return;
             this.netChannel.port2.postMessage({
                 type: 'tcp-connected',
@@ -237,11 +244,13 @@ class AgentVM {
         
         socket.on('data', (data) => {
             if (!this.netChannel) return;
+            // Use transferable Uint8Array for efficiency with large data
+            const uint8 = new Uint8Array(data.buffer, data.byteOffset, data.length);
             this.netChannel.port2.postMessage({
                 type: 'tcp-data',
                 key,
-                data: Array.from(data)
-            });
+                data: uint8
+            }, [uint8.buffer]);
         });
         
         socket.on('end', () => {
@@ -299,6 +308,30 @@ class AgentVM {
             } else {
                 session.socket.end();
             }
+        }
+    }
+    
+    /**
+     * Handle TCP pause request from worker (flow control)
+     * @private
+     */
+    _handleTcpPause(msg) {
+        const { key } = msg;
+        const session = this.tcpSessions.get(key);
+        if (session && session.socket) {
+            session.socket.pause();
+        }
+    }
+    
+    /**
+     * Handle TCP resume request from worker (flow control)
+     * @private
+     */
+    _handleTcpResume(msg) {
+        const { key } = msg;
+        const session = this.tcpSessions.get(key);
+        if (session && session.socket) {
+            session.socket.resume();
         }
     }
 
