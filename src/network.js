@@ -128,10 +128,25 @@ class NetworkStack extends EventEmitter {
         if (!session) return;
         
         const payload = Buffer.from(data);
-        // Send PSH-ACK to VM
-        this.sendTCP(session.srcIP, session.srcPort, session.dstIP, session.dstPort,
-                     session.mySeq, session.myAck, 0x18, payload); // PSH | ACK
-        session.mySeq += payload.length;
+        
+        // MTU is 1500, IP header is 20, TCP header is 20
+        // Maximum Segment Size (MSS) = 1500 - 20 - 20 = 1460
+        const MSS = 1460;
+        
+        // Segment the data if it exceeds MSS
+        let offset = 0;
+        while (offset < payload.length) {
+            const chunkSize = Math.min(MSS, payload.length - offset);
+            const chunk = payload.subarray(offset, offset + chunkSize);
+            const isLast = (offset + chunkSize >= payload.length);
+            
+            // Send PSH-ACK for last segment, just ACK for intermediate segments
+            const flags = isLast ? 0x18 : 0x10; // PSH|ACK or just ACK
+            this.sendTCP(session.srcIP, session.srcPort, session.dstIP, session.dstPort,
+                         session.mySeq, session.myAck, flags, chunk);
+            session.mySeq += chunk.length;
+            offset += chunkSize;
+        }
     }
     
     /**
