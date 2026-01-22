@@ -51,8 +51,8 @@ class NetworkStack extends EventEmitter {
         
         // TCP Flow Control: Maximum buffer before requesting pause
         // Keep buffers small to ensure responsive flow control
-        this.TX_BUFFER_HIGH_WATER = 128 * 1024;  // 128KB - request pause
-        this.TX_BUFFER_LOW_WATER = 32 * 1024;    // 32KB - request resume
+        this.TX_BUFFER_HIGH_WATER = 16 * 1024;  // 16KB - request pause
+        this.TX_BUFFER_LOW_WATER = 4 * 1024;    // 4KB - request resume
         this.txPaused = new Set(); // Set of TCP session keys that are paused
     }
     
@@ -65,6 +65,10 @@ class NetworkStack extends EventEmitter {
         
         const { receiveMessageOnPort } = require('node:worker_threads');
         
+        // Limit bytes processed per poll to prevent buffer explosion
+        const MAX_BYTES_PER_POLL = 64 * 1024; // 64KB max per poll cycle
+        let bytesThisPoll = 0;
+        
         // Check for pending messages
         let msg;
         while ((msg = receiveMessageOnPort(this.netPort))) {
@@ -75,6 +79,11 @@ class NetworkStack extends EventEmitter {
                 this._handleTcpConnected(m);
             } else if (m.type === 'tcp-data') {
                 this._handleTcpData(m);
+                bytesThisPoll += m.data.length;
+                // Stop processing data if we've hit the limit - leave rest for next poll
+                if (bytesThisPoll >= MAX_BYTES_PER_POLL) {
+                    break;
+                }
             } else if (m.type === 'tcp-end') {
                 this._handleTcpEnd(m);
             } else if (m.type === 'tcp-error') {
@@ -255,6 +264,41 @@ class NetworkStack extends EventEmitter {
         }
         
         return chunk;
+    }
+    
+    /**
+     * Close the active socket - send FIN to remote, notify main thread
+     */
+    closeSocket() {
+        // Find the active TCP session (the one that's in FIN_WAIT or ESTABLISHED)
+        for (const [key, session] of this.natTable) {
+            if (session.state === 'ESTABLISHED' || session.state === 'FIN_WAIT') {
+                this.emit('debug', `[TCP] VM closing socket ${key}, state=${session.state}, sending FIN`);
+                
+                // If we already received FIN from remote (FIN_WAIT), just send ACK
+                // Otherwise send FIN to initiate close from our side
+                if (session.state === 'FIN_WAIT') {
+                    // We already sent FIN-ACK when we received their FIN
+                    // Now just clean up - notify main thread to close the socket
+                    if (this.netPort) {
+                        this.netPort.postMessage({ type: 'tcp-close', key });
+                    }
+                    session.state = 'CLOSED';
+                } else {
+                    // ESTABLISHED - we're initiating close, send FIN
+                    this.sendTCP(session.srcIP, session.srcPort, session.dstIP, session.dstPort,
+                                 session.mySeq, session.myAck, 0x11); // FIN | ACK
+                    session.mySeq++;
+                    session.state = 'FIN_SENT';
+                    
+                    // Notify main thread to close the socket
+                    if (this.netPort) {
+                        this.netPort.postMessage({ type: 'tcp-close', key });
+                    }
+                }
+                break; // Only close one socket (we only support one connection at a time currently)
+            }
+        }
     }
     
     hasPendingData() {

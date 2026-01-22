@@ -1,4 +1,4 @@
-const { Worker, MessageChannel } = require('node:worker_threads');
+const { Worker, MessageChannel, SHARE_ENV } = require('node:worker_threads');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const dgram = require('node:dgram');
@@ -70,7 +70,8 @@ class AgentVM {
                     mac: this.mac,
                     netPort: this.netChannel.port1
                 },
-                transferList: [this.netChannel.port1]
+                transferList: [this.netChannel.port1],
+                env: SHARE_ENV  // Share environment variables with worker thread
             });
 
             this.worker.on('message', (msg) => {
@@ -96,7 +97,7 @@ class AgentVM {
                 } else if (msg.type === 'stderr') {
                     this.handleOutput('stderr', msg.data);
                 } else if (msg.type === 'debug') {
-                    console.log('[Worker Debug]', msg.msg);
+                    // console.log('[Worker Debug]', msg.msg);
                 } else if (msg.type === 'exit') {
                     if (!this.destroyed) {
                         console.error('VM Exited unexpectedly:', msg.error);

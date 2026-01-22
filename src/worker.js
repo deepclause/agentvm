@@ -486,6 +486,7 @@ async function start() {
     // Custom fd_close for our handles
     const origFdClose = wasiImport.fd_close;
     wasiImport.fd_close = (fd) => {
+        parentPort.postMessage({ type: 'debug', msg: `fd_close(${fd}) called` });
         if (customFdHandles.has(fd)) {
             const handle = customFdHandles.get(fd);
             try {
@@ -496,6 +497,12 @@ async function start() {
         }
         if (fakeFdMap.has(fd)) {
             fakeFdMap.delete(fd);
+            return 0;
+        }
+        // Handle network socket close
+        if (fd === NET_CONN_FD) {
+            parentPort.postMessage({ type: 'debug', msg: `fd_close(${fd}) - closing network socket` });
+            netStack.closeSocket();
             return 0;
         }
         return origFdClose(fd);
@@ -589,6 +596,27 @@ async function start() {
                 if (args[0] >= 100) { // Our custom fds start at 100
                     parentPort.postMessage({ type: 'debug', msg: `WASI ${op}(fd=${args[0]}, ...) => ${result}` });
                 }
+                return result;
+            };
+        }
+    }
+
+    // Debug: trace ALL fd operations when DEBUG_WASI_FD=1
+    const DEBUG_WASI_FD = process.env.DEBUG_WASI_FD === '1';
+    if (DEBUG_WASI_FD) {
+        const allFdOps = [
+            'fd_read', 'fd_write', 'fd_pread', 'fd_pwrite', 
+            'fd_close', 'fd_seek', 'fd_tell', 'fd_sync', 'fd_datasync',
+            'fd_fdstat_get', 'fd_fdstat_set_flags', 'fd_filestat_get',
+            'fd_prestat_get', 'fd_prestat_dir_name', 'fd_readdir',
+            'fd_allocate', 'fd_advise', 'fd_renumber', 'fd_filestat_set_size', 'fd_filestat_set_times'
+        ];
+        for (const op of allFdOps) {
+            if (!wasiImport[op]) continue;
+            const orig = wasiImport[op];
+            wasiImport[op] = (...args) => {
+                const result = orig(...args);
+                parentPort.postMessage({ type: 'debug', msg: `[FD] ${op}(${args.slice(0,3).join(', ')}) => ${result}` });
                 return result;
             };
         }
@@ -723,6 +751,7 @@ async function start() {
         let hasNetWrite = false;
         let hasNetListen = false;
         let minTimeout = Infinity;
+        let otherFds = [];
 
         // 1. Scan subscriptions
         for (let i = 0; i < nsubscriptions; i++) {
@@ -731,19 +760,22 @@ async function start() {
              if (type === 1) { // FD_READ
                  const fd = view.getUint32(base + 16, true);
                  if (fd === 0) hasStdin = true;
-                 if (fd === NET_FD) {
+                 else if (fd === NET_FD) {
                      hasNetListen = true;
-                     // // parentPort.postMessage({ type: 'debug', msg: `poll_oneoff FD_READ for listen fd ${NET_FD}` });
                  }
-                 if (fd === NET_FD + 1) {
+                 else if (fd === NET_FD + 1) {
                      hasNetRead = true;
-                     // // parentPort.postMessage({ type: 'debug', msg: `poll_oneoff FD_READ for conn fd ${NET_FD + 1}, pending=${netStack.hasPendingData()}` });
+                 }
+                 else {
+                     otherFds.push(`read:${fd}`);
                  }
              } else if (type === 2) { // FD_WRITE
                  const fd = view.getUint32(base + 16, true);
                  if (fd === NET_FD + 1) {
                      hasNetWrite = true;
-                     // // parentPort.postMessage({ type: 'debug', msg: `poll_oneoff FD_WRITE for NET_FD` });
+                 }
+                 else {
+                     otherFds.push(`write:${fd}`);
                  }
              } else if (type === 0) { // CLOCK
                  const timeout = view.getBigUint64(base + 24, true);
@@ -751,15 +783,14 @@ async function start() {
                  
                  let t = Number(timeout) / 1000000; // to ms
                  if ((flags & 1) === 1) { // ABSOLUTE (not supported properly here, assume relative 0?)
-                     // Actually WASI clock time is complicated. 
-                     // Usually relative (flags=0).
-                     // If absolute, we need current time.
-                     // For now assume relative or 0.
                      t = 0; 
                  }
                  if (t < minTimeout) minTimeout = t;
              }
         }
+        
+        // Log what we're waiting for
+        parentPort.postMessage({ type: 'debug', msg: `poll_oneoff: hasStdin=${hasStdin}, hasNetRead=${hasNetRead}, hasNetWrite=${hasNetWrite}, hasNetListen=${hasNetListen}, timeout=${minTimeout}, otherFds=[${otherFds.join(',')}], pending=${netStack.hasPendingData()}, fin=${netStack.hasReceivedFin()}` });
         
         // 2. Check Immediate Status
         const netReadable = netStack.hasPendingData() || netStack.hasReceivedFin();
@@ -904,7 +935,7 @@ async function start() {
                 return 6; // WASI_ERRNO_AGAIN - would block
             },
             sock_recv: (fd, ri_data_ptr, ri_data_len, ri_flags, ro_datalen_ptr, ro_flags_ptr) => {
-                // parentPort.postMessage({ type: 'debug', msg: `sock_recv(${fd}) called, buffered=${sockRecvBuffer.length}, pending=${netStack.hasPendingData()}` });
+                parentPort.postMessage({ type: 'debug', msg: `sock_recv(${fd}) called, buffered=${sockRecvBuffer.length}, pending=${netStack.hasPendingData()}, fin=${netStack.hasReceivedFin()}` });
                 
                 if (fd !== NET_CONN_FD) {
                     // parentPort.postMessage({ type: 'debug', msg: `sock_recv(${fd}) - wrong fd` });
@@ -918,9 +949,17 @@ async function start() {
                 if (sockRecvBuffer.length === 0) {
                     const data = netStack.readFromNetwork(4096);
                     if (!data || data.length === 0) {
+                        // Check if FIN was received - if so, return EOF (0 bytes) instead of EAGAIN
+                        if (netStack.hasReceivedFin()) {
+                            parentPort.postMessage({ type: 'debug', msg: `sock_recv(${fd}) returning EOF due to FIN` });
+                            view.setUint32(ro_datalen_ptr, 0, true);
+                            view.setUint16(ro_flags_ptr, 0, true);
+                            return 0; // Success with 0 bytes = EOF
+                        }
+                        parentPort.postMessage({ type: 'debug', msg: `sock_recv(${fd}) returning EAGAIN` });
                         view.setUint32(ro_datalen_ptr, 0, true);
                         view.setUint16(ro_flags_ptr, 0, true);
-                        // Return EAGAIN to indicate no data available
+                        // Return EAGAIN to indicate no data available yet
                         return 6; // WASI_ERRNO_AGAIN
                     }
                     sockRecvBuffer = data;
@@ -961,7 +1000,7 @@ async function start() {
                 return 0; // Success
             },
             sock_shutdown: (fd, how) => {
-                // parentPort.postMessage({ type: 'debug', msg: `sock_shutdown(${fd}, ${how})` });
+                parentPort.postMessage({ type: 'debug', msg: `sock_shutdown(${fd}, ${how})` });
                 return 0; // Success
             }
         }
