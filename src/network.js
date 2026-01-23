@@ -283,20 +283,28 @@ class NetworkStack extends EventEmitter {
                     if (this.netPort) {
                         this.netPort.postMessage({ type: 'tcp-close', key });
                     }
-                    session.state = 'CLOSED';
                 } else {
                     // ESTABLISHED - we're initiating close, send FIN
                     this.sendTCP(session.srcIP, session.srcPort, session.dstIP, session.dstPort,
                                  session.mySeq, session.myAck, 0x11); // FIN | ACK
                     session.mySeq++;
-                    session.state = 'FIN_SENT';
                     
                     // Notify main thread to close the socket
                     if (this.netPort) {
                         this.netPort.postMessage({ type: 'tcp-close', key });
                     }
                 }
+                // Delete the session to allow new connections
+                this.natTable.delete(key);
                 break; // Only close one socket (we only support one connection at a time currently)
+            }
+        }
+        
+        // Also clean up any stale closed sessions
+        for (const [key, session] of this.natTable) {
+            if (session.state === 'CLOSED_BY_REMOTE' || session.state === 'CLOSED' || session.state === 'FIN_SENT') {
+                this.emit('debug', `[TCP] Cleaning up stale session ${key}, state=${session.state}`);
+                this.natTable.delete(key);
             }
         }
     }

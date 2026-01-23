@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "main": "src/index.js",
   "scripts": {
-    "test": "node test/basic.test.js && node test/mount.test.js && node test/network/vm.test.js"
+    "test": "node test/basic.test.js && node test/mount.test.js && node test/network/http.test.js"
   },
   "keywords": ["vm", "wasm", "sandbox", "agent", "linux", "alpine", "container", "wasi"],
   "author": "DeepClause",

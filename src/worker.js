@@ -503,6 +503,9 @@ async function start() {
         if (fd === NET_CONN_FD) {
             parentPort.postMessage({ type: 'debug', msg: `fd_close(${fd}) - closing network socket` });
             netStack.closeSocket();
+            // Reset connection state so new connections can be accepted
+            netConnectionAccepted = false;
+            sockRecvBuffer = Buffer.alloc(0);
             return 0;
         }
         return origFdClose(fd);
@@ -954,6 +957,10 @@ async function start() {
                             parentPort.postMessage({ type: 'debug', msg: `sock_recv(${fd}) returning EOF due to FIN` });
                             view.setUint32(ro_datalen_ptr, 0, true);
                             view.setUint16(ro_flags_ptr, 0, true);
+                            // Clean up the connection to allow new connections
+                            netStack.closeSocket();
+                            netConnectionAccepted = false;
+                            sockRecvBuffer = Buffer.alloc(0);
                             return 0; // Success with 0 bytes = EOF
                         }
                         parentPort.postMessage({ type: 'debug', msg: `sock_recv(${fd}) returning EAGAIN` });
