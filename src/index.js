@@ -16,12 +16,19 @@ class AgentVM {
      * @param {Object.<string, string>} [options.mounts] - Mount points mapping VM path to host path (e.g., {'/mnt/data': '/host/path'}).
      * @param {boolean} [options.network] - Enable networking (default: true).
      * @param {string} [options.mac] - MAC address for the VM (default: 02:00:00:00:00:01).
+     * @param {number} [options.networkRateLimit] - Network rate limit in bytes/sec (default: 256KB/s). Set to 0 for unlimited.
+     * @param {boolean} [options.debug] - Enable debug logging.
+     * @param {boolean} [options.interactive] - Interactive/raw mode - skip shell setup for direct terminal access.
      */
     constructor(options = {}) {
         this.wasmPath = options.wasmPath || path.resolve(__dirname, '../agentvm-alpine-python.wasm');
         this.mounts = options.mounts || {};
         this.network = options.network !== false; // Default to true
         this.mac = options.mac || '02:00:00:00:00:01';
+        this.debug = options.debug || false;
+        this.interactive = options.interactive || false;
+        // Rate limit: 256KB/s default to avoid overwhelming VM filesystem writes
+        this.networkRateLimit = options.networkRateLimit !== undefined ? options.networkRateLimit :  1024 * 1024 * 1024;
         this.sharedBuffer = new SharedArrayBuffer(SHARED_BUFFER_SIZE);
         this.inputInt32 = new Int32Array(this.sharedBuffer);
         this.inputData = new Uint8Array(this.sharedBuffer, 8);
@@ -31,9 +38,14 @@ class AgentVM {
         this.isReady = false;
         this.destroyed = false;
         
+        // Callbacks for raw/interactive mode
+        this.onStdout = null;
+        this.onStderr = null;
+        this.onExit = null;
+        
         // NAT: Main thread handles sockets, worker polls for responses via MessageChannel
         this.udpSessions = new Map(); // key -> { socket, lastActive }
-        this.tcpSessions = new Map(); // key -> { socket, state, ... }
+        this.tcpSessions = new Map(); // key -> { socket, state, bytesThisSecond, lastReset, paused, pendingData }
         this.netChannel = null;
     }
 
@@ -77,7 +89,14 @@ class AgentVM {
             this.worker.on('message', (msg) => {
                 if (msg.type === 'ready') {
                     this.isReady = true;
-                    // Run setup commands
+                    
+                    // In interactive mode, skip shell setup and resolve immediately
+                    if (this.interactive) {
+                        resolve();
+                        return;
+                    }
+                    
+                    // Run setup commands for exec() mode
                     this.exec("stty -echo; export PS1=''").then(async () => {
                          // Auto-setup network if enabled
                          if (this.network) {
@@ -97,10 +116,15 @@ class AgentVM {
                 } else if (msg.type === 'stderr') {
                     this.handleOutput('stderr', msg.data);
                 } else if (msg.type === 'debug') {
-                    // console.log('[Worker Debug]', msg.msg);
+                    // Worker debug messages (disabled by default for performance)
+                    // if (this.debug) console.log('[Worker]', msg.msg);
                 } else if (msg.type === 'exit') {
-                    if (!this.destroyed) {
+                    if (!this.destroyed && !this.interactive) {
                         console.error('VM Exited unexpectedly:', msg.error);
+                    }
+                    // In interactive mode, trigger onExit callback
+                    if (this.interactive && this.onExit) {
+                        this.onExit(msg.error);
                     }
                 }
             });
@@ -232,8 +256,20 @@ class AgentVM {
         const connectIP = (dstIP === '192.168.127.1') ? '127.0.0.1' : dstIP;
         
         const socket = new net.Socket();
-        const session = { socket, srcIP, srcPort, dstIP, dstPort };
+        const session = { 
+            socket, srcIP, srcPort, dstIP, dstPort,
+            // Rate limiting state
+            bytesThisSecond: 0,
+            lastReset: Date.now(),
+            rateLimitPaused: false,
+            flowControlPaused: false,  // Track flow control state
+            pendingResume: null
+        };
         this.tcpSessions.set(key, session);
+        
+        if (this.debug) {
+            console.log(`[TCP] Connecting to ${connectIP}:${dstPort}, key=${key}`);
+        }
         
         socket.connect(dstPort, connectIP, () => {
             if (!this.netChannel) return;
@@ -245,13 +281,67 @@ class AgentVM {
         
         socket.on('data', (data) => {
             if (!this.netChannel) return;
+            
+            // Rate limiting: track bytes per second
+            if (this.networkRateLimit > 0) {
+                const now = Date.now();
+                // Reset counter every second
+                if (now - session.lastReset >= 1000) {
+                    session.bytesThisSecond = 0;
+                    session.lastReset = now;
+                }
+                
+                session.bytesThisSecond += data.length;
+                
+                // If we've exceeded rate limit, pause the socket
+                if (session.bytesThisSecond >= this.networkRateLimit && !session.rateLimitPaused) {
+                    session.rateLimitPaused = true;
+                    socket.pause();
+                    if (this.debug) {
+                        console.log(`[RateLimit] Pausing ${key}, sent ${session.bytesThisSecond} bytes this second`);
+                    }
+                    
+                    // Schedule resume at start of next second
+                    const timeUntilNextSecond = 1000 - (now - session.lastReset);
+                    session.pendingResume = setTimeout(() => {
+                        // Always clear the rate limit pause flag and reset counters
+                        session.rateLimitPaused = false;
+                        session.bytesThisSecond = 0;
+                        session.lastReset = Date.now();
+                        session.pendingResume = null;
+                        
+                        // Only actually resume if flow control also allows it
+                        if (!session.flowControlPaused) {
+                            socket.resume();
+                            if (this.debug) {
+                                console.log(`[RateLimit] Resuming ${key}`);
+                            }
+                        } else if (this.debug) {
+                            console.log(`[RateLimit] Rate limit cleared for ${key}, but flow control still paused`);
+                        }
+                    }, timeUntilNextSecond);
+                }
+            }
+            
             // Use transferable Uint8Array for efficiency with large data
-            const uint8 = new Uint8Array(data.buffer, data.byteOffset, data.length);
-            this.netChannel.port2.postMessage({
-                type: 'tcp-data',
-                key,
-                data: uint8
-            }, [uint8.buffer]);
+            // NOTE: We must copy the data because socket buffers may share ArrayBuffer
+            try {
+                const copy = new Uint8Array(data.length);
+                copy.set(data);
+                this.netChannel.port2.postMessage({
+                    type: 'tcp-data',
+                    key,
+                    data: copy
+                }, [copy.buffer]);
+            } catch (e) {
+                console.error('[TCP] Failed to post data:', e.message);
+                // Fallback: send without transfer
+                this.netChannel.port2.postMessage({
+                    type: 'tcp-data',
+                    key,
+                    data: new Uint8Array(data)
+                });
+            }
         });
         
         socket.on('end', () => {
@@ -263,6 +353,11 @@ class AgentVM {
         });
         
         socket.on('close', () => {
+            // Clean up rate limit timer
+            if (session.pendingResume) {
+                clearTimeout(session.pendingResume);
+                session.pendingResume = null;
+            }
             if (this.netChannel) {
                 this.netChannel.port2.postMessage({
                     type: 'tcp-close',
@@ -273,6 +368,11 @@ class AgentVM {
         });
         
         socket.on('error', (err) => {
+            // Clean up rate limit timer
+            if (session.pendingResume) {
+                clearTimeout(session.pendingResume);
+                session.pendingResume = null;
+            }
             if (this.netChannel) {
                 this.netChannel.port2.postMessage({
                     type: 'tcp-error',
@@ -320,6 +420,7 @@ class AgentVM {
         const { key } = msg;
         const session = this.tcpSessions.get(key);
         if (session && session.socket) {
+            session.flowControlPaused = true;
             session.socket.pause();
         }
     }
@@ -332,7 +433,11 @@ class AgentVM {
         const { key } = msg;
         const session = this.tcpSessions.get(key);
         if (session && session.socket) {
-            session.socket.resume();
+            session.flowControlPaused = false;
+            // Only resume if not also rate-limit paused
+            if (!session.rateLimitPaused) {
+                session.socket.resume();
+            }
         }
     }
 
@@ -394,6 +499,16 @@ class AgentVM {
         
         // Debug
         // console.log(`[VM ${type}]`, JSON.stringify(text));
+
+        // In interactive mode, call callbacks directly
+        if (this.interactive) {
+            if (type === 'stdout' && this.onStdout) {
+                this.onStdout(dataUint8);
+            } else if (type === 'stderr' && this.onStderr) {
+                this.onStderr(dataUint8);
+            }
+            return;
+        }
 
         if (!this.pendingCommand) return;
 

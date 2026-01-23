@@ -677,6 +677,9 @@ async function start() {
             if (!instance) return 0;
             const view = new DataView(instance.exports.memory.buffer);
             
+            // Poll for network responses before reading
+            netStack.pollNetResponses();
+            
             const data = netStack.readFromNetwork(4096);
             if (!data || data.length === 0) {
                 view.setUint32(nread_ptr, 0, true);
@@ -795,8 +798,13 @@ async function start() {
         // Log what we're waiting for
         parentPort.postMessage({ type: 'debug', msg: `poll_oneoff: hasStdin=${hasStdin}, hasNetRead=${hasNetRead}, hasNetWrite=${hasNetWrite}, hasNetListen=${hasNetListen}, timeout=${minTimeout}, otherFds=[${otherFds.join(',')}], pending=${netStack.hasPendingData()}, fin=${netStack.hasReceivedFin()}` });
         
+        // IMPORTANT: Always poll for network responses first!
+        // This ensures TCP data from main thread is received even when 
+        // we're polling for both read and write (common during TLS handshake).
+        netStack.pollNetResponses();
+        
         // 2. Check Immediate Status
-        const netReadable = netStack.hasPendingData() || netStack.hasReceivedFin();
+        const netReadable = sockRecvBuffer.length > 0 || netStack.hasPendingData() || netStack.hasReceivedFin();
         const netWritable = true; // Always writable
         const stdinReadable = localBuffer.length > 0 || Atomics.load(inputInt32, INPUT_FLAG_INDEX) !== 0;
         
@@ -856,7 +864,7 @@ async function start() {
         
         // Refresh status
         const postStdinReadable = localBuffer.length > 0 || Atomics.load(inputInt32, INPUT_FLAG_INDEX) !== 0;
-        const postNetReadable = netStack.hasPendingData() || netStack.hasReceivedFin();
+        const postNetReadable = sockRecvBuffer.length > 0 || netStack.hasPendingData() || netStack.hasReceivedFin();
         
         for(let i=0; i<nsubscriptions; i++) {
              const base = in_ptr + i * 48;
@@ -880,7 +888,7 @@ async function start() {
                      // Connected socket - readable if there's data
                      triggered = true;
                      evType = 1;
-                     nbytes = netStack.txBuffer.length;
+                     nbytes = sockRecvBuffer.length + netStack.txBuffer.length;
                      // // parentPort.postMessage({ type: 'debug', msg: `poll: conn fd readable, ${nbytes} bytes` });
                  }
              } else if (type === 2) { // WRITE
@@ -918,6 +926,9 @@ async function start() {
             ...wasiImport,
             // WASI Socket Extensions (for network support)
             sock_accept: (fd, flags, result_fd_ptr) => {
+                // Poll for network responses first - TCP-connected messages may be pending
+                netStack.pollNetResponses();
+                
                 if (fd !== NET_FD) {
                     // parentPort.postMessage({ type: 'debug', msg: `sock_accept(${fd}) - wrong fd` });
                     return 8; // WASI_ERRNO_BADF
@@ -938,6 +949,9 @@ async function start() {
                 return 6; // WASI_ERRNO_AGAIN - would block
             },
             sock_recv: (fd, ri_data_ptr, ri_data_len, ri_flags, ro_datalen_ptr, ro_flags_ptr) => {
+                // Poll for network responses first
+                netStack.pollNetResponses();
+                
                 parentPort.postMessage({ type: 'debug', msg: `sock_recv(${fd}) called, buffered=${sockRecvBuffer.length}, pending=${netStack.hasPendingData()}, fin=${netStack.hasReceivedFin()}` });
                 
                 if (fd !== NET_CONN_FD) {

@@ -1,11 +1,23 @@
 {
   "name": "deepclause-agentvm",
-  "version": "0.0.1",
+  "version": "0.0.3",
   "main": "src/index.js",
+  "bin": {
+    "agentvm": "./bin/cli.js"
+  },
   "scripts": {
     "test": "node test/basic.test.js && node test/mount.test.js && node test/network/http.test.js"
   },
-  "keywords": ["vm", "wasm", "sandbox", "agent", "linux", "alpine", "container", "wasi"],
+  "keywords": [
+    "vm",
+    "wasm",
+    "sandbox",
+    "agent",
+    "linux",
+    "alpine",
+    "container",
+    "wasi"
+  ],
   "author": "DeepClause",
   "license": "MIT",
   "description": "Lightweight WASM-based Linux VM for AI agents - run shell commands in an isolated Alpine Linux environment",
@@ -15,6 +27,7 @@
   },
   "files": [
     "src/",
+    "bin/",
     "agentvm-alpine-python.wasm",
     "README.md"
   ],
@@ -23,7 +36,9 @@
   },
   "devDependencies": {
     "@ai-sdk/openai": "^3.0.12",
+    "0x": "^6.0.0",
     "ai": "^6.0.39",
+    "clinic": "^13.0.0",
     "dotenv": "^17.2.3"
   }
 }

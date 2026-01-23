@@ -144,8 +144,6 @@ class NetworkStack extends EventEmitter {
         
         const payload = Buffer.from(data);
         
-
-        
         // MTU is 1500, IP header is 20, TCP header is 20
         // Maximum Segment Size (MSS) = 1500 - 20 - 20 = 1460
         const MSS = 1460;
