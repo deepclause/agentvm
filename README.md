@@ -13,6 +13,8 @@ The entire project, including network stack and hacks for making host directory 
 
 > ⚠️ **DISCLAIMER**: This library is highly experimental and should be used at your own risk. It is not recommended for production use. The underlying WASI implementation may have security vulnerabilities and the API may change without notice.
 
+Latest version on npm: 0.0.3
+
 ## Installation
 
 ```bash
