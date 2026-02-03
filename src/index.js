@@ -28,7 +28,7 @@ class AgentVM {
         this.debug = options.debug || false;
         this.interactive = options.interactive || false;
         // Rate limit: 256KB/s default to avoid overwhelming VM filesystem writes
-        this.networkRateLimit = options.networkRateLimit !== undefined ? options.networkRateLimit :  1024 * 1024 * 1024;
+        this.networkRateLimit = options.networkRateLimit !== undefined ? options.networkRateLimit :  256 * 1024;
         this.sharedBuffer = new SharedArrayBuffer(SHARED_BUFFER_SIZE);
         this.inputInt32 = new Int32Array(this.sharedBuffer);
         this.inputData = new Uint8Array(this.sharedBuffer, 8);

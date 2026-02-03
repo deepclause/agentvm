@@ -117,13 +117,30 @@ async function start() {
         // Resolve fake fd to real fd for the base directory
         let actualFd = fakeFdMap.has(fd) ? fakeFdMap.get(fd) : fd;
         
-        // Check if this is a preopened directory
-        const preopenInfo = fdToHostPath.get(actualFd);
+        // Check if this is a preopened directory OR one of our custom directory handles
+        let preopenInfo = fdToHostPath.get(actualFd);
+        
+        // Also check if fd is one of our custom directory handles
+        if (!preopenInfo && customFdHandles.has(fd)) {
+            const handle = customFdHandles.get(fd);
+            if (handle.type === 'directory') {
+                preopenInfo = { hostPath: handle.hostPath, wasiPath: handle.wasiPath };
+            }
+        }
         
         // Fix: Node.js WASI doesn't handle path_open(fd, ".") properly for preopens
         if (pathStr === '.' && (oflags & 0x2) !== 0 && preopenInfo) {
             const fakeFd = nextFakeFd++;
-            fakeFdMap.set(fakeFd, actualFd);
+            // For custom directory handles, map to a new custom handle instead of fakeFdMap
+            if (customFdHandles.has(fd)) {
+                customFdHandles.set(fakeFd, {
+                    type: 'directory',
+                    hostPath: preopenInfo.hostPath,
+                    wasiPath: preopenInfo.wasiPath
+                });
+            } else {
+                fakeFdMap.set(fakeFd, actualFd);
+            }
             if (instance) {
                 const view = new DataView(instance.exports.memory.buffer);
                 view.setUint32(opened_fd_ptr, fakeFd, true);
@@ -137,14 +154,58 @@ async function start() {
             return 0;
         }
         
-        // For files inside preopened directories, implement our own file opening
-        // because Node.js WASI has bugs with 64-bit rights validation
-        if (preopenInfo && pathStr !== '.' && (oflags & 0x2) === 0) {
-            // This is trying to open a file (not a directory) inside a preopen
+        // For files OR subdirectories inside preopened directories, implement our own handling
+        // because Node.js WASI has bugs with 64-bit rights validation and subdirectory access
+        if (preopenInfo && pathStr !== '.') {
             const hostFilePath = require('path').join(preopenInfo.hostPath, pathStr);
             
             // WASI oflags
             const O_CREAT = 1, O_DIRECTORY = 2, O_EXCL = 4, O_TRUNC = 8;
+            
+            // Handle opening subdirectories
+            if (oflags & O_DIRECTORY) {
+                try {
+                    const stat = fs.statSync(hostFilePath);
+                    if (!stat.isDirectory()) {
+                        return 54; // WASI_ERRNO_NOTDIR
+                    }
+                    
+                    // Create a fake fd that maps to this subdirectory path
+                    const newFd = nextFakeFd++;
+                    // Store subdirectory info so future path_open calls relative to this fd work
+                    customFdHandles.set(newFd, {
+                        type: 'directory',
+                        hostPath: hostFilePath,
+                        wasiPath: require('path').join(preopenInfo.wasiPath, pathStr)
+                    });
+                    
+                    if (instance) {
+                        const view = new DataView(instance.exports.memory.buffer);
+                        view.setUint32(opened_fd_ptr, newFd, true);
+                    }
+                    
+                    if (process.env.DEBUG_WASI_PATH === '1') {
+                        parentPort.postMessage({
+                            type: 'debug',
+                            msg: `WASI path_open CUSTOM DIR: fd=${fd}, path="${pathStr}" => 0 (custom fd ${newFd})`
+                        });
+                    }
+                    return 0;
+                } catch (err) {
+                    if (process.env.DEBUG_WASI_PATH === '1') {
+                        parentPort.postMessage({
+                            type: 'debug',
+                            msg: `WASI path_open CUSTOM DIR FAIL: fd=${fd}, path="${pathStr}" => ${err.message}`
+                        });
+                    }
+                    if (err.code === 'ENOENT') return 44; // WASI_ERRNO_NOENT
+                    if (err.code === 'EACCES') return 2;  // WASI_ERRNO_ACCES
+                    if (err.code === 'ENOTDIR') return 54; // WASI_ERRNO_NOTDIR
+                    return 28; // WASI_ERRNO_INVAL
+                }
+            }
+            
+            // This is trying to open a file (not a directory) inside a preopen
             // WASI fdflags
             const FDFLAG_APPEND = 1, FDFLAG_DSYNC = 2, FDFLAG_NONBLOCK = 4, FDFLAG_RSYNC = 8, FDFLAG_SYNC = 16;
             
@@ -489,9 +550,12 @@ async function start() {
         parentPort.postMessage({ type: 'debug', msg: `fd_close(${fd}) called` });
         if (customFdHandles.has(fd)) {
             const handle = customFdHandles.get(fd);
-            try {
-                fs.closeSync(handle.nodeFd);
-            } catch (err) { /* ignore */ }
+            // Only close if it's a file handle with a nodeFd (directories don't have one)
+            if (handle.type === 'file' && handle.nodeFd !== undefined) {
+                try {
+                    fs.closeSync(handle.nodeFd);
+                } catch (err) { /* ignore */ }
+            }
             customFdHandles.delete(fd);
             return 0;
         }
@@ -522,8 +586,98 @@ async function start() {
         };
     };
     
-    // Wrap fd operations to handle our fake directory fds (not fd_read, we handle that above)
-    wasiImport.fd_readdir = wrapFdOp('fd_readdir', wasiImport.fd_readdir);
+    // Custom fd_readdir for our directory handles
+    const origFdReaddir = wasiImport.fd_readdir;
+    wasiImport.fd_readdir = (fd, buf_ptr, buf_len, cookie, bufused_ptr) => {
+        const hasIt = customFdHandles.has(fd);
+        // Check if this is one of our custom directory handles
+        if (hasIt) {
+            const handle = customFdHandles.get(fd);
+            if (!handle || handle.type !== 'directory') {
+                return handle ? 54 : 8; // WASI_ERRNO_NOTDIR or WASI_ERRNO_BADF
+            }
+            if (!instance) {
+                return 8; // WASI_ERRNO_BADF
+            }
+            
+            const view = new DataView(instance.exports.memory.buffer);
+            const mem = new Uint8Array(instance.exports.memory.buffer);
+            
+            try {
+                const entries = fs.readdirSync(handle.hostPath, { withFileTypes: true });
+                const startIdx = typeof cookie === 'bigint' ? Number(cookie) : cookie;
+                
+                let offset = 0;
+                for (let i = startIdx; i < entries.length; i++) {
+                    const entry = entries[i];
+                    const name = entry.name;
+                    const nameBytes = new TextEncoder().encode(name);
+                    
+                    // WASI dirent structure:
+                    // d_next: u64 (8 bytes) at offset 0
+                    // d_ino: u64 (8 bytes) at offset 8
+                    // d_namlen: u32 (4 bytes) at offset 16
+                    // d_type: u8 (1 byte) at offset 20
+                    // padding: 3 bytes at offset 21-23
+                    // name: starts at offset 24
+                    const DIRENT_HEADER_SIZE = 24;
+                    const direntSize = DIRENT_HEADER_SIZE + nameBytes.length;
+                    
+                    if (offset + direntSize > buf_len) {
+                        break;
+                    }
+                    
+                    const base = buf_ptr + offset;
+                    
+                    // d_next is the cookie for the next fd_readdir call (entry index + 1)
+                    view.setBigUint64(base, BigInt(i + 1), true);
+                    
+                    // d_ino - compute a hash of the path as inode
+                    const fullPath = require('path').join(handle.hostPath, name);
+                    let ino = 0;
+                    for (let j = 0; j < fullPath.length; j++) {
+                        ino = ((ino << 5) - ino + fullPath.charCodeAt(j)) | 0;
+                    }
+                    view.setBigUint64(base + 8, BigInt(Math.abs(ino)), true);
+                    
+                    // d_namlen
+                    view.setUint32(base + 16, nameBytes.length, true);
+                    
+                    // d_type: 0=unknown, 3=dir, 4=file, 7=symlink
+                    let dtype = 0;
+                    if (entry.isFile()) dtype = 4;
+                    else if (entry.isDirectory()) dtype = 3;
+                    else if (entry.isSymbolicLink()) dtype = 7;
+                    view.setUint8(base + 20, dtype);
+                    
+                    // 3 bytes padding at offset 21-23
+                    view.setUint8(base + 21, 0);
+                    view.setUint8(base + 22, 0);
+                    view.setUint8(base + 23, 0);
+                    
+                    // Name starts at offset 24
+                    mem.set(nameBytes, base + 24);
+                    
+                    offset += direntSize;
+                }
+                
+                view.setUint32(bufused_ptr, offset, true);
+                return 0;
+                
+            } catch (err) {
+                if (err.code === 'ENOENT') return 44; // WASI_ERRNO_NOENT
+                if (err.code === 'EACCES') return 2;  // WASI_ERRNO_ACCES
+                return 29; // WASI_ERRNO_IO
+            }
+        }
+        
+        if (fakeFdMap.has(fd)) {
+            return origFdReaddir(fakeFdMap.get(fd), buf_ptr, buf_len, cookie, bufused_ptr);
+        }
+        
+        console.error(`[fd_readdir] FALLBACK`);
+        return origFdReaddir(fd, buf_ptr, buf_len, cookie, bufused_ptr);
+    };
     
     // Wrap fd_fdstat_get for custom file handles and debugging
     const origFdstatGet = wasiImport.fd_fdstat_get;
@@ -536,11 +690,12 @@ async function start() {
             
             // fdstat structure: filetype(1) + padding(1) + flags(2) + padding(4) + rights_base(8) + rights_inh(8) = 24 bytes
             // filetype: 4 = REGULAR_FILE, 3 = DIRECTORY
-            view.setUint8(fdstat_ptr, 4); // FILETYPE_REGULAR_FILE
+            const fileType = handle.type === 'directory' ? 3 : 4;
+            view.setUint8(fdstat_ptr, fileType);
             view.setUint8(fdstat_ptr + 1, 0); // padding
             view.setUint16(fdstat_ptr + 2, 0, true); // fs_flags
             view.setUint32(fdstat_ptr + 4, 0, true); // padding
-            // rights_base (full rights for file)
+            // rights_base (full rights)
             view.setUint32(fdstat_ptr + 8, 0x1FFFFFFF, true); // low 32 bits
             view.setUint32(fdstat_ptr + 12, 0, true); // high 32 bits
             // rights_inheriting 
@@ -574,7 +729,68 @@ async function start() {
     };
     
     wasiImport.fd_filestat_get = wrapFdOp('fd_filestat_get', wasiImport.fd_filestat_get);
-    wasiImport.path_filestat_get = wrapFdOp('path_filestat_get', wasiImport.path_filestat_get);
+    
+    // Custom path_filestat_get for our directory handles
+    const origPathFilestatGet = wasiImport.path_filestat_get;
+    wasiImport.path_filestat_get = (fd, flags, path_ptr, path_len, filestat_ptr) => {
+        // Check if fd is one of our custom directory handles
+        if (customFdHandles.has(fd)) {
+            const handle = customFdHandles.get(fd);
+            if (handle.type === 'directory' && instance) {
+                const view = new DataView(instance.exports.memory.buffer);
+                const mem = new Uint8Array(instance.exports.memory.buffer);
+                const pathBytes = mem.slice(path_ptr, path_ptr + path_len);
+                const pathStr = new TextDecoder().decode(pathBytes);
+                const fullPath = require('path').join(handle.hostPath, pathStr);
+                
+                require('fs').writeSync(2, `[path_filestat_get] custom fd=${fd}, path="${pathStr}", fullPath="${fullPath}"\n`);
+                
+                try {
+                    const stat = fs.statSync(fullPath);
+                    
+                    // WASI filestat structure (64 bytes total):
+                    // 0: dev (u64)
+                    // 8: ino (u64)
+                    // 16: filetype (u8)
+                    // 17-23: padding
+                    // 24: nlink (u64)
+                    // 32: size (u64)
+                    // 40: atim (u64)
+                    // 48: mtim (u64)
+                    // 56: ctim (u64)
+                    
+                    view.setBigUint64(filestat_ptr, BigInt(0), true); // dev
+                    view.setBigUint64(filestat_ptr + 8, BigInt(stat.ino || 0), true); // ino
+                    
+                    // filetype: 0=unknown, 1=block, 2=char, 3=dir, 4=file, 5=socket_dgram, 6=socket_stream, 7=symlink
+                    let filetype = 0;
+                    if (stat.isFile()) filetype = 4;
+                    else if (stat.isDirectory()) filetype = 3;
+                    else if (stat.isSymbolicLink()) filetype = 7;
+                    view.setUint8(filestat_ptr + 16, filetype);
+                    
+                    view.setBigUint64(filestat_ptr + 24, BigInt(stat.nlink || 1), true); // nlink
+                    view.setBigUint64(filestat_ptr + 32, BigInt(stat.size), true); // size
+                    view.setBigUint64(filestat_ptr + 40, BigInt(Math.floor(stat.atimeMs * 1000000)), true); // atim (ns)
+                    view.setBigUint64(filestat_ptr + 48, BigInt(Math.floor(stat.mtimeMs * 1000000)), true); // mtim (ns)
+                    view.setBigUint64(filestat_ptr + 56, BigInt(Math.floor(stat.ctimeMs * 1000000)), true); // ctim (ns)
+                    
+                    return 0;
+                } catch (err) {
+                    require('fs').writeSync(2, `[path_filestat_get] ERROR: ${err.message}\n`);
+                    if (err.code === 'ENOENT') return 44; // WASI_ERRNO_NOENT
+                    if (err.code === 'EACCES') return 2;  // WASI_ERRNO_ACCES
+                    return 29; // WASI_ERRNO_IO
+                }
+            }
+        }
+        
+        // Fall back to wrapped original
+        if (fakeFdMap.has(fd)) {
+            return origPathFilestatGet(fakeFdMap.get(fd), flags, path_ptr, path_len, filestat_ptr);
+        }
+        return origPathFilestatGet(fd, flags, path_ptr, path_len, filestat_ptr);
+    };
     
     // Debug: trace path operations for mount debugging
     const DEBUG_WASI_PATH = process.env.DEBUG_WASI_PATH === '1';
@@ -804,7 +1020,7 @@ async function start() {
         netStack.pollNetResponses();
         
         // 2. Check Immediate Status
-        const netReadable = sockRecvBuffer.length > 0 || netStack.hasPendingData() || netStack.hasReceivedFin();
+        const netReadable = netStack.hasPendingData() || netStack.hasReceivedFin();
         const netWritable = true; // Always writable
         const stdinReadable = localBuffer.length > 0 || Atomics.load(inputInt32, INPUT_FLAG_INDEX) !== 0;
         
@@ -864,7 +1080,7 @@ async function start() {
         
         // Refresh status
         const postStdinReadable = localBuffer.length > 0 || Atomics.load(inputInt32, INPUT_FLAG_INDEX) !== 0;
-        const postNetReadable = sockRecvBuffer.length > 0 || netStack.hasPendingData() || netStack.hasReceivedFin();
+        const postNetReadable = netStack.hasPendingData() || netStack.hasReceivedFin();
         
         for(let i=0; i<nsubscriptions; i++) {
              const base = in_ptr + i * 48;
@@ -888,7 +1104,7 @@ async function start() {
                      // Connected socket - readable if there's data
                      triggered = true;
                      evType = 1;
-                     nbytes = sockRecvBuffer.length + netStack.txBuffer.length;
+                     nbytes = netStack.txBuffer.length;
                      // // parentPort.postMessage({ type: 'debug', msg: `poll: conn fd readable, ${nbytes} bytes` });
                  }
              } else if (type === 2) { // WRITE
@@ -952,7 +1168,7 @@ async function start() {
                 // Poll for network responses first
                 netStack.pollNetResponses();
                 
-                parentPort.postMessage({ type: 'debug', msg: `sock_recv(${fd}) called, buffered=${sockRecvBuffer.length}, pending=${netStack.hasPendingData()}, fin=${netStack.hasReceivedFin()}` });
+                parentPort.postMessage({ type: 'debug', msg: `sock_recv(${fd}) called, sockRecvBuf=${sockRecvBuffer.length}, txBuf=${netStack.txBuffer.length}, fin=${netStack.hasReceivedFin()}` });
                 
                 if (fd !== NET_CONN_FD) {
                     // parentPort.postMessage({ type: 'debug', msg: `sock_recv(${fd}) - wrong fd` });
@@ -965,6 +1181,7 @@ async function start() {
                 // First check if we have buffered data from a previous partial read
                 if (sockRecvBuffer.length === 0) {
                     const data = netStack.readFromNetwork(4096);
+                    parentPort.postMessage({ type: 'debug', msg: `sock_recv readFromNetwork returned ${data ? data.length : 'null'} bytes, txBuf now=${netStack.txBuffer.length}` });
                     if (!data || data.length === 0) {
                         // Check if FIN was received - if so, return EOF (0 bytes) instead of EAGAIN
                         if (netStack.hasReceivedFin()) {
@@ -990,6 +1207,9 @@ async function start() {
                 
                 // Write data to iovec buffers
                 const bytesWritten = writeIOVs(view, ri_data_ptr, ri_data_len, sockRecvBuffer);
+                
+                // Debug: show how much we wrote vs how much we had
+                parentPort.postMessage({ type: 'debug', msg: `sock_recv wrote ${bytesWritten}/${sockRecvBuffer.length} bytes to ${ri_data_len} iovecs` });
                 
                 // Keep any unwritten data for the next call
                 sockRecvBuffer = sockRecvBuffer.subarray(bytesWritten);
