@@ -6,8 +6,10 @@ const dgram = require('node:dgram');
 // Buffer layout:
 // Int32[0]: Flag (0 = Free/Empty, 1 = Data Ready)
 // Int32[1]: Data Length
-// Offset 8: Data Bytes
+// Int32[2]: Network signal (incremented when network data arrives)
+// Offset 12: Data Bytes (after 3 Int32s = 12 bytes)
 const SHARED_BUFFER_SIZE = 64 * 1024; // 64KB
+const NET_SIGNAL_INDEX = 2; // Index for network wake signal
 
 class AgentVM {
     /**
@@ -27,11 +29,11 @@ class AgentVM {
         this.mac = options.mac || '02:00:00:00:00:01';
         this.debug = options.debug || false;
         this.interactive = options.interactive || false;
-        // Rate limit: 256KB/s default to avoid overwhelming VM filesystem writes
-        this.networkRateLimit = options.networkRateLimit !== undefined ? options.networkRateLimit :  256 * 1024;
+        // Rate limit to avoid overwhelming VM filesystem writes
+        this.networkRateLimit = options.networkRateLimit !== undefined ? options.networkRateLimit :  1024 * 1024 * 1024;
         this.sharedBuffer = new SharedArrayBuffer(SHARED_BUFFER_SIZE);
         this.inputInt32 = new Int32Array(this.sharedBuffer);
-        this.inputData = new Uint8Array(this.sharedBuffer, 8);
+        this.inputData = new Uint8Array(this.sharedBuffer, 12); // Offset 12 (after 3 Int32s)
         
         this.worker = null;
         this.pendingCommand = null; // { resolve, reject, marker, outputStr, stderrStr }
@@ -116,8 +118,8 @@ class AgentVM {
                 } else if (msg.type === 'stderr') {
                     this.handleOutput('stderr', msg.data);
                 } else if (msg.type === 'debug') {
-                    // Worker debug messages (disabled by default for performance)
-                    // if (this.debug) console.log('[Worker]', msg.msg);
+                    // Worker debug messages
+                    if (this.debug) console.log('[Worker]', msg.msg);
                 } else if (msg.type === 'exit') {
                     if (!this.destroyed && !this.interactive) {
                         console.error('VM Exited unexpectedly:', msg.error);
@@ -323,8 +325,7 @@ class AgentVM {
                 }
             }
             
-            // Use transferable Uint8Array for efficiency with large data
-            // NOTE: We must copy the data because socket buffers may share ArrayBuffer
+            // Send data immediately to worker - batching caused delivery delays
             try {
                 const copy = new Uint8Array(data.length);
                 copy.set(data);
@@ -333,14 +334,19 @@ class AgentVM {
                     key,
                     data: copy
                 }, [copy.buffer]);
+                
+                // Signal the worker that network data is available
+                Atomics.add(this.inputInt32, NET_SIGNAL_INDEX, 1);
+                Atomics.notify(this.inputInt32, NET_SIGNAL_INDEX);
             } catch (e) {
-                console.error('[TCP] Failed to post data:', e.message);
-                // Fallback: send without transfer
+                // Fallback without transfer
                 this.netChannel.port2.postMessage({
                     type: 'tcp-data',
                     key,
                     data: new Uint8Array(data)
                 });
+                Atomics.add(this.inputInt32, NET_SIGNAL_INDEX, 1);
+                Atomics.notify(this.inputInt32, NET_SIGNAL_INDEX);
             }
         });
         
@@ -353,7 +359,7 @@ class AgentVM {
         });
         
         socket.on('close', () => {
-            // Clean up rate limit timer
+            // Clean up timers
             if (session.pendingResume) {
                 clearTimeout(session.pendingResume);
                 session.pendingResume = null;
@@ -368,7 +374,7 @@ class AgentVM {
         });
         
         socket.on('error', (err) => {
-            // Clean up rate limit timer
+            // Clean up timers
             if (session.pendingResume) {
                 clearTimeout(session.pendingResume);
                 session.pendingResume = null;
@@ -402,6 +408,9 @@ class AgentVM {
      */
     _handleTcpClose(msg) {
         const { key, destroy } = msg;
+        if (this.debug) {
+            console.log(`[TCP] Close request for ${key}, destroy=${destroy}`);
+        }
         const session = this.tcpSessions.get(key);
         if (session) {
             if (destroy) {

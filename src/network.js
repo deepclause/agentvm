@@ -50,9 +50,9 @@ class NetworkStack extends EventEmitter {
         this.rxBuffer = Buffer.alloc(0); // Data received FROM the VM (buffering for full frame)
         
         // TCP Flow Control: Maximum buffer before requesting pause
-        // Keep buffers small to ensure responsive flow control
-        this.TX_BUFFER_HIGH_WATER = 16 * 1024;  // 16KB - request pause
-        this.TX_BUFFER_LOW_WATER = 4 * 1024;    // 4KB - request resume
+        // Use larger buffers to reduce pause/resume cycle frequency and improve throughput
+        this.TX_BUFFER_HIGH_WATER = 256 * 1024;  // 256KB - request pause
+        this.TX_BUFFER_LOW_WATER = 64 * 1024;    // 64KB - request resume
         this.txPaused = new Set(); // Set of TCP session keys that are paused
     }
     
@@ -65,8 +65,9 @@ class NetworkStack extends EventEmitter {
         
         const { receiveMessageOnPort } = require('node:worker_threads');
         
-        // Limit bytes processed per poll to prevent buffer explosion
-        const MAX_BYTES_PER_POLL = 64 * 1024; // 64KB max per poll cycle
+        // Process more bytes per poll to improve throughput
+        // The limit prevents runaway processing but should be large enough for sustained transfers
+        const MAX_BYTES_PER_POLL = 512 * 1024; // 512KB max per poll cycle
         let bytesThisPoll = 0;
         
         // Check for pending messages
@@ -248,9 +249,8 @@ class NetworkStack extends EventEmitter {
         const chunk = this.txBuffer.subarray(0, maxLen);
         this.txBuffer = this.txBuffer.subarray(chunk.length);
         
-
-        
-        // Flow control: resume paused TCP sessions when buffer drains
+        // Flow control: resume paused TCP sessions when buffer drains below low water mark
+        // This is critical for maintaining throughput - we need to resume quickly
         if (this.txBuffer.length < this.TX_BUFFER_LOW_WATER && this.txPaused.size > 0) {
             this.emit('debug', `[TCP] Resuming ${this.txPaused.size} sessions, txBuffer=${this.txBuffer.length}`);
             for (const key of this.txPaused) {
@@ -262,6 +262,14 @@ class NetworkStack extends EventEmitter {
         }
         
         return chunk;
+    }
+    
+    /**
+     * Get the current size of pending data in the TX buffer
+     * @returns {number} Number of bytes waiting to be read
+     */
+    pendingDataSize() {
+        return this.txBuffer.length;
     }
     
     /**

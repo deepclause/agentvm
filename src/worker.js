@@ -7,7 +7,8 @@ const { wasmPath, sharedInputBuffer, mounts, network, mac, netPort } = workerDat
 const inputInt32 = new Int32Array(sharedInputBuffer);
 const INPUT_FLAG_INDEX = 0;
 const INPUT_SIZE_INDEX = 1;
-const INPUT_DATA_OFFSET = 8;
+const NET_SIGNAL_INDEX = 2;  // Network wake signal
+const INPUT_DATA_OFFSET = 12; // Offset after 3 Int32s
 
 let localBuffer = new Uint8Array(0);
 
@@ -29,9 +30,8 @@ netStack.on('debug', (msg) => {
 });
 
 netStack.on('network-activity', () => {
-    // We should wake up poll_oneoff if it's waiting?
-    // Not easily possible unless we use SharedArrayBuffer for signaling or
-    // just rely on poll timeout loop.
+    // Network activity is signaled by the main thread via NET_SIGNAL_INDEX
+    // which wakes up Atomics.wait in poll_oneoff
 });
 
 // Helper to read IOVectors from WASM memory
@@ -896,7 +896,8 @@ async function start() {
             // Poll for network responses before reading
             netStack.pollNetResponses();
             
-            const data = netStack.readFromNetwork(4096);
+            // Read larger chunks for better throughput
+            const data = netStack.readFromNetwork(65536);
             if (!data || data.length === 0) {
                 view.setUint32(nread_ptr, 0, true);
                 return 0;
@@ -1012,7 +1013,8 @@ async function start() {
         }
         
         // Log what we're waiting for
-        parentPort.postMessage({ type: 'debug', msg: `poll_oneoff: hasStdin=${hasStdin}, hasNetRead=${hasNetRead}, hasNetWrite=${hasNetWrite}, hasNetListen=${hasNetListen}, timeout=${minTimeout}, otherFds=[${otherFds.join(',')}], pending=${netStack.hasPendingData()}, fin=${netStack.hasReceivedFin()}` });
+        const pollStart = Date.now();
+        parentPort.postMessage({ type: 'debug', msg: `poll_oneoff: hasStdin=${hasStdin}, hasNetRead=${hasNetRead}, hasNetWrite=${hasNetWrite}, timeout=${minTimeout}ms, sockRecvBuf=${sockRecvBuffer.length}, txBuf=${netStack.txBuffer.length}` });
         
         // IMPORTANT: Always poll for network responses first!
         // This ensures TCP data from main thread is received even when 
@@ -1020,7 +1022,8 @@ async function start() {
         netStack.pollNetResponses();
         
         // 2. Check Immediate Status
-        const netReadable = netStack.hasPendingData() || netStack.hasReceivedFin();
+        // Include sockRecvBuffer in readability check - it may have data from a previous partial read
+        const netReadable = sockRecvBuffer.length > 0 || netStack.hasPendingData() || netStack.hasReceivedFin();
         const netWritable = true; // Always writable
         const stdinReadable = localBuffer.length > 0 || Atomics.load(inputInt32, INPUT_FLAG_INDEX) !== 0;
         
@@ -1048,29 +1051,44 @@ async function start() {
                 waitTime = -1; // Infinite
             }
             
-            // If we are waiting for Stdin, we can use Atomics.wait
+            // If we are waiting for Stdin or network, use a hybrid approach:
+            // - Use non-blocking poll first (no Atomics.wait)
+            // - Only sleep when we've polled several times with no data
             if (hasStdin || hasNetRead || waitTime > 0) {
-                 // Problem: Atomics.wait blocks the event loop completely.
-                 // UDP responses come via MessagePort from main thread.
-                 // Solution: Use short waits and poll for UDP messages via receiveMessageOnPort.
-                 
                  const t = (waitTime === -1) ? 30000 : waitTime; // Max 30s for "infinite"
-                 const chunkSize = 5; // 5ms chunks - good balance between responsiveness and CPU
-                 let remaining = t;
+                 const startTime = Date.now();
+                 let lastNetSignal = Atomics.load(inputInt32, NET_SIGNAL_INDEX);
+                 let pollCount = 0;
                  
-                 while (remaining > 0) {
-                     const waitChunk = Math.min(chunkSize, remaining);
-                     Atomics.wait(inputInt32, INPUT_FLAG_INDEX, 0, waitChunk);
-                     remaining -= waitChunk;
+                 while (true) {
+                     const elapsed = Date.now() - startTime;
+                     if (elapsed >= t) break;
                      
-                     // Poll for network responses from main thread (synchronous)
+                     // ALWAYS poll for network responses
                      netStack.pollNetResponses();
+                     pollCount++;
                      
                      // Check if stdin became available
-                     if (Atomics.load(inputInt32, INPUT_FLAG_INDEX) !== 0) break;
+                     if (hasStdin && Atomics.load(inputInt32, INPUT_FLAG_INDEX) !== 0) break;
                      
-                     // Check if network data became available (from UDP responses or FIN)
-                     if (hasNetRead && (netStack.hasPendingData() || netStack.hasReceivedFin())) break;
+                     // Check if network data became available (including buffered data)
+                     if (sockRecvBuffer.length > 0 || netStack.hasPendingData() || netStack.hasReceivedFin()) break;
+                     
+                     // Check if network signal changed (new data arrived)
+                     const newNetSignal = Atomics.load(inputInt32, NET_SIGNAL_INDEX);
+                     if (newNetSignal !== lastNetSignal) {
+                         lastNetSignal = newNetSignal;
+                         continue; // Data may have arrived, loop again to poll
+                     }
+                     
+                     // Only sleep after polling a few times with no data
+                     // This ensures we stay responsive when data is flowing
+                     if (pollCount > 10) {
+                         // Sleep for 1ms using Atomics.wait - will wake early on signal
+                         const remaining = Math.max(1, t - elapsed);
+                         Atomics.wait(inputInt32, NET_SIGNAL_INDEX, lastNetSignal, Math.min(1, remaining));
+                         pollCount = 0; // Reset poll count after sleeping
+                     }
                  }
             }
         }
@@ -1078,9 +1096,9 @@ async function start() {
         // 4. Populate Events
         let eventsWritten = 0;
         
-        // Refresh status
+        // Refresh status (include sockRecvBuffer in check)
         const postStdinReadable = localBuffer.length > 0 || Atomics.load(inputInt32, INPUT_FLAG_INDEX) !== 0;
-        const postNetReadable = netStack.hasPendingData() || netStack.hasReceivedFin();
+        const postNetReadable = sockRecvBuffer.length > 0 || netStack.hasPendingData() || netStack.hasReceivedFin();
         
         for(let i=0; i<nsubscriptions; i++) {
              const base = in_ptr + i * 48;
@@ -1132,6 +1150,10 @@ async function start() {
         }
         
         view.setUint32(nevents_ptr, eventsWritten, true);
+        const pollDuration = Date.now() - pollStart;
+        if (pollDuration > 5) {
+            parentPort.postMessage({ type: 'debug', msg: `poll_oneoff completed in ${pollDuration}ms, events=${eventsWritten}` });
+        }
         return 0; // Success
     };
 
@@ -1180,7 +1202,8 @@ async function start() {
                 
                 // First check if we have buffered data from a previous partial read
                 if (sockRecvBuffer.length === 0) {
-                    const data = netStack.readFromNetwork(4096);
+                    // Read larger chunks for better throughput - the VM will consume what it needs
+                    const data = netStack.readFromNetwork(65536);
                     parentPort.postMessage({ type: 'debug', msg: `sock_recv readFromNetwork returned ${data ? data.length : 'null'} bytes, txBuf now=${netStack.txBuffer.length}` });
                     if (!data || data.length === 0) {
                         // Check if FIN was received - if so, return EOF (0 bytes) instead of EAGAIN
