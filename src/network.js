@@ -84,9 +84,10 @@ class NetworkStack extends EventEmitter {
         if (!this.ringReader) return;
         
         // Process more bytes per poll to improve throughput
-        // The limit prevents runaway processing but should be large enough for sustained transfers
-        const MAX_BYTES_PER_POLL = 512 * 1024; // 512KB max per poll cycle
-        let bytesThisPoll = 0;
+        // BUT: Always process control messages (END, ERROR, etc.) to avoid deadlocks!
+        const MAX_DATA_BYTES_PER_POLL = 512 * 1024; // 512KB max DATA per poll cycle
+        let dataBytesThisPoll = 0;
+        let hitDataLimit = false;
         
         // Read messages from ring buffer (no polling needed - direct memory access!)
         let msg;
@@ -98,14 +99,20 @@ class NetworkStack extends EventEmitter {
                 const key = this.ringReader.parseKey(msg.payload);
                 this._handleTcpConnected({ key });
             } else if (msg.type === NET_MSG_TCP_DATA) {
+                // Skip data if we've hit the limit - but keep processing control messages!
+                if (hitDataLimit) {
+                    // Put this message back? No, we can't. Instead, process it anyway
+                    // but set a flag to stop reading MORE data messages after this
+                }
                 const parsed = this.ringReader.parseTcpData(msg.payload);
                 this._handleTcpData(parsed);
-                bytesThisPoll += parsed.data.length;
-                // Stop processing data if we've hit the limit - leave rest for next poll
-                if (bytesThisPoll >= MAX_BYTES_PER_POLL) {
-                    break;
+                dataBytesThisPoll += parsed.data.length;
+                if (dataBytesThisPoll >= MAX_DATA_BYTES_PER_POLL) {
+                    hitDataLimit = true;
+                    // Don't break! Continue processing to catch any control messages
                 }
             } else if (msg.type === NET_MSG_TCP_END) {
+                // CRITICAL: Always process END messages to avoid deadlocks!
                 const key = this.ringReader.parseKey(msg.payload);
                 this._handleTcpEnd({ key });
             } else if (msg.type === NET_MSG_TCP_ERROR) {

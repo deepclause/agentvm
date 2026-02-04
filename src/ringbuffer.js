@@ -40,8 +40,8 @@ const STDIN_AREA_SIZE = 4096;  // 4KB for stdin
 const STDIN_OFFSET = HEADER_SIZE;
 const NET_RING_OFFSET = HEADER_SIZE + STDIN_AREA_SIZE;
 
-// Total buffer size: 32 + 4096 + 256KB = ~260KB
-const NET_RING_SIZE = 256 * 1024;
+// Total buffer size: 32 + 4096 + 1MB = ~1MB
+const NET_RING_SIZE = 1024 * 1024;  // 1MB ring buffer for larger transfers
 const TOTAL_BUFFER_SIZE = HEADER_SIZE + STDIN_AREA_SIZE + NET_RING_SIZE;
 
 // Network message types

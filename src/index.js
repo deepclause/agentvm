@@ -252,6 +252,13 @@ class AgentVM {
         const connectIP = (dstIP === '192.168.127.1') ? '127.0.0.1' : dstIP;
         
         const socket = new net.Socket();
+        
+        // Enable TCP keepalive to prevent connection drops during pauses
+        socket.setKeepAlive(true, 30000); // Send keepalive every 30 seconds
+        
+        // Set a generous timeout for slow connections (5 minutes)
+        socket.setTimeout(300000);
+        
         const session = { 
             socket, srcIP, srcPort, dstIP, dstPort,
             // Rate limiting state
@@ -342,7 +349,22 @@ class AgentVM {
         });
         
         socket.on('end', () => {
-            this.ringWriter.writeTcpEnd(key);
+            // Mark that we've received FIN from remote
+            session.remoteEnded = true;
+            
+            // If socket is paused for ring buffer backpressure, defer the END
+            // This ensures all data arrives at the worker before the END
+            if (session.ringBufferPaused || (session.pendingData && session.pendingData.length > 0)) {
+                if (this.debug) {
+                    console.log(`[TCP] Deferring END for ${key}, paused=${session.ringBufferPaused}, pending=${session.pendingData?.length || 0}`);
+                }
+                // The flush timer will send the END once pending data is flushed
+            } else {
+                if (this.debug) {
+                    console.log(`[TCP] Sending END for ${key} immediately`);
+                }
+                this.ringWriter.writeTcpEnd(key);
+            }
         });
         
         socket.on('close', () => {
@@ -371,6 +393,16 @@ class AgentVM {
             }
             this.ringWriter.writeTcpError(key, err.message);
             this.tcpSessions.delete(key);
+        });
+        
+        socket.on('timeout', () => {
+            // Socket has been idle too long - just reset the timeout, don't close
+            // This handles the case where the VM is slow to process data
+            if (this.debug) {
+                console.log(`[TCP] Socket timeout for ${key}, resetting`);
+            }
+            // Reset the timeout - we don't want to close the connection
+            socket.setTimeout(300000);
         });
     }
     
@@ -460,6 +492,24 @@ class AgentVM {
             
             // If all pending data flushed, clear timer and resume
             if (session.pendingData.length === 0) {
+                // Send deferred END if remote ended while we had pending data
+                // Important: We must ensure END is written before clearing the timer
+                if (session.remoteEnded && !session.endSent) {
+                    const endWritten = this.ringWriter.writeTcpEnd(key);
+                    if (!endWritten) {
+                        // No space for END yet - signal worker and try again next tick
+                        this.ringWriter.signalWorker();
+                        if (this.debug) {
+                            console.log(`[RingBuffer] Waiting to send END for ${key}, buffer full`);
+                        }
+                        return; // Don't clear timer yet, keep trying
+                    }
+                    session.endSent = true;
+                    if (this.debug) {
+                        console.log(`[RingBuffer] Sent deferred END for ${key}`);
+                    }
+                }
+                
                 clearInterval(session.ringBufferFlushTimer);
                 session.ringBufferFlushTimer = null;
                 session.ringBufferPaused = false;
