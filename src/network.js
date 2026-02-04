@@ -88,10 +88,12 @@ class NetworkStack extends EventEmitter {
         const MAX_DATA_BYTES_PER_POLL = 512 * 1024; // 512KB max DATA per poll cycle
         let dataBytesThisPoll = 0;
         let hitDataLimit = false;
+        let messagesRead = 0;
         
         // Read messages from ring buffer (no polling needed - direct memory access!)
         let msg;
         while ((msg = this.ringReader.readNetworkMessage())) {
+            messagesRead++;
             if (msg.type === NET_MSG_UDP_RECV) {
                 const parsed = this.ringReader.parseUdpRecv(msg.payload);
                 this._handleUdpResponse(parsed);
@@ -122,6 +124,10 @@ class NetworkStack extends EventEmitter {
                 const key = this.ringReader.parseKey(msg.payload);
                 this._handleTcpClosed({ key });
             }
+        }
+        
+        if (messagesRead > 0) {
+            this.emit('debug', `[NetStack] pollNetResponses: read ${messagesRead} messages, ${dataBytesThisPoll} data bytes, txBuf=${this.txBuffer.length}`);
         }
     }
     
@@ -194,14 +200,9 @@ class NetworkStack extends EventEmitter {
             offset += chunkSize;
         }
         
-        // Flow control: pause main thread socket if buffer is too full
-        if (this.txBuffer.length > this.TX_BUFFER_HIGH_WATER && !this.txPaused.has(key)) {
-            this.txPaused.add(key);
-            this.emit('debug', `[TCP] Pausing ${key}, txBuffer=${this.txBuffer.length}`);
-            if (this.netPort) {
-                this.netPort.postMessage({ type: 'tcp-pause', key });
-            }
-        }
+        // Note: Flow control is handled by ring buffer backpressure in main thread.
+        // When ring buffer is full, main thread pauses socket and buffers data.
+        // No need for worker-side txBuffer flow control - it would cause deadlocks.
     }
     
     /**
@@ -278,18 +279,6 @@ class NetworkStack extends EventEmitter {
         
         const chunk = this.txBuffer.subarray(0, maxLen);
         this.txBuffer = this.txBuffer.subarray(chunk.length);
-        
-        // Flow control: resume paused TCP sessions when buffer drains below low water mark
-        // This is critical for maintaining throughput - we need to resume quickly
-        if (this.txBuffer.length < this.TX_BUFFER_LOW_WATER && this.txPaused.size > 0) {
-            this.emit('debug', `[TCP] Resuming ${this.txPaused.size} sessions, txBuffer=${this.txBuffer.length}`);
-            for (const key of this.txPaused) {
-                if (this.netPort) {
-                    this.netPort.postMessage({ type: 'tcp-resume', key });
-                }
-            }
-            this.txPaused.clear();
-        }
         
         return chunk;
     }
@@ -553,6 +542,8 @@ class NetworkStack extends EventEmitter {
                     this.netPort.postMessage({ type: 'tcp-close', key, destroy: true });
                 }
                 this.natTable.delete(key);
+                // Clean up flow control state
+                this.txPaused.delete(key);
             }
             return;
         }
@@ -624,6 +615,8 @@ class NetworkStack extends EventEmitter {
             // If remote already closed, we can now clean up the session
             if (session.state === 'CLOSED_BY_REMOTE' || session.state === 'FIN_WAIT') {
                 this.natTable.delete(key);
+                // Clean up flow control state
+                this.txPaused.delete(key);
             } else {
                 session.state = 'FIN_SENT';
             }

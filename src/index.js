@@ -23,7 +23,7 @@ class AgentVM {
         this.debug = options.debug || false;
         this.interactive = options.interactive || false;
         // Rate limit to avoid overwhelming VM filesystem writes
-        this.networkRateLimit = options.networkRateLimit !== undefined ? options.networkRateLimit :  1024 * 1024 * 1024;
+        this.networkRateLimit = options.networkRateLimit !== undefined ? options.networkRateLimit : 512 * 1024; // 512KB/s default
         
         // Use the new ring buffer layout
         this.sharedBuffer = new SharedArrayBuffer(TOTAL_BUFFER_SIZE);
@@ -62,11 +62,8 @@ class AgentVM {
                 this._handleTcpSend(msg);
             } else if (msg.type === 'tcp-close') {
                 this._handleTcpClose(msg);
-            } else if (msg.type === 'tcp-pause') {
-                this._handleTcpPause(msg);
-            } else if (msg.type === 'tcp-resume') {
-                this._handleTcpResume(msg);
             }
+            // Note: tcp-pause/tcp-resume removed - using ring buffer backpressure only
         });
 
         return new Promise((resolve, reject) => {
@@ -210,6 +207,10 @@ class AgentVM {
     _handleUdpSend(msg) {
         const { key, dstIP, dstPort, payload, srcIP, srcPort } = msg;
         
+        if (this.debug) {
+            console.log(`[UDP] Send request: ${srcIP}:${srcPort} -> ${dstIP}:${dstPort}, ${payload.length} bytes`);
+        }
+        
         let session = this.udpSessions.get(key);
         if (!session) {
             const socket = dgram.createSocket('udp4');
@@ -217,6 +218,9 @@ class AgentVM {
             this.udpSessions.set(key, session);
             
             socket.on('message', (data, rinfo) => {
+                if (this.debug) {
+                    console.log(`[UDP] Response from ${rinfo.address}:${rinfo.port}, ${data.length} bytes`);
+                }
                 // Send response back to worker via ring buffer
                 this.ringWriter.writeUdpRecv({
                     key,
@@ -265,7 +269,6 @@ class AgentVM {
             bytesThisSecond: 0,
             lastReset: Date.now(),
             rateLimitPaused: false,
-            flowControlPaused: false,  // Track flow control state
             pendingResume: null
         };
         this.tcpSessions.set(key, session);
@@ -280,6 +283,9 @@ class AgentVM {
         });
         
         socket.on('data', (data) => {
+            if (this.debug) {
+                console.log(`[TCP] Received ${data.length} bytes from server for ${key}`);
+            }
             // Rate limiting: track bytes per second
             if (this.networkRateLimit > 0) {
                 const now = Date.now();
@@ -308,14 +314,14 @@ class AgentVM {
                         session.lastReset = Date.now();
                         session.pendingResume = null;
                         
-                        // Only actually resume if flow control also allows it
-                        if (!session.flowControlPaused && !session.ringBufferPaused) {
+                        // Only actually resume if not also paused for ring buffer
+                        if (!session.ringBufferPaused) {
                             socket.resume();
                             if (this.debug) {
                                 console.log(`[RateLimit] Resuming ${key}`);
                             }
                         } else if (this.debug) {
-                            console.log(`[RateLimit] Rate limit cleared for ${key}, but still paused`);
+                            console.log(`[RateLimit] Rate limit cleared for ${key}, but ringBufferPaused`);
                         }
                     }, timeUntilNextSecond);
                 }
@@ -453,7 +459,7 @@ class AgentVM {
                 session.ringBufferFlushTimer = null;
                 session.ringBufferPaused = false;
                 
-                if (!session.flowControlPaused && !session.rateLimitPaused && session.socket) {
+                if (!session.rateLimitPaused && session.socket) {
                     session.socket.resume();
                     if (this.debug) {
                         console.log(`[RingBuffer] Resuming ${key}, buffer drained`);
@@ -514,7 +520,7 @@ class AgentVM {
                 session.ringBufferFlushTimer = null;
                 session.ringBufferPaused = false;
                 
-                if (!session.flowControlPaused && !session.rateLimitPaused && session.socket) {
+                if (!session.rateLimitPaused && session.socket) {
                     session.socket.resume();
                     if (this.debug) {
                         console.log(`[RingBuffer] Resuming ${key}, pending data flushed`);
@@ -524,34 +530,9 @@ class AgentVM {
         }, 1); // Try every 1ms
     }
     
-    /**
-     * Handle TCP pause request from worker (flow control)
-     * @private
-     */
-    _handleTcpPause(msg) {
-        const { key } = msg;
-        const session = this.tcpSessions.get(key);
-        if (session && session.socket) {
-            session.flowControlPaused = true;
-            session.socket.pause();
-        }
-    }
+    // Note: Worker-side flow control (tcp-pause) removed - using ring buffer backpressure only
     
-    /**
-     * Handle TCP resume request from worker (flow control)
-     * @private
-     */
-    _handleTcpResume(msg) {
-        const { key } = msg;
-        const session = this.tcpSessions.get(key);
-        if (session && session.socket) {
-            session.flowControlPaused = false;
-            // Only resume if not also paused for other reasons
-            if (!session.rateLimitPaused && !session.ringBufferPaused) {
-                session.socket.resume();
-            }
-        }
-    }
+    // Note: Worker-side flow control (tcp-resume) removed - using ring buffer backpressure only
 
     /**
      * Executes a command in the VM.
