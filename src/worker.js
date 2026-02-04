@@ -2,21 +2,22 @@ const { parentPort, workerData, receiveMessageOnPort } = require('node:worker_th
 const { WASI } = require('node:wasi');
 const fs = require('node:fs');
 const { NetworkStack } = require('./network');
+const { RingBufferReader, IO_READY_INDEX, STDIN_FLAG_INDEX, STDIN_SIZE_INDEX, STDIN_DATA_OFFSET, NET_RING_OFFSET } = require('./ringbuffer');
 
-const { wasmPath, sharedInputBuffer, mounts, network, mac, netPort } = workerData;
-const inputInt32 = new Int32Array(sharedInputBuffer);
-const INPUT_FLAG_INDEX = 0;
-const INPUT_SIZE_INDEX = 1;
-const NET_SIGNAL_INDEX = 2;  // Network wake signal
-const INPUT_DATA_OFFSET = 12; // Offset after 3 Int32s
+const { wasmPath, sharedBuffer, mounts, network, mac, netPort } = workerData;
+
+// Initialize ring buffer reader for shared memory IPC (main → worker data)
+const ringReader = new RingBufferReader(sharedBuffer);
 
 let localBuffer = new Uint8Array(0);
 
 // Buffer for sock_recv to handle partial reads
 let sockRecvBuffer = Buffer.alloc(0);
 
-// Initialize Network Stack with net port for main-thread communication
-const netStack = new NetworkStack({ netPort });
+// Initialize Network Stack with:
+// - ringReader for incoming data (main → worker, via SharedArrayBuffer)
+// - netPort for outgoing control messages (worker → main, via MessagePort)
+const netStack = new NetworkStack({ ringReader, netPort });
 const NET_FD = 3; // Standard for LISTEN_FDS=1 (listening socket)
 const NET_CONN_FD = 4; // Connected socket for actual I/O
 let netConnectionAccepted = false;
@@ -30,8 +31,8 @@ netStack.on('debug', (msg) => {
 });
 
 netStack.on('network-activity', () => {
-    // Network activity is signaled by the main thread via NET_SIGNAL_INDEX
-    // which wakes up Atomics.wait in poll_oneoff
+    // Network activity is signaled via IO_READY_INDEX in the shared buffer
+    // which wakes up ringReader.waitForIO() in poll_oneoff
 });
 
 // Helper to read IOVectors from WASM memory
@@ -911,17 +912,13 @@ async function start() {
             if (!instance) return 0;
             
             if (localBuffer.length === 0) {
-                 Atomics.wait(inputInt32, INPUT_FLAG_INDEX, 0);
+                 // Wait for stdin data using ring buffer
+                 ringReader.waitForIO(-1); // Block until I/O ready
                  
-                 const size = inputInt32[INPUT_SIZE_INDEX];
-                 if (size > 0) {
-                     const sharedData = new Uint8Array(sharedInputBuffer, INPUT_DATA_OFFSET, size);
-                     localBuffer = sharedData.slice(0);
+                 const stdinData = ringReader.readStdin();
+                 if (stdinData && stdinData.length > 0) {
+                     localBuffer = stdinData;
                  }
-                 
-                 inputInt32[INPUT_SIZE_INDEX] = 0;
-                 Atomics.store(inputInt32, INPUT_FLAG_INDEX, 0);
-                 Atomics.notify(inputInt32, INPUT_FLAG_INDEX);
             }
 
             if (localBuffer.length === 0) return 0; 
@@ -1025,7 +1022,7 @@ async function start() {
         // Include sockRecvBuffer in readability check - it may have data from a previous partial read
         const netReadable = sockRecvBuffer.length > 0 || netStack.hasPendingData() || netStack.hasReceivedFin();
         const netWritable = true; // Always writable
-        const stdinReadable = localBuffer.length > 0 || Atomics.load(inputInt32, INPUT_FLAG_INDEX) !== 0;
+        const stdinReadable = localBuffer.length > 0 || ringReader.hasStdinData();
         
         let ready = false;
         if (hasStdin && stdinReadable) ready = true;
@@ -1034,16 +1031,9 @@ async function start() {
         
         // 3. Wait if needed
         if (!ready && minTimeout !== 0) {
-            // We can only wait on Stdin safely via Atomics.
-            // If we are waiting for Net Read, and it's not ready, we depend on external event.
-            // But we can't wait on external event easily here.
-            // However, Net Write is always ready, so if hasNetWrite is true, we wouldn't be here.
+            // Wait for I/O using the unified ring buffer signal
+            // The main thread notifies IO_READY_INDEX when stdin OR network data arrives
             
-            // So we are here if:
-            // - Asking for Stdin (empty) AND/OR Net Read (empty)
-            // - AND NOT asking for Net Write
-            
-            // If we have a timeout, we wait.
             let waitTime = 0;
             if (minTimeout !== Infinity) {
                 waitTime = Math.max(0, Math.ceil(minTimeout));
@@ -1051,44 +1041,33 @@ async function start() {
                 waitTime = -1; // Infinite
             }
             
-            // If we are waiting for Stdin or network, use a hybrid approach:
-            // - Use non-blocking poll first (no Atomics.wait)
-            // - Only sleep when we've polled several times with no data
+            // Use the ring buffer's efficient wait mechanism
             if (hasStdin || hasNetRead || waitTime > 0) {
                  const t = (waitTime === -1) ? 30000 : waitTime; // Max 30s for "infinite"
                  const startTime = Date.now();
-                 let lastNetSignal = Atomics.load(inputInt32, NET_SIGNAL_INDEX);
-                 let pollCount = 0;
                  
                  while (true) {
                      const elapsed = Date.now() - startTime;
                      if (elapsed >= t) break;
                      
-                     // ALWAYS poll for network responses
+                     // Poll for network responses from ring buffer (no busy-wait needed!)
                      netStack.pollNetResponses();
-                     pollCount++;
                      
                      // Check if stdin became available
-                     if (hasStdin && Atomics.load(inputInt32, INPUT_FLAG_INDEX) !== 0) break;
+                     if (hasStdin && ringReader.hasStdinData()) break;
                      
                      // Check if network data became available (including buffered data)
                      if (sockRecvBuffer.length > 0 || netStack.hasPendingData() || netStack.hasReceivedFin()) break;
                      
-                     // Check if network signal changed (new data arrived)
-                     const newNetSignal = Atomics.load(inputInt32, NET_SIGNAL_INDEX);
-                     if (newNetSignal !== lastNetSignal) {
-                         lastNetSignal = newNetSignal;
-                         continue; // Data may have arrived, loop again to poll
+                     // Check if there's more network data in the ring buffer
+                     if (ringReader.hasNetworkData()) {
+                         continue; // More data to process, don't sleep
                      }
                      
-                     // Only sleep after polling a few times with no data
-                     // This ensures we stay responsive when data is flowing
-                     if (pollCount > 10) {
-                         // Sleep for 1ms using Atomics.wait - will wake early on signal
-                         const remaining = Math.max(1, t - elapsed);
-                         Atomics.wait(inputInt32, NET_SIGNAL_INDEX, lastNetSignal, Math.min(1, remaining));
-                         pollCount = 0; // Reset poll count after sleeping
-                     }
+                     // Block efficiently until I/O is ready (stdin OR network)
+                     // This uses Atomics.wait which wakes instantly when notified
+                     const remaining = Math.max(1, t - elapsed);
+                     ringReader.waitForIO(Math.min(10, remaining)); // Short waits for responsiveness
                  }
             }
         }
@@ -1097,7 +1076,7 @@ async function start() {
         let eventsWritten = 0;
         
         // Refresh status (include sockRecvBuffer in check)
-        const postStdinReadable = localBuffer.length > 0 || Atomics.load(inputInt32, INPUT_FLAG_INDEX) !== 0;
+        const postStdinReadable = localBuffer.length > 0 || ringReader.hasStdinData();
         const postNetReadable = sockRecvBuffer.length > 0 || netStack.hasPendingData() || netStack.hasReceivedFin();
         
         for(let i=0; i<nsubscriptions; i++) {

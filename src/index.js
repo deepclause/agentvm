@@ -2,14 +2,7 @@ const { Worker, MessageChannel, SHARE_ENV } = require('node:worker_threads');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const dgram = require('node:dgram');
-
-// Buffer layout:
-// Int32[0]: Flag (0 = Free/Empty, 1 = Data Ready)
-// Int32[1]: Data Length
-// Int32[2]: Network signal (incremented when network data arrives)
-// Offset 12: Data Bytes (after 3 Int32s = 12 bytes)
-const SHARED_BUFFER_SIZE = 64 * 1024; // 64KB
-const NET_SIGNAL_INDEX = 2; // Index for network wake signal
+const { RingBufferWriter, TOTAL_BUFFER_SIZE, IO_READY_INDEX, STDIN_FLAG_INDEX, STDIN_AREA_SIZE } = require('./ringbuffer');
 
 class AgentVM {
     /**
@@ -31,9 +24,11 @@ class AgentVM {
         this.interactive = options.interactive || false;
         // Rate limit to avoid overwhelming VM filesystem writes
         this.networkRateLimit = options.networkRateLimit !== undefined ? options.networkRateLimit :  1024 * 1024 * 1024;
-        this.sharedBuffer = new SharedArrayBuffer(SHARED_BUFFER_SIZE);
-        this.inputInt32 = new Int32Array(this.sharedBuffer);
-        this.inputData = new Uint8Array(this.sharedBuffer, 12); // Offset 12 (after 3 Int32s)
+        
+        // Use the new ring buffer layout
+        this.sharedBuffer = new SharedArrayBuffer(TOTAL_BUFFER_SIZE);
+        this.ringWriter = new RingBufferWriter(this.sharedBuffer);
+        this.int32 = new Int32Array(this.sharedBuffer);
         
         this.worker = null;
         this.pendingCommand = null; // { resolve, reject, marker, outputStr, stderrStr }
@@ -79,10 +74,10 @@ class AgentVM {
                 workerData: {
                     wasmPath: this.wasmPath,
                     mounts: this.mounts,
-                    sharedInputBuffer: this.sharedBuffer,
+                    sharedBuffer: this.sharedBuffer,
                     network: this.network,
                     mac: this.mac,
-                    netPort: this.netChannel.port1
+                    netPort: this.netChannel.port1  // Still needed for worker → main control messages
                 },
                 transferList: [this.netChannel.port1],
                 env: SHARE_ENV  // Share environment variables with worker thread
@@ -222,11 +217,10 @@ class AgentVM {
             this.udpSessions.set(key, session);
             
             socket.on('message', (data, rinfo) => {
-                // Send response back to worker
-                this.netChannel.port2.postMessage({
-                    type: 'udp-recv',
+                // Send response back to worker via ring buffer
+                this.ringWriter.writeUdpRecv({
                     key,
-                    data: Array.from(data),
+                    data: data,
                     fromIP: rinfo.address,
                     fromPort: rinfo.port,
                     srcIP,
@@ -274,16 +268,11 @@ class AgentVM {
         }
         
         socket.connect(dstPort, connectIP, () => {
-            if (!this.netChannel) return;
-            this.netChannel.port2.postMessage({
-                type: 'tcp-connected',
-                key
-            });
+            // Send connected event via ring buffer
+            this.ringWriter.writeTcpConnected(key);
         });
         
         socket.on('data', (data) => {
-            if (!this.netChannel) return;
-            
             // Rate limiting: track bytes per second
             if (this.networkRateLimit > 0) {
                 const now = Date.now();
@@ -313,49 +302,47 @@ class AgentVM {
                         session.pendingResume = null;
                         
                         // Only actually resume if flow control also allows it
-                        if (!session.flowControlPaused) {
+                        if (!session.flowControlPaused && !session.ringBufferPaused) {
                             socket.resume();
                             if (this.debug) {
                                 console.log(`[RateLimit] Resuming ${key}`);
                             }
                         } else if (this.debug) {
-                            console.log(`[RateLimit] Rate limit cleared for ${key}, but flow control still paused`);
+                            console.log(`[RateLimit] Rate limit cleared for ${key}, but still paused`);
                         }
                     }, timeUntilNextSecond);
                 }
             }
             
-            // Send data immediately to worker - batching caused delivery delays
-            try {
-                const copy = new Uint8Array(data.length);
-                copy.set(data);
-                this.netChannel.port2.postMessage({
-                    type: 'tcp-data',
-                    key,
-                    data: copy
-                }, [copy.buffer]);
+            // Send data to worker via ring buffer
+            const bytesWritten = this.ringWriter.writeTcpData(key, data);
+            
+            if (bytesWritten < data.length) {
+                // Not all data was written - buffer the remainder and pause socket
+                const remaining = data.slice(bytesWritten);
+                if (!session.pendingData) {
+                    session.pendingData = [];
+                }
+                session.pendingData.push(remaining);
                 
-                // Signal the worker that network data is available
-                Atomics.add(this.inputInt32, NET_SIGNAL_INDEX, 1);
-                Atomics.notify(this.inputInt32, NET_SIGNAL_INDEX);
-            } catch (e) {
-                // Fallback without transfer
-                this.netChannel.port2.postMessage({
-                    type: 'tcp-data',
-                    key,
-                    data: new Uint8Array(data)
-                });
-                Atomics.add(this.inputInt32, NET_SIGNAL_INDEX, 1);
-                Atomics.notify(this.inputInt32, NET_SIGNAL_INDEX);
+                // Signal worker to drain the buffer
+                this.ringWriter.signalWorker();
+                
+                if (!session.ringBufferPaused) {
+                    session.ringBufferPaused = true;
+                    socket.pause();
+                    if (this.debug) {
+                        console.log(`[RingBuffer] Pausing ${key}, wrote ${bytesWritten}/${data.length}, ${session.pendingData.length} chunks pending`);
+                    }
+                    
+                    // Try to flush pending data periodically
+                    this._scheduleRingBufferFlush(key);
+                }
             }
         });
         
         socket.on('end', () => {
-            if (!this.netChannel) return;
-            this.netChannel.port2.postMessage({
-                type: 'tcp-end',
-                key
-            });
+            this.ringWriter.writeTcpEnd(key);
         });
         
         socket.on('close', () => {
@@ -364,12 +351,11 @@ class AgentVM {
                 clearTimeout(session.pendingResume);
                 session.pendingResume = null;
             }
-            if (this.netChannel) {
-                this.netChannel.port2.postMessage({
-                    type: 'tcp-close',
-                    key
-                });
+            if (session.ringBufferFlushTimer) {
+                clearInterval(session.ringBufferFlushTimer);
+                session.ringBufferFlushTimer = null;
             }
+            this.ringWriter.writeTcpClose(key);
             this.tcpSessions.delete(key);
         });
         
@@ -379,13 +365,11 @@ class AgentVM {
                 clearTimeout(session.pendingResume);
                 session.pendingResume = null;
             }
-            if (this.netChannel) {
-                this.netChannel.port2.postMessage({
-                    type: 'tcp-error',
-                    key,
-                    error: err.message
-                });
+            if (session.ringBufferFlushTimer) {
+                clearInterval(session.ringBufferFlushTimer);
+                session.ringBufferFlushTimer = null;
             }
+            this.ringWriter.writeTcpError(key, err.message);
             this.tcpSessions.delete(key);
         });
     }
@@ -422,6 +406,75 @@ class AgentVM {
     }
     
     /**
+     * Schedule flushing of pending ring buffer data
+     * @private
+     */
+    _scheduleRingBufferFlush(key) {
+        const session = this.tcpSessions.get(key);
+        if (!session || session.ringBufferFlushTimer) return;
+        
+        // Use a short interval to continuously try flushing
+        session.ringBufferFlushTimer = setInterval(() => {
+            if (!session.pendingData || session.pendingData.length === 0) {
+                // Nothing to flush - clear timer and resume
+                clearInterval(session.ringBufferFlushTimer);
+                session.ringBufferFlushTimer = null;
+                session.ringBufferPaused = false;
+                
+                if (!session.flowControlPaused && !session.rateLimitPaused && session.socket) {
+                    session.socket.resume();
+                    if (this.debug) {
+                        console.log(`[RingBuffer] Resuming ${key}, buffer drained`);
+                    }
+                }
+                return;
+            }
+            
+            // Try to write pending chunks
+            let written = 0;
+            while (session.pendingData.length > 0) {
+                const chunk = session.pendingData[0];
+                const bytesWritten = this.ringWriter.writeTcpData(key, chunk);
+                
+                if (bytesWritten === chunk.length) {
+                    // Full chunk written
+                    session.pendingData.shift();
+                    written += chunk.length;
+                } else if (bytesWritten > 0) {
+                    // Partial write - keep the remainder
+                    session.pendingData[0] = chunk.slice(bytesWritten);
+                    written += bytesWritten;
+                    // Buffer is full - signal worker to drain it
+                    this.ringWriter.signalWorker();
+                    break;
+                } else {
+                    // No space at all - signal worker to drain it
+                    this.ringWriter.signalWorker();
+                    break;
+                }
+            }
+            
+            if (this.debug && written > 0) {
+                console.log(`[RingBuffer] Flushed ${written} bytes for ${key}, ${session.pendingData.length} chunks remaining`);
+            }
+            
+            // If all pending data flushed, clear timer and resume
+            if (session.pendingData.length === 0) {
+                clearInterval(session.ringBufferFlushTimer);
+                session.ringBufferFlushTimer = null;
+                session.ringBufferPaused = false;
+                
+                if (!session.flowControlPaused && !session.rateLimitPaused && session.socket) {
+                    session.socket.resume();
+                    if (this.debug) {
+                        console.log(`[RingBuffer] Resuming ${key}, pending data flushed`);
+                    }
+                }
+            }
+        }, 1); // Try every 1ms
+    }
+    
+    /**
      * Handle TCP pause request from worker (flow control)
      * @private
      */
@@ -443,8 +496,8 @@ class AgentVM {
         const session = this.tcpSessions.get(key);
         if (session && session.socket) {
             session.flowControlPaused = false;
-            // Only resume if not also rate-limit paused
-            if (!session.rateLimitPaused) {
+            // Only resume if not also paused for other reasons
+            if (!session.rateLimitPaused && !session.ringBufferPaused) {
                 session.socket.resume();
             }
         }
@@ -480,24 +533,17 @@ class AgentVM {
     async writeToStdin(data) {
         const encoded = typeof data === 'string' ? new TextEncoder().encode(data) : data;
         let offset = 0;
-        const CHUNK_SIZE = SHARED_BUFFER_SIZE - 16;
+        const CHUNK_SIZE = STDIN_AREA_SIZE;
 
         while (offset < encoded.length) {
             // Wait for buffer to be free (0)
             // We use a polling loop to avoid blocking the main thread event loop
-            while (Atomics.load(this.inputInt32, 0) !== 0) {
+            while (Atomics.load(this.int32, STDIN_FLAG_INDEX) !== 0) {
                 await new Promise(r => setTimeout(r, 5));
             }
 
             const chunk = encoded.subarray(offset, offset + CHUNK_SIZE);
-            this.inputData.set(chunk);
-            this.inputInt32[1] = chunk.length;
-            
-            // Mark as Ready (1)
-            Atomics.store(this.inputInt32, 0, 1);
-            
-            // Wake up worker
-            Atomics.notify(this.inputInt32, 0);
+            this.ringWriter.writeStdin(chunk);
             
             offset += chunk.length;
         }

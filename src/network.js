@@ -1,4 +1,13 @@
 const EventEmitter = require('events');
+const { 
+    RingBufferReader, 
+    NET_MSG_TCP_CONNECTED, 
+    NET_MSG_TCP_DATA, 
+    NET_MSG_TCP_END, 
+    NET_MSG_TCP_ERROR, 
+    NET_MSG_TCP_CLOSE, 
+    NET_MSG_UDP_RECV 
+} = require('./ringbuffer');
 
 // Protocol Constants
 const ETH_P_IP = 0x0800;
@@ -42,7 +51,11 @@ class NetworkStack extends EventEmitter {
         
         this.natTable = new Map(); // key -> { state, mySeq, myAck, ... } for TCP state tracking
         
-        // Network I/O is handled by main thread via MessagePort
+        // Network I/O via shared ring buffer for INCOMING data (main → worker)
+        // No more MessagePort polling for data!
+        this.ringReader = options.ringReader || null;
+        
+        // MessagePort still needed for OUTGOING control messages (worker → main)
         this.netPort = options.netPort || null;
         
         // QEMU Framing Buffer
@@ -57,40 +70,50 @@ class NetworkStack extends EventEmitter {
     }
     
     /**
-     * Poll for network responses from main thread (synchronous)
+     * Check if there's network data available in the ring buffer
+     */
+    hasNetworkData() {
+        return this.ringReader && this.ringReader.hasNetworkData();
+    }
+    
+    /**
+     * Poll for network responses from ring buffer (synchronous, no waiting)
      * Call this during poll_oneoff to check for incoming data
      */
     pollNetResponses() {
-        if (!this.netPort) return;
-        
-        const { receiveMessageOnPort } = require('node:worker_threads');
+        if (!this.ringReader) return;
         
         // Process more bytes per poll to improve throughput
         // The limit prevents runaway processing but should be large enough for sustained transfers
         const MAX_BYTES_PER_POLL = 512 * 1024; // 512KB max per poll cycle
         let bytesThisPoll = 0;
         
-        // Check for pending messages
+        // Read messages from ring buffer (no polling needed - direct memory access!)
         let msg;
-        while ((msg = receiveMessageOnPort(this.netPort))) {
-            const m = msg.message;
-            if (m.type === 'udp-recv') {
-                this._handleUdpResponse(m);
-            } else if (m.type === 'tcp-connected') {
-                this._handleTcpConnected(m);
-            } else if (m.type === 'tcp-data') {
-                this._handleTcpData(m);
-                bytesThisPoll += m.data.length;
+        while ((msg = this.ringReader.readNetworkMessage())) {
+            if (msg.type === NET_MSG_UDP_RECV) {
+                const parsed = this.ringReader.parseUdpRecv(msg.payload);
+                this._handleUdpResponse(parsed);
+            } else if (msg.type === NET_MSG_TCP_CONNECTED) {
+                const key = this.ringReader.parseKey(msg.payload);
+                this._handleTcpConnected({ key });
+            } else if (msg.type === NET_MSG_TCP_DATA) {
+                const parsed = this.ringReader.parseTcpData(msg.payload);
+                this._handleTcpData(parsed);
+                bytesThisPoll += parsed.data.length;
                 // Stop processing data if we've hit the limit - leave rest for next poll
                 if (bytesThisPoll >= MAX_BYTES_PER_POLL) {
                     break;
                 }
-            } else if (m.type === 'tcp-end') {
-                this._handleTcpEnd(m);
-            } else if (m.type === 'tcp-error') {
-                this._handleTcpError(m);
-            } else if (m.type === 'tcp-close') {
-                this._handleTcpClosed(m);
+            } else if (msg.type === NET_MSG_TCP_END) {
+                const key = this.ringReader.parseKey(msg.payload);
+                this._handleTcpEnd({ key });
+            } else if (msg.type === NET_MSG_TCP_ERROR) {
+                const parsed = this.ringReader.parseTcpError(msg.payload);
+                this._handleTcpError(parsed);
+            } else if (msg.type === NET_MSG_TCP_CLOSE) {
+                const key = this.ringReader.parseKey(msg.payload);
+                this._handleTcpClosed({ key });
             }
         }
     }
