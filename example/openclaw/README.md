@@ -26,14 +26,14 @@ Copy to your workspace skills directory (usually `~/.openclaw/workspace/skills/`
 
 ```bash
 mkdir -p ~/.openclaw/workspace/skills/agentvm
-cp -r agentvm_openclaw/skill/* ~/.openclaw/workspace/skills/agentvm/
+cp -r example/openclaw/* ~/.openclaw/workspace/skills/agentvm/
 ```
 
 **Option B: Source Integration**
 If you are modifying the OpenClaw source code directly:
 
 ```bash
-cp -r agentvm_openclaw/skill openclaw/skills/agentvm
+cp -r example/openclaw openclaw/skills/agentvm
 ```
 
 ### 3. Restart OpenClaw
@@ -41,7 +41,7 @@ cp -r agentvm_openclaw/skill openclaw/skills/agentvm
 Restart your OpenClaw gateway or process to load the new skill.
 
 ```bash
-openclaw restart
+openclaw gateway restart
 ```
 
 ## Usage
