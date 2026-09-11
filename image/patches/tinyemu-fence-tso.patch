@@ -1,0 +1,13 @@
+--- /tmp/tinyemu-orig/riscv_cpu_template.h	2026-09-11 03:16:35.132831075 +0000
++++ /root/tinyemu-patched/riscv_cpu_template.h	2026-09-11 03:12:08.455057459 +0000
+@@ -1352,6 +1352,10 @@
+             funct3 = (insn >> 12) & 7;
+             switch(funct3) {
+             case 0: /* fence */
++                /* fence.tso (Ztso) is emitted by newer compilers for
++                   seq-cst atomics. It is a no-op on a single in-order hart. */
++                if (insn == 0x8330000f)
++                    break;
+                 if (insn & 0xf00fff80)
+                     goto illegal_insn;
+                 break;
