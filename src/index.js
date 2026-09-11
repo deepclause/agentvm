@@ -264,6 +264,11 @@ class AgentVM {
 
     _accountNetworkBytes(bytes) {
         if (this.networkRateLimit <= 0) return;
+        // The global NIC queue bound in the worker prevents buffer bloat, so
+        // a single connection does not need the aggregate throttle. Only slow
+        // down when many flows are competing, which is exactly the npm case
+        // that used to starve TLS handshakes and DNS.
+        if (this.tcpSessions.size <= 2) return;
         const now = Date.now();
         if (now - this.networkWindowStarted >= 1000) {
             this.networkWindowStarted = now;

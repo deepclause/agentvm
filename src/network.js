@@ -189,22 +189,37 @@ class NetworkStack extends EventEmitter {
     readFromNetwork(maxLength) {
         if (this.txBytes === 0 || maxLength <= 0) return null;
         const length = Math.min(maxLength, this.txBytes);
-        const result = Buffer.allocUnsafe(length);
-        let written = 0;
+        const first = this.txChunks[0];
+        const available = first.length - this.txOffset;
 
-        while (written < length) {
-            const chunk = this.txChunks[0];
-            const available = chunk.length - this.txOffset;
-            const count = Math.min(available, length - written);
-            chunk.copy(result, written, this.txOffset, this.txOffset + count);
-            written += count;
-            this.txOffset += count;
-            if (this.txOffset === chunk.length) {
+        // The common case is a single queued Ethernet frame. Return a view of
+        // the existing buffer instead of allocating and copying a fresh one.
+        // The underlying buffer stays referenced by this view even after the
+        // chunk is shifted, so the returned data remains valid.
+        let result;
+        if (available >= length) {
+            result = first.subarray(this.txOffset, this.txOffset + length);
+            this.txOffset += length;
+            if (this.txOffset === first.length) {
                 this.txChunks.shift();
                 this.txOffset = 0;
             }
+        } else {
+            result = Buffer.allocUnsafe(length);
+            let written = 0;
+            while (written < length) {
+                const chunk = this.txChunks[0];
+                const count = Math.min(chunk.length - this.txOffset, length - written);
+                chunk.copy(result, written, this.txOffset, this.txOffset + count);
+                written += count;
+                this.txOffset += count;
+                if (this.txOffset === chunk.length) {
+                    this.txChunks.shift();
+                    this.txOffset = 0;
+                }
+            }
         }
-        this.txBytes -= written;
+        this.txBytes -= length;
 
         // Reading from the frame pipe creates room for pending TCP data. Pump
         // all flows here so host sockets resume without waiting for an
