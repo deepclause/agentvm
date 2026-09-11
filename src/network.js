@@ -443,8 +443,10 @@ class NetworkStack extends EventEmitter {
         flow.lastActivity = Date.now();
 
         // Acknowledge our data and honor the guest's advertised window.
+        // A zero window must be honored exactly (0 || fallback would ignore it
+        // and overrun the guest receive buffer).
         if (flags & TCP_ACK) {
-            flow.guestWindow = window || flow.guestWindow;
+            flow.guestWindow = window;
             this._purgeUnacked(flow, ack);
         }
 
@@ -482,6 +484,7 @@ class NetworkStack extends EventEmitter {
                 // Fully acknowledged.
                 flow.unacked.shift();
                 flow.hostAcked = end;
+                flow.retransmits = 0;
                 continue;
             }
             if (seqGt(ack, e.seq)) {
