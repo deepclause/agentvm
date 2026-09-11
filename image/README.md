@@ -36,7 +36,8 @@ The build applies the compatibility patch plus
 
 - builds the TinyEMU WASI interpreter with `-O3` instead of `-O2`,
 - enables link-time optimization,
-- removes debug information and strips the linked emulator,
+- removes the unused RV32 decoder (RV64-only), and the linked emulator is
+  stripped,
 - builds the guest Linux kernel for performance (`-O2`) instead of size (`-Os`), and
 - avoids redundant code-TLB lookups for ordinary same-page branches while
   preserving the slow path at timer, interrupt, privilege, and page boundaries.
@@ -48,9 +49,10 @@ features, and uses Wizer; the build preserves those settings.
 A three-run local comparison using Node 22 showed median improvements of about
 9% for boot, 6–8% for a guest Node CPU loop, and 10% for a 1,000-small-file
 workload. The same-page branch fast path contributes roughly another 1–2% to
-CPU-heavy Node code. Increasing TinyEMU's instruction batch size was also
-benchmarked and rejected after it caused a large Node/V8 regression. These are
-deliberately conservative changes; npm remains
+CPU-heavy Node code, and the RV64-only decoder contributes a similar small
+filesystem/CPU improvement. Increasing TinyEMU's instruction batch size was
+also benchmarked and rejected after it caused a large Node/V8 regression.
+These are deliberately conservative changes; npm remains
 dominated by interpreted RISC-V execution and guest filesystem metadata
 operations.
 

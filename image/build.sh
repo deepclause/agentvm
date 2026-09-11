@@ -40,6 +40,7 @@ git clone -q "$TINYEMU_REPO" "$WORK/tinyemu"
 git -C "$WORK/tinyemu" checkout -q "$TINYEMU_REV"
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-fence-tso.patch"
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-low-risk-performance.patch"
+git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-rv64-only.patch"
 # Generated without context to avoid preserving upstream trailing whitespace.
 git -C "$WORK/tinyemu" apply --unidiff-zero "$HERE/patches/tinyemu-fast-branch.patch"
 rm -rf "$WORK/tinyemu/.git"
@@ -73,6 +74,18 @@ config_copy = "COPY --link --from=assets /config/tinyemu/linux_rv64_config ./.co
 config_tune = config_copy + "RUN scripts/config --disable CC_OPTIMIZE_FOR_SIZE --enable CC_OPTIMIZE_FOR_PERFORMANCE\n"
 assert s.count(config_copy) == 2, "unexpected riscv64 kernel config stages"
 s = s.replace(config_copy, config_tune)
+
+# The target is always riscv64. The stock recipe links a separate RV32 CPU and
+# also compiles the 32-bit decoder into the RV64 object. The source patch
+# removes that decoder; specialize the one remaining object at compile time.
+old_objects = "riscv_machine.o softfp.o riscv_cpu32.o riscv_cpu64.o fs_disk.o"
+new_objects = "riscv_machine.o softfp.o riscv_cpu64.o fs_disk.o"
+assert s.count(old_objects) == 1, "unexpected TinyEMU object list"
+s = s.replace(old_objects, new_objects)
+old_cc = "-D_WASI_EMULATED_SIGNAL -DWASI -I/tools/wizer/include/"
+new_cc = "-D_WASI_EMULATED_SIGNAL -DWASI -DCONFIG_RISCV_ONLY_64 -I/tools/wizer/include/"
+assert s.count(old_cc) == 1, "unexpected TinyEMU compiler command"
+s = s.replace(old_cc, new_cc)
 open(p, "w").write(s)
 PY
 
