@@ -171,9 +171,9 @@ class NetworkStack extends EventEmitter {
     }
 
     _queueFrame(frame, priority = false) {
-        const header = Buffer.allocUnsafe(4);
-        header.writeUInt32BE(frame.length, 0);
-        const framed = Buffer.concat([header, frame]);
+        const framed = Buffer.allocUnsafe(4 + frame.length);
+        framed.writeUInt32BE(frame.length, 0);
+        frame.copy(framed, 4);
         if (priority) {
             // Never insert ahead of a partially-read framed packet: that would
             // corrupt the QEMU byte stream. Control traffic may otherwise pass
@@ -436,7 +436,10 @@ class NetworkStack extends EventEmitter {
         srcIP.copy(header, 12);
         dstIP.copy(header, 16);
         header.writeUInt16BE(this.calculateChecksum(header), 10);
-        return Buffer.concat([header, payload]);
+        const packet = Buffer.allocUnsafe(20 + payload.length);
+        header.copy(packet, 0);
+        payload.copy(packet, 20);
+        return packet;
     }
 
     sendIP(payload, protocol, srcIP, dstIP, priority = false) {
