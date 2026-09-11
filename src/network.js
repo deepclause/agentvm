@@ -27,8 +27,12 @@ const INITIAL_WINDOW = 65535;
 const MAX_FRAME_SIZE = 65535;
 const TCP_INITIAL_RTO_MS = 1000;
 const TCP_MAX_RTO_MS = 30000;
-const TCP_MAX_RETRANSMITS = 12;
-const TCP_IDLE_REAP_MS = 300000;
+// Linux commonly allows a stalled TCP connection to survive for many minutes.
+// The emulated guest can spend minutes CPU-bound in npm extraction, so native-
+// style timeouts are required; five-minute cleanup was resetting valid TLS
+// handshakes and then making npm report ECONNRESET/EHOSTUNREACH.
+const TCP_MAX_RETRANSMITS = 32;
+const TCP_IDLE_REAP_MS = 30 * 60 * 1000;
 const UDP_IDLE_REAP_MS = 30000;
 const DNS_TIMEOUT_MS = 10000;
 // TinyEMU's virtual NIC is much shallower than a native Linux NIC. Even when
@@ -37,6 +41,10 @@ const DNS_TIMEOUT_MS = 10000;
 // behind megabytes of data. Keep a small per-flow flight window and stop host
 // reads before the worker backlog grows large.
 const TCP_MAX_IN_FLIGHT = 32 * 1024;
+// Bound the shared NIC queue across *all* flows. A per-flow window alone still
+// permits npm's many parallel TLS downloads to enqueue several megabytes and
+// overflow the guest virtio receive queue, starving even prioritized DNS.
+const NIC_TX_HIGH_WATER = 256 * 1024;
 const FLOW_HIGH_WATER = 128 * 1024;
 const FLOW_LOW_WATER = 32 * 1024;
 
@@ -197,7 +205,19 @@ class NetworkStack extends EventEmitter {
             }
         }
         this.txBytes -= written;
+
+        // Reading from the frame pipe creates room for pending TCP data. Pump
+        // all flows here so host sockets resume without waiting for an
+        // unrelated ACK or host event.
+        if (this.txBytes < NIC_TX_HIGH_WATER) this._pumpTcpFlows();
         return result;
+    }
+
+    _pumpTcpFlows() {
+        for (const flow of this.tcpFlows.values()) {
+            if (this.txBytes >= NIC_TX_HIGH_WATER) break;
+            this._maybeSend(flow);
+        }
     }
 
     // Legacy inspection surface. Internal reads use the chunk queue to avoid
@@ -653,7 +673,7 @@ class NetworkStack extends EventEmitter {
         const sendWindow = Math.min(flow.guestWindow, TCP_MAX_IN_FLIGHT);
         let available = Math.max(0, sendWindow - seqDistance(flow.sendUna, flow.sendNext));
 
-        while (flow.pending.length > 0 && available > 0) {
+        while (flow.pending.length > 0 && available > 0 && this.txBytes < NIC_TX_HIGH_WATER) {
             const chunk = flow.pending[0];
             const length = Math.min(flow.peerMss, chunk.length, available);
             if (length === 0) break;

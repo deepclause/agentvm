@@ -123,13 +123,20 @@ test('unacknowledged data is retransmitted and excessive loss tears down only th
     stack.tick(entry.sentAt + flow.retransmitTimeout + 1);
     assert.equal(drainFrames(stack).length, 1);
 
-    for (let i = 0; i < 13 && stack.tcpFlows.has(flow.key); i++) {
+    for (let i = 0; i < 33 && stack.tcpFlows.has(flow.key); i++) {
         const current = flow.unacked[0];
         stack.tick(current.sentAt + flow.retransmitTimeout + 1);
         drainFrames(stack);
     }
     assert.equal(stack.tcpFlows.has(flow.key), false);
     assert.ok(posted.some((message) => message.type === 'tcp-close' && message.key === flow.key && message.destroy));
+});
+
+test('slow established flows survive a six-minute guest CPU pause', () => {
+    const { stack, flow } = establish();
+    const then = flow.lastActivity + 6 * 60 * 1000;
+    stack.tick(then);
+    assert.equal(stack.tcpFlows.has(flow.key), true);
 });
 
 test('UDP replies use the remote endpoint as source and the guest as destination', () => {
