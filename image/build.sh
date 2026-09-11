@@ -86,6 +86,25 @@ old_cc = "-D_WASI_EMULATED_SIGNAL -DWASI -I/tools/wizer/include/"
 new_cc = "-D_WASI_EMULATED_SIGNAL -DWASI -DCONFIG_RISCV_ONLY_64 -I/tools/wizer/include/"
 assert s.count(old_cc) == 1, "unexpected TinyEMU compiler command"
 s = s.replace(old_cc, new_cc)
+
+# Run Binaryen's optimizer over the linked TinyEMU module before Wizer
+# snapshots it. This shrinks the emulator and can improve V8 tiering.
+old_wizer = "RUN mv temu temu-org && /tools/wizer/wizer --allow-wasi --wasm-bulk-memory=true -r _start=wizer.resume --mapdir /pack::/pack -o temu temu-org"
+new_wizer = (
+    "ARG BINARYEN_VERSION\n"
+    "RUN wget -O /tmp/binaryen.tar.gz "
+    "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/"
+    "binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz && "
+    "mkdir -p /binaryen && tar -C /binaryen -zxvf /tmp/binaryen.tar.gz && "
+    "rm /tmp/binaryen.tar.gz\n"
+    "RUN mv temu temu-org && "
+    "/binaryen/binaryen-version_${BINARYEN_VERSION}/bin/wasm-opt temu-org -O3 --enable-bulk-memory -o temu-opt && "
+    "mv temu-opt temu-org && "
+    "/tools/wizer/wizer --allow-wasi --wasm-bulk-memory=true -r _start=wizer.resume "
+    "--mapdir /pack::/pack -o temu temu-org"
+)
+assert s.count(old_wizer) == 1, "unexpected TinyEMU wizer stage"
+s = s.replace(old_wizer, new_wizer)
 open(p, "w").write(s)
 PY
 

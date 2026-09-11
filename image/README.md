@@ -40,7 +40,9 @@ The build applies the compatibility patch plus
   stripped,
 - builds the guest Linux kernel for performance (`-O2`) instead of size (`-Os`), and
 - avoids redundant code-TLB lookups for ordinary same-page branches while
-  preserving the slow path at timer, interrupt, privilege, and page boundaries.
+  preserving the slow path at timer, interrupt, privilege, and page boundaries,
+- and runs Binaryen `wasm-opt -O3` over the linked TinyEMU module before
+  Wizer snapshots it.
 
 The image also disables verbose init and kernel logging. The c2w recipe already
 disables TinyEMU's unused SDL, x86, RV128, SLIRP, and network-filesystem
