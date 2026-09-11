@@ -14,6 +14,7 @@ Options:
   --no-network           Disable networking
   --mount, -m <path>     Mount a host directory into the VM at /mnt/host
                          Can specify VM path with: --mount /host/path:/vm/path
+  --wasm <path>          Path to the VM .wasm image
   --debug, -d            Enable debug logging
   --help, -h             Show this help message
 
@@ -31,6 +32,7 @@ function parseArgs(args) {
         network: true,
         mounts: {},
         debug: false,
+        wasmPath: null,
     };
 
     for (let i = 0; i < args.length; i++) {
@@ -84,6 +86,14 @@ function parseArgs(args) {
                 options.debug = true;
                 break;
 
+            case '--wasm':
+                options.wasmPath = args[++i];
+                if (!options.wasmPath) {
+                    console.error('Error: --wasm requires a path argument');
+                    process.exit(1);
+                }
+                break;
+
             default:
                 if (arg.startsWith('-')) {
                     console.error(`Unknown option: ${arg}`);
@@ -115,6 +125,7 @@ async function main() {
     process.stderr.write('\n');
 
     const vm = new AgentVM({
+        wasmPath: options.wasmPath || undefined,
         network: options.network,
         mounts: options.mounts,
         debug: options.debug,
