@@ -99,6 +99,14 @@ class RingBufferWriter {
         Atomics.notify(this.int32, IO_READY_INDEX);
     }
     
+    _writeRingBytes(position, bytes) {
+        const firstLength = Math.min(bytes.length, NET_RING_SIZE - position);
+        this.uint8.set(bytes.subarray(0, firstLength), NET_RING_OFFSET + position);
+        const remaining = bytes.length - firstLength;
+        if (remaining > 0) this.uint8.set(bytes.subarray(firstLength), NET_RING_OFFSET);
+        return (position + bytes.length) % NET_RING_SIZE;
+    }
+
     /**
      * Write a network message to the ring buffer
      * @param {number} type - Message type (NET_MSG_*)
@@ -110,28 +118,15 @@ class RingBufferWriter {
         if (msgLen >= NET_RING_SIZE || this.availableSpace() < msgLen) {
             return false;
         }
-        
+
+        const header = Buffer.allocUnsafe(5);
+        header.writeUInt32LE(payload.length, 0);
+        header[4] = type;
         let head = Atomics.load(this.int32, NET_HEAD_INDEX);
-        const ringStart = NET_RING_OFFSET;
-        
-        // Write length (4 bytes, little-endian). A uint32 permits a maximum
-        // sized UDP datagram plus its flow key without truncation.
-        for (let shift = 0; shift < 32; shift += 8) {
-            this.uint8[ringStart + head] = (payload.length >>> shift) & 0xff;
-            head = (head + 1) % NET_RING_SIZE;
-        }
-        
-        // Write type (1 byte)
-        this.uint8[ringStart + head] = type;
-        head = (head + 1) % NET_RING_SIZE;
-        
-        // Write payload
-        for (let i = 0; i < payload.length; i++) {
-            this.uint8[ringStart + head] = payload[i];
-            head = (head + 1) % NET_RING_SIZE;
-        }
-        
-        // Update head atomically and signal
+        head = this._writeRingBytes(head, header);
+        head = this._writeRingBytes(head, payload);
+
+        // Publish only after both bulk copies are complete.
         Atomics.store(this.int32, NET_HEAD_INDEX, head);
         Atomics.add(this.int32, IO_READY_INDEX, 1);
         Atomics.notify(this.int32, IO_READY_INDEX);
@@ -385,12 +380,16 @@ class RingBufferReader {
         const type = this.uint8[ringStart + tail];
         tail = (tail + 1) % NET_RING_SIZE;
         
-        // Read payload
-        const payload = Buffer.alloc(payloadLen);
-        for (let i = 0; i < payloadLen; i++) {
-            payload[i] = this.uint8[ringStart + tail];
-            tail = (tail + 1) % NET_RING_SIZE;
+        // Copy the payload in at most two operations instead of executing one
+        // JavaScript loop iteration per network byte.
+        const payload = Buffer.allocUnsafe(payloadLen);
+        const firstLength = Math.min(payloadLen, NET_RING_SIZE - tail);
+        payload.set(this.uint8.subarray(ringStart + tail, ringStart + tail + firstLength), 0);
+        const remaining = payloadLen - firstLength;
+        if (remaining > 0) {
+            payload.set(this.uint8.subarray(ringStart, ringStart + remaining), firstLength);
         }
+        tail = (tail + payloadLen) % NET_RING_SIZE;
         
         // Update tail atomically
         Atomics.store(this.int32, NET_TAIL_INDEX, tail);

@@ -358,11 +358,10 @@ async function start() {
                 try {
                     const buffer = Buffer.alloc(buf_len);
                     const bytesRead = fs.readSync(handle.nodeFd, buffer, 0, buf_len, null);
-                    
-                    // Copy to WASM memory
-                    for (let j = 0; j < bytesRead; j++) {
-                        mem[buf_ptr + j] = buffer[j];
-                    }
+
+                    // Bulk-copy into WASM memory. Per-byte JavaScript loops
+                    // are disproportionately expensive for mounted files.
+                    mem.set(buffer.subarray(0, bytesRead), buf_ptr);
                     totalRead += bytesRead;
                     
                     if (bytesRead < buf_len) break; // EOF or partial read
@@ -419,11 +418,8 @@ async function start() {
                 try {
                     const buffer = Buffer.alloc(buf_len);
                     const bytesRead = fs.readSync(handle.nodeFd, buffer, 0, buf_len, currentOffset);
-                    
-                    // Copy to WASM memory
-                    for (let j = 0; j < bytesRead; j++) {
-                        mem[buf_ptr + j] = buffer[j];
-                    }
+
+                    mem.set(buffer.subarray(0, bytesRead), buf_ptr);
                     totalRead += bytesRead;
                     currentOffset += bytesRead;
                     
@@ -473,7 +469,9 @@ async function start() {
                 const buf_len = view.getUint32(iovs_ptr + i * 8 + 4, true);
                 
                 try {
-                    const buffer = Buffer.from(mem.slice(buf_ptr, buf_ptr + buf_len));
+                    // fs.writeSync is synchronous, so a zero-copy view over
+                    // WASM memory is safe for the duration of the call.
+                    const buffer = Buffer.from(mem.buffer, mem.byteOffset + buf_ptr, buf_len);
                     const bytesWritten = fs.writeSync(handle.nodeFd, buffer, 0, buf_len, currentOffset);
                     
                     totalWritten += bytesWritten;
@@ -521,7 +519,7 @@ async function start() {
                 const buf_len = view.getUint32(iovs_ptr + i * 8 + 4, true);
                 
                 try {
-                    const buffer = Buffer.from(mem.slice(buf_ptr, buf_ptr + buf_len));
+                    const buffer = Buffer.from(mem.buffer, mem.byteOffset + buf_ptr, buf_len);
                     const bytesWritten = fs.writeSync(handle.nodeFd, buffer);
                     totalWritten += bytesWritten;
                 } catch (err) {
