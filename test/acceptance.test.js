@@ -85,8 +85,10 @@ async function main() {
             console.log('--- 4/5. pi agent (skipped via AGENTVM_SKIP_PI=1) ---');
         } else {
             console.log('--- 4. install pi coding agent (large npm install) ---');
-            r = await withTimeout(vm.exec('npm install -g @earendil-works/pi-coding-agent 2>&1 | tail -5'), 1800000);
-            report('npm install -g @earendil-works/pi-coding-agent', r.exitCode === 0, r.stdout.trim().split('\n').pop());
+            // Capture npm's own exit code explicitly: piping through `tail`
+            // would otherwise mask a failed install.
+            r = await withTimeout(vm.exec('npm install -g @earendil-works/pi-coding-agent >/tmp/pi-install.log 2>&1; echo "NPM_EXIT:$?"; tail -3 /tmp/pi-install.log'), 1800000);
+            report('npm install -g @earendil-works/pi-coding-agent', /NPM_EXIT:0/.test(r.stdout), r.stdout.trim().split('\n').slice(-2).join(' | '));
 
             console.log('--- 5. run pi agent ---');
             r = await withTimeout(vm.exec('pi --help 2>&1 | head -3'), 60000);
