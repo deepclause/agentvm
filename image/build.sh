@@ -16,6 +16,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="${1:-$HERE/agentvm-alpine-python-node.wasm}"
 IMAGE_NAME="agentvm-alpine-python-node:riscv64"
 C2W="${C2W:-c2w}"
+# Guest RAM. The writable overlay (and /run tmpfs) default to ~half of this,
+# so the pi coding agent needs substantially more than the 128 MiB default.
+VM_MEMORY_SIZE_MB="${VM_MEMORY_SIZE_MB:-1024}"
 
 # TinyEMU pinned by the embedded c2w Dockerfile. We patch it to accept the
 # `fence.tso` instruction that modern riscv64 node/npm binaries emit.
@@ -61,8 +64,9 @@ assert s.count(old) == 1, "unexpected embedded Dockerfile shape"
 open(p, "w").write(s.replace(old, new))
 PY
 
-echo "==> Converting to WASM: $OUT"
+echo "==> Converting to WASM: $OUT (memory ${VM_MEMORY_SIZE_MB} MiB)"
 "$C2W" --target-arch riscv64 \
+    --build-arg "VM_MEMORY_SIZE_MB=${VM_MEMORY_SIZE_MB}" \
     --dockerfile "$WORK/Dockerfile.c2w" \
     --extra-flag "--build-context=tinyemu-patched=$WORK/tinyemu" \
     "$IMAGE_NAME" \

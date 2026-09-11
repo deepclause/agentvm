@@ -1,5 +1,5 @@
---- /tmp/tinyemu-orig/riscv_cpu_template.h	2026-09-11 03:16:35.132831075 +0000
-+++ /root/tinyemu-patched/riscv_cpu_template.h	2026-09-11 03:12:08.455057459 +0000
+--- a/riscv_cpu_template.h
++++ b/riscv_cpu_template.h
 @@ -1352,6 +1352,10 @@
              funct3 = (insn >> 12) & 7;
              switch(funct3) {
