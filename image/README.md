@@ -20,7 +20,32 @@ cd image
 C2W=/path/to/c2w ./build.sh [out.wasm]
 ```
 
-This produces `agentvm-alpine-python-node.wasm` (roughly 175 MB).
+This produces `agentvm-alpine-python-node.wasm` (roughly 193 MB with the
+current acceptance root filesystem). To keep a baseline image while testing a
+new build, pass another output name:
+
+```bash
+C2W=/path/to/c2w ./build.sh agentvm-alpine-python-node-optimized.wasm
+```
+
+## Low-risk runtime optimizations
+
+The build applies `patches/tinyemu-low-risk-performance.patch` in addition to
+the compatibility patch. It:
+
+- builds the TinyEMU WASI interpreter with `-O3` instead of `-O2`,
+- enables link-time optimization,
+- removes debug information and strips the linked emulator, and
+- builds the guest Linux kernel for performance (`-O2`) instead of size (`-Os`).
+
+The image also disables verbose init and kernel logging. The c2w recipe already
+disables TinyEMU's unused SDL, x86, RV128, SLIRP, and network-filesystem
+features, and uses Wizer; the build preserves those settings.
+
+A three-run local comparison using Node 22 showed median improvements of about
+9% for boot, 6% for a guest Node CPU loop, and 10% for a 1,000-small-file
+workload. These are deliberately conservative changes; npm remains dominated
+by interpreted RISC-V execution and guest filesystem metadata operations.
 
 ## Why we patch TinyEMU
 

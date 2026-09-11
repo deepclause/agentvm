@@ -39,6 +39,7 @@ echo "==> Preparing patched TinyEMU"
 git clone -q "$TINYEMU_REPO" "$WORK/tinyemu"
 git -C "$WORK/tinyemu" checkout -q "$TINYEMU_REV"
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-fence-tso.patch"
+git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-low-risk-performance.patch"
 rm -rf "$WORK/tinyemu/.git"
 
 echo "==> Generating patched c2w Dockerfile"
@@ -61,12 +62,23 @@ new = """FROM scratch AS tinyemu-repo
 COPY --from=tinyemu-patched / /
 """
 assert s.count(old) == 1, "unexpected embedded Dockerfile shape"
-open(p, "w").write(s.replace(old, new))
+s = s.replace(old, new)
+
+# The stock c2w kernel is optimized for size (-Os). npm and Node spend a lot
+# of time in guest syscalls and filesystem/network paths, so use the kernel's
+# normal performance profile (-O2). Apply this to both riscv64 kernel stages.
+config_copy = "COPY --link --from=assets /config/tinyemu/linux_rv64_config ./.config\n"
+config_tune = config_copy + "RUN scripts/config --disable CC_OPTIMIZE_FOR_SIZE --enable CC_OPTIMIZE_FOR_PERFORMANCE\n"
+assert s.count(config_copy) == 2, "unexpected riscv64 kernel config stages"
+s = s.replace(config_copy, config_tune)
+open(p, "w").write(s)
 PY
 
 echo "==> Converting to WASM: $OUT (memory ${VM_MEMORY_SIZE_MB} MiB)"
 "$C2W" --target-arch riscv64 \
     --build-arg "VM_MEMORY_SIZE_MB=${VM_MEMORY_SIZE_MB}" \
+    --build-arg "LINUX_LOGLEVEL=3" \
+    --build-arg "INIT_DEBUG=false" \
     --dockerfile "$WORK/Dockerfile.c2w" \
     --extra-flag "--build-context=tinyemu-patched=$WORK/tinyemu" \
     "$IMAGE_NAME" \
