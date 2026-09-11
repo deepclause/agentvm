@@ -11,8 +11,7 @@ RUN apk add --no-cache \
         python3 py3-pip \
         nodejs npm \
         bash curl git \
-        coreutils \
-    && npm install -g npm@latest
+        coreutils
 
 # A shell is the entrypoint AgentVM exec() talks to.
 CMD ["/bin/sh"]

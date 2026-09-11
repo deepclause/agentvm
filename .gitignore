@@ -1,1 +1,6 @@
 node_modules/**/*
+image/*.wasm
+image/*.data
+image/*.js
+logs/
+*.log
