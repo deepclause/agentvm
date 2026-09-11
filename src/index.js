@@ -45,6 +45,12 @@ class AgentVM {
         this.udpSessions = new Map(); // key -> { socket, lastActive }
         this.tcpSessions = new Map(); // key -> { socket, state, bytesThisSecond, lastReset, paused, pendingData }
         this.netChannel = null;
+        this.pendingRingEvents = [];
+        this.ringFlushTimer = null;
+        this.networkWindowStarted = Date.now();
+        this.networkBytesThisWindow = 0;
+        this.networkRateLimited = false;
+        this.networkRateTimer = null;
     }
 
     async start() {
@@ -67,8 +73,11 @@ class AgentVM {
                 this._handleUdpClose(msg);
             } else if (msg.type === 'dns-lookup') {
                 this._handleDnsLookup(msg);
+            } else if (msg.type === 'tcp-pause') {
+                this._handleTcpFlowControl(msg.key, true);
+            } else if (msg.type === 'tcp-resume') {
+                this._handleTcpFlowControl(msg.key, false);
             }
-            // Note: tcp-pause/tcp-resume removed - using ring buffer backpressure only
         });
 
         return new Promise((resolve, reject) => {
@@ -193,6 +202,16 @@ class AgentVM {
         }
         this.tcpSessions.clear();
         
+        if (this.ringFlushTimer) {
+            clearTimeout(this.ringFlushTimer);
+            this.ringFlushTimer = null;
+        }
+        if (this.networkRateTimer) {
+            clearTimeout(this.networkRateTimer);
+            this.networkRateTimer = null;
+        }
+        this.pendingRingEvents.length = 0;
+
         // Close network channel
         if (this.netChannel) {
             this.netChannel.port2.close();
@@ -205,6 +224,73 @@ class AgentVM {
         }
     }
     
+    /** Queue a small control/datagram event until the SPSC ring has room. */
+    _enqueueRingEvent(write, onWritten = null) {
+        if (this.destroyed) return;
+        this.pendingRingEvents.push({ write, onWritten });
+        this._flushRingEvents();
+    }
+
+    _flushRingEvents() {
+        if (this.destroyed) return;
+        while (this.pendingRingEvents.length > 0) {
+            const event = this.pendingRingEvents[0];
+            if (!event.write()) break;
+            this.pendingRingEvents.shift();
+            if (event.onWritten) event.onWritten();
+        }
+        if (this.pendingRingEvents.length > 0 && !this.ringFlushTimer) {
+            this.ringWriter.signalWorker();
+            this.ringFlushTimer = setTimeout(() => {
+                this.ringFlushTimer = null;
+                this._flushRingEvents();
+            }, 2);
+        }
+    }
+
+    _handleTcpFlowControl(key, pause) {
+        const session = this.tcpSessions.get(key);
+        if (!session) return;
+        session.flowPaused = pause;
+        if (pause) session.socket.pause();
+        else if (!session.rateLimitPaused && !session.ringBufferPaused && !session.connectAnnouncementPending) {
+            session.socket.resume();
+        }
+    }
+
+    _accountNetworkBytes(bytes) {
+        if (this.networkRateLimit <= 0) return;
+        const now = Date.now();
+        if (now - this.networkWindowStarted >= 1000) {
+            this.networkWindowStarted = now;
+            this.networkBytesThisWindow = 0;
+        }
+        this.networkBytesThisWindow += bytes;
+        if (this.networkBytesThisWindow < this.networkRateLimit || this.networkRateLimited) return;
+
+        // The configured limit applies to the VM as a whole, not independently
+        // to every npm connection. Per-socket limiting allowed dozens of
+        // concurrent downloads to overwhelm TinyEMU by an order of magnitude.
+        this.networkRateLimited = true;
+        for (const session of this.tcpSessions.values()) {
+            session.rateLimitPaused = true;
+            session.socket.pause();
+        }
+        const delay = Math.max(1, 1000 - (now - this.networkWindowStarted));
+        this.networkRateTimer = setTimeout(() => {
+            this.networkRateTimer = null;
+            this.networkRateLimited = false;
+            this.networkWindowStarted = Date.now();
+            this.networkBytesThisWindow = 0;
+            for (const session of this.tcpSessions.values()) {
+                session.rateLimitPaused = false;
+                if (!session.ringBufferPaused && !session.flowPaused && !session.connectAnnouncementPending) {
+                    session.socket.resume();
+                }
+            }
+        }, delay);
+    }
+
     /**
      * Handle a DNS lookup request from the worker. Resolution runs on the main
      * thread because worker threads must not call the async DNS resolver.
@@ -217,9 +303,9 @@ class AgentVM {
             const options = family === 0 ? { all: true, verbatim: true } : { all: true, family, verbatim: true };
             const results = await dns.promises.lookup(name, options);
             const ips = results.map((r) => r.address);
-            this.ringWriter.writeDnsResult({ key, name, qtype, ips });
+            this._enqueueRingEvent(() => this.ringWriter.writeDnsResult({ key, name, qtype, ips }));
         } catch (err) {
-            this.ringWriter.writeDnsResult({ key, name, qtype, error: err.message });
+            this._enqueueRingEvent(() => this.ringWriter.writeDnsResult({ key, name, qtype, error: err.message }));
         }
     }
 
@@ -253,30 +339,27 @@ class AgentVM {
             this.udpSessions.set(key, session);
             
             socket.on('message', (data, rinfo) => {
+                const expectedIP = dstIP === '192.168.127.1' ? '127.0.0.1' : dstIP;
+                if (rinfo.port !== dstPort || (rinfo.address !== expectedIP && rinfo.address !== `::ffff:${expectedIP}`)) {
+                    return;
+                }
                 if (this.debug) {
                     console.log(`[UDP] Response from ${rinfo.address}:${rinfo.port}, ${data.length} bytes`);
                 }
-                // Send response back to worker via ring buffer
-                this.ringWriter.writeUdpRecv({
-                    key,
-                    data: data,
-                    fromIP: rinfo.address,
-                    fromPort: rinfo.port,
-                    srcIP,
-                    srcPort,
-                    dstIP,
-                    dstPort
-                });
+                this._enqueueRingEvent(() => this.ringWriter.writeUdpRecv({ key, data }));
             });
             
             socket.on('error', (err) => {
-                console.error(`UDP socket error for ${key}:`, err.message);
+                if (this.debug) console.error(`UDP socket error for ${key}:`, err.message);
+                this.udpSessions.delete(key);
+                try { socket.close(); } catch (e) {}
             });
         }
         
         session.lastActive = Date.now();
         const payloadBuf = Buffer.from(payload);
-        session.socket.send(payloadBuf, dstPort, dstIP);
+        const sendIP = dstIP === '192.168.127.1' ? '127.0.0.1' : dstIP;
+        session.socket.send(payloadBuf, dstPort, sendIP);
     }
     
     /**
@@ -290,6 +373,14 @@ class AgentVM {
         // Translate gateway IP to localhost for local server access
         const connectIP = (dstIP === '192.168.127.1') ? '127.0.0.1' : dstIP;
         
+        // A duplicate SYN must never create a second host socket for the same
+        // guest flow.
+        const existing = this.tcpSessions.get(key);
+        if (existing) {
+            if (!existing.socket.destroyed) return;
+            this.tcpSessions.delete(key);
+        }
+
         const socket = new net.Socket();
         
         // Enable TCP keepalive to prevent connection drops during pauses
@@ -300,10 +391,10 @@ class AgentVM {
         
         const session = { 
             socket, srcIP, srcPort, dstIP, dstPort,
-            // Rate limiting state
-            bytesThisSecond: 0,
-            lastReset: Date.now(),
-            rateLimitPaused: false,
+            rateLimitPaused: this.networkRateLimited,
+            ringBufferPaused: false,
+            flowPaused: false,
+            connectAnnouncementPending: true,
             pendingResume: null
         };
         this.tcpSessions.set(key, session);
@@ -313,54 +404,23 @@ class AgentVM {
         }
         
         socket.connect(dstPort, connectIP, () => {
-            // Send connected event via ring buffer
-            this.ringWriter.writeTcpConnected(key);
+            // Do not allow host data to overtake the connected event if the
+            // ring happens to be full.
+            socket.pause();
+            this._enqueueRingEvent(
+                () => this.ringWriter.writeTcpConnected(key),
+                () => {
+                    session.connectAnnouncementPending = false;
+                    if (!session.rateLimitPaused && !session.ringBufferPaused && !session.flowPaused) socket.resume();
+                }
+            );
         });
         
         socket.on('data', (data) => {
             if (this.debug) {
                 console.log(`[TCP] Received ${data.length} bytes from server for ${key}`);
             }
-            // Rate limiting: track bytes per second
-            if (this.networkRateLimit > 0) {
-                const now = Date.now();
-                // Reset counter every second
-                if (now - session.lastReset >= 1000) {
-                    session.bytesThisSecond = 0;
-                    session.lastReset = now;
-                }
-                
-                session.bytesThisSecond += data.length;
-                
-                // If we've exceeded rate limit, pause the socket
-                if (session.bytesThisSecond >= this.networkRateLimit && !session.rateLimitPaused) {
-                    session.rateLimitPaused = true;
-                    socket.pause();
-                    if (this.debug) {
-                        console.log(`[RateLimit] Pausing ${key}, sent ${session.bytesThisSecond} bytes this second`);
-                    }
-                    
-                    // Schedule resume at start of next second
-                    const timeUntilNextSecond = 1000 - (now - session.lastReset);
-                    session.pendingResume = setTimeout(() => {
-                        // Always clear the rate limit pause flag and reset counters
-                        session.rateLimitPaused = false;
-                        session.bytesThisSecond = 0;
-                        session.lastReset = Date.now();
-                        session.pendingResume = null;
-                        
-                        // Only actually resume if not also paused for ring buffer
-                        if (!session.ringBufferPaused) {
-                            socket.resume();
-                            if (this.debug) {
-                                console.log(`[RateLimit] Resuming ${key}`);
-                            }
-                        } else if (this.debug) {
-                            console.log(`[RateLimit] Rate limit cleared for ${key}, but ringBufferPaused`);
-                        }
-                    }, timeUntilNextSecond);
-                }
-            }
+            this._accountNetworkBytes(data.length);
             
             // Send data to worker via ring buffer
             const bytesWritten = this.ringWriter.writeTcpData(key, data);
@@ -404,21 +464,39 @@ class AgentVM {
                 if (this.debug) {
                     console.log(`[TCP] Sending END for ${key} immediately`);
                 }
-                this.ringWriter.writeTcpEnd(key);
+                session.endSent = true;
+                this._enqueueRingEvent(() => this.ringWriter.writeTcpEnd(key));
             }
         });
         
         socket.on('close', () => {
-            // Clean up timers
+            if (this.tcpSessions.get(key) !== session) return;
             if (session.pendingResume) {
                 clearTimeout(session.pendingResume);
                 session.pendingResume = null;
             }
+            session.socketClosed = true;
+
+            // An orderly close follows `end`. Keep the session and its flush
+            // timer alive until all previously received bytes and END have
+            // entered the worker ring. Otherwise the tail of large downloads
+            // is silently discarded.
+            if (session.remoteEnded) {
+                if (!session.pendingData || session.pendingData.length === 0) {
+                    if (!session.endSent) {
+                        session.endSent = true;
+                        this._enqueueRingEvent(() => this.ringWriter.writeTcpEnd(key));
+                    }
+                    this.tcpSessions.delete(key);
+                }
+                return;
+            }
+
             if (session.ringBufferFlushTimer) {
                 clearInterval(session.ringBufferFlushTimer);
                 session.ringBufferFlushTimer = null;
             }
-            this.ringWriter.writeTcpClose(key);
+            this._enqueueRingEvent(() => this.ringWriter.writeTcpClose(key));
             this.tcpSessions.delete(key);
         });
         
@@ -432,7 +510,7 @@ class AgentVM {
                 clearInterval(session.ringBufferFlushTimer);
                 session.ringBufferFlushTimer = null;
             }
-            this.ringWriter.writeTcpError(key, err.message);
+            this._enqueueRingEvent(() => this.ringWriter.writeTcpError(key, err.message));
             this.tcpSessions.delete(key);
         });
         
@@ -494,7 +572,7 @@ class AgentVM {
                 session.ringBufferFlushTimer = null;
                 session.ringBufferPaused = false;
                 
-                if (!session.rateLimitPaused && session.socket) {
+                if (!session.rateLimitPaused && !session.flowPaused && !session.connectAnnouncementPending && session.socket) {
                     session.socket.resume();
                     if (this.debug) {
                         console.log(`[RingBuffer] Resuming ${key}, buffer drained`);
@@ -550,12 +628,13 @@ class AgentVM {
                         console.log(`[RingBuffer] Sent deferred END for ${key}`);
                     }
                 }
+                if (session.socketClosed) this.tcpSessions.delete(key);
                 
                 clearInterval(session.ringBufferFlushTimer);
                 session.ringBufferFlushTimer = null;
                 session.ringBufferPaused = false;
                 
-                if (!session.rateLimitPaused && session.socket) {
+                if (!session.rateLimitPaused && !session.flowPaused && !session.connectAnnouncementPending && session.socket) {
                     session.socket.resume();
                     if (this.debug) {
                         console.log(`[RingBuffer] Resuming ${key}, pending data flushed`);

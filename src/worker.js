@@ -1,8 +1,8 @@
-const { parentPort, workerData, receiveMessageOnPort } = require('node:worker_threads');
+const { parentPort, workerData } = require('node:worker_threads');
 const { WASI } = require('node:wasi');
 const fs = require('node:fs');
 const { NetworkStack } = require('./network');
-const { RingBufferReader, IO_READY_INDEX, STDIN_FLAG_INDEX, STDIN_SIZE_INDEX, STDIN_DATA_OFFSET, NET_RING_OFFSET } = require('./ringbuffer');
+const { RingBufferReader } = require('./ringbuffer');
 
 const { wasmPath, sharedBuffer, mounts, network, mac, netPort } = workerData;
 
@@ -18,7 +18,11 @@ let sockRecvBuffer = Buffer.alloc(0);
 // Initialize Network Stack with:
 // - ringReader for incoming data (main → worker, via SharedArrayBuffer)
 // - netPort for outgoing control messages (worker → main, via MessagePort)
-const netStack = new NetworkStack({ ringReader, netPort });
+const netStack = new NetworkStack({
+    ringReader,
+    netPort,
+    debugStats: process.env.DEBUG_NETWORK_STATS === '1',
+});
 const NET_FD = 3; // Standard for LISTEN_FDS=1 (listening socket)
 const NET_CONN_FD = 4; // Connected socket for actual I/O
 let netConnectionAccepted = false;
@@ -549,7 +553,6 @@ async function start() {
     // Custom fd_close for our handles
     const origFdClose = wasiImport.fd_close;
     wasiImport.fd_close = (fd) => {
-        parentPort.postMessage({ type: 'debug', msg: `fd_close(${fd}) called` });
         if (customFdHandles.has(fd)) {
             const handle = customFdHandles.get(fd);
             // Only close if it's a file handle with a nodeFd (directories don't have one)
@@ -566,8 +569,10 @@ async function start() {
             return 0;
         }
         // Handle network socket close: tear down every flow over the pipe.
-        if (fd === NET_CONN_FD) {
-            parentPort.postMessage({ type: 'debug', msg: `fd_close(${fd}) - closing network socket` });
+        if (network && fd === NET_CONN_FD) {
+            if (process.env.DEBUG_NETWORK_STATS === '1') {
+                parentPort.postMessage({ type: 'debug', msg: 'network frame pipe closed via fd_close' });
+            }
             netStack.closeSocket();
             netConnectionAccepted = false;
             sockRecvBuffer = Buffer.alloc(0);
@@ -676,7 +681,6 @@ async function start() {
             return origFdReaddir(fakeFdMap.get(fd), buf_ptr, buf_len, cookie, bufused_ptr);
         }
         
-        console.error(`[fd_readdir] FALLBACK`);
         return origFdReaddir(fd, buf_ptr, buf_len, cookie, bufused_ptr);
     };
     
@@ -744,8 +748,6 @@ async function start() {
                 const pathStr = new TextDecoder().decode(pathBytes);
                 const fullPath = require('path').join(handle.hostPath, pathStr);
                 
-                require('fs').writeSync(2, `[path_filestat_get] custom fd=${fd}, path="${pathStr}", fullPath="${fullPath}"\n`);
-                
                 try {
                     const stat = fs.statSync(fullPath);
                     
@@ -778,7 +780,6 @@ async function start() {
                     
                     return 0;
                 } catch (err) {
-                    require('fs').writeSync(2, `[path_filestat_get] ERROR: ${err.message}\n`);
                     if (err.code === 'ENOENT') return 44; // WASI_ERRNO_NOENT
                     if (err.code === 'EACCES') return 2;  // WASI_ERRNO_ACCES
                     return 29; // WASI_ERRNO_IO
@@ -845,7 +846,7 @@ async function start() {
     const originalFdWrite = wasiImport.fd_write;
     wasiImport.fd_write = (fd, iovs_ptr, iovs_len, nwritten_ptr) => {
         try {
-            if (fd === NET_FD) {
+            if (network && fd === NET_FD) {
                 if (!instance) return 0;
                 const view = new DataView(instance.exports.memory.buffer);
                 const buffers = readIOVs(view, iovs_ptr, iovs_len);
@@ -889,7 +890,7 @@ async function start() {
 
     const originalFdRead = wasiImport.fd_read;
     wasiImport.fd_read = (fd, iovs_ptr, iovs_len, nread_ptr) => {
-        if (fd === NET_FD) {
+        if (network && fd === NET_FD) {
             // parentPort.postMessage({ type: 'debug', msg: `fd_read(${fd}) - network read attempt` });
             if (!instance) return 0;
             const view = new DataView(instance.exports.memory.buffer);
@@ -936,7 +937,7 @@ async function start() {
 
     const originalFdFdstatGet = wasiImport.fd_fdstat_get;
     wasiImport.fd_fdstat_get = (fd, bufPtr) => {
-        if (fd === NET_FD || fd === NET_FD + 1) { // fd 3 (listen) or fd 4 (connection)
+        if (network && (fd === NET_FD || fd === NET_FD + 1)) { // fd 3 (listen) or fd 4 (connection)
             // // parentPort.postMessage({ type: 'debug', msg: `fd_fdstat_get(${fd})` });
             if (!instance) return 0;
             const view = new DataView(instance.exports.memory.buffer);
@@ -980,10 +981,10 @@ async function start() {
              if (type === 1) { // FD_READ
                  const fd = view.getUint32(base + 16, true);
                  if (fd === 0) hasStdin = true;
-                 else if (fd === NET_FD) {
+                 else if (network && fd === NET_FD) {
                      hasNetListen = true;
                  }
-                 else if (fd === NET_FD + 1) {
+                 else if (network && fd === NET_FD + 1) {
                      hasNetRead = true;
                  }
                  else {
@@ -991,7 +992,7 @@ async function start() {
                  }
              } else if (type === 2) { // FD_WRITE
                  const fd = view.getUint32(base + 16, true);
-                 if (fd === NET_FD + 1) {
+                 if (network && fd === NET_FD + 1) {
                      hasNetWrite = true;
                  }
                  else {
@@ -1009,10 +1010,6 @@ async function start() {
              }
         }
         
-        // Log what we're waiting for
-        const pollStart = Date.now();
-        parentPort.postMessage({ type: 'debug', msg: `poll_oneoff: hasStdin=${hasStdin}, hasNetRead=${hasNetRead}, hasNetWrite=${hasNetWrite}, timeout=${minTimeout}ms, sockRecvBuf=${sockRecvBuffer.length}, txBuf=${netStack.txBuffer.length}` });
-        
         // IMPORTANT: Always poll for network responses first!
         // This ensures TCP data from main thread is received even when 
         // we're polling for both read and write (common during TLS handshake).
@@ -1027,6 +1024,7 @@ async function start() {
         
         let ready = false;
         if (hasStdin && stdinReadable) ready = true;
+        if (hasNetListen && !netConnectionAccepted) ready = true;
         if (hasNetRead && netReadable) ready = true;
         if (hasNetWrite && netWritable) ready = true;
         
@@ -1051,8 +1049,9 @@ async function start() {
                      const elapsed = Date.now() - startTime;
                      if (elapsed >= t) break;
                      
-                     // Poll for network responses from ring buffer (no busy-wait needed!)
+                     // Poll for network responses and retransmission timers.
                      netStack.pollNetResponses();
+                     netStack.tick();
                      
                      // Check if stdin became available
                      if (hasStdin && ringReader.hasStdinData()) break;
@@ -1095,19 +1094,21 @@ async function start() {
                      triggered = true;
                      evType = 1;
                      nbytes = localBuffer.length || 1;
-                 } else if (fd === NET_FD && netConnectionAccepted) {
-                     // Listen socket - always readable if we haven't accepted yet (to trigger sock_accept)
-                     // But we've already accepted, so not readable
-                 } else if (fd === NET_FD + 1 && postNetReadable) {
+                 } else if (network && fd === NET_FD && !netConnectionAccepted) {
+                     // The one synthetic connection from TinyEMU is ready to
+                     // accept exactly once.
+                     triggered = true;
+                     evType = 1;
+                     nbytes = 1;
+                 } else if (network && fd === NET_FD + 1 && postNetReadable) {
                      // Connected socket - readable if there's data
                      triggered = true;
                      evType = 1;
-                     nbytes = netStack.txBuffer.length;
-                     // // parentPort.postMessage({ type: 'debug', msg: `poll: conn fd readable, ${nbytes} bytes` });
+                     nbytes = sockRecvBuffer.length + netStack.pendingDataSize();
                  }
              } else if (type === 2) { // WRITE
                  const fd = view.getUint32(base + 16, true);
-                 if (fd === NET_FD + 1) {
+                 if (network && fd === NET_FD + 1) {
                      // Connected socket - always writable
                      triggered = true;
                      evType = 2;
@@ -1130,10 +1131,6 @@ async function start() {
         }
         
         view.setUint32(nevents_ptr, eventsWritten, true);
-        const pollDuration = Date.now() - pollStart;
-        if (pollDuration > 5) {
-            parentPort.postMessage({ type: 'debug', msg: `poll_oneoff completed in ${pollDuration}ms, events=${eventsWritten}` });
-        }
         return 0; // Success
     };
 
@@ -1147,7 +1144,7 @@ async function start() {
                 // Poll for network responses first - TCP-connected messages may be pending
                 netStack.pollNetResponses();
                 
-                if (fd !== NET_FD) {
+                if (!network || fd !== NET_FD) {
                     // parentPort.postMessage({ type: 'debug', msg: `sock_accept(${fd}) - wrong fd` });
                     return 8; // WASI_ERRNO_BADF
                 }
@@ -1169,7 +1166,7 @@ async function start() {
             sock_recv: (fd, ri_data_ptr, ri_data_len, ri_flags, ro_datalen_ptr, ro_flags_ptr) => {
                 netStack.pollNetResponses();
 
-                if (fd !== NET_CONN_FD) {
+                if (!network || fd !== NET_CONN_FD) {
                     return 8; // WASI_ERRNO_BADF
                 }
                 if (!instance) return 0;
@@ -1194,7 +1191,7 @@ async function start() {
                 return 0;
             },
             sock_send: (fd, si_data_ptr, si_data_len, si_flags, so_datalen_ptr) => {
-                if (fd !== NET_CONN_FD) {
+                if (!network || fd !== NET_CONN_FD) {
                     return 8; // WASI_ERRNO_BADF
                 }
                 
@@ -1214,8 +1211,14 @@ async function start() {
                 return 0; // Success
             },
             sock_shutdown: (fd, how) => {
-                parentPort.postMessage({ type: 'debug', msg: `sock_shutdown(${fd}, ${how})` });
-                return 0; // Success
+                if (!network || fd !== NET_CONN_FD) return 8; // WASI_ERRNO_BADF
+                if (process.env.DEBUG_NETWORK_STATS === '1') {
+                    parentPort.postMessage({ type: 'debug', msg: `ignored frame-pipe shutdown (${how})` });
+                }
+                // fd 4 is the permanent QEMU Ethernet frame pipe, not one of
+                // the proxied TCP flows. A guest-side half-close must not tear
+                // down the NIC or poison subsequent DNS/connections.
+                return 0;
             }
         }
     });

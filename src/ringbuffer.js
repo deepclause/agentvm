@@ -22,7 +22,7 @@
  * 
  * Network Message Format in ring buffer:
  * ┌──────────┬──────────┬──────────────────────────────────────┐
- * │ Uint16   │ Uint8    │ Variable length                      │
+ * │ Uint32   │ Uint8    │ Variable length                      │
  * │ length   │ type     │ payload                              │
  * └──────────┴──────────┴──────────────────────────────────────┘
  */
@@ -42,6 +42,7 @@ const NET_RING_OFFSET = HEADER_SIZE + STDIN_AREA_SIZE;
 
 // Total buffer size: 32 + 4096 + 1MB = ~1MB
 const NET_RING_SIZE = 1024 * 1024;  // 1MB ring buffer for larger transfers
+const NET_CONTROL_RESERVE = 16 * 1024; // Data cannot starve FIN/error/DNS events
 const TOTAL_BUFFER_SIZE = HEADER_SIZE + STDIN_AREA_SIZE + NET_RING_SIZE;
 
 // Network message types
@@ -105,20 +106,20 @@ class RingBufferWriter {
      * @returns {boolean} - True if written, false if no space
      */
     writeMessage(type, payload) {
-        const msgLen = 3 + payload.length; // 2 bytes length + 1 byte type + payload
-        
-        if (this.availableSpace() < msgLen) {
-            return false; // No space
+        const msgLen = 5 + payload.length; // 4 bytes length + 1 byte type + payload
+        if (msgLen >= NET_RING_SIZE || this.availableSpace() < msgLen) {
+            return false;
         }
         
         let head = Atomics.load(this.int32, NET_HEAD_INDEX);
         const ringStart = NET_RING_OFFSET;
         
-        // Write length (2 bytes, little-endian)
-        this.uint8[ringStart + head] = payload.length & 0xFF;
-        head = (head + 1) % NET_RING_SIZE;
-        this.uint8[ringStart + head] = (payload.length >> 8) & 0xFF;
-        head = (head + 1) % NET_RING_SIZE;
+        // Write length (4 bytes, little-endian). A uint32 permits a maximum
+        // sized UDP datagram plus its flow key without truncation.
+        for (let shift = 0; shift < 32; shift += 8) {
+            this.uint8[ringStart + head] = (payload.length >>> shift) & 0xff;
+            head = (head + 1) % NET_RING_SIZE;
+        }
         
         // Write type (1 byte)
         this.uint8[ringStart + head] = type;
@@ -161,7 +162,7 @@ class RingBufferWriter {
         // Max payload size is 65535 - 1 (keyLen) - keyBytes.length
         // Use 60000 as safe chunk size to leave room for header
         const maxDataPerChunk = 60000;
-        const perChunkOverhead = 3 + 1 + keyBytes.length; // 3 bytes msg header + 1 keyLen + key
+        if (keyBytes.length > 255) return 0;
         
         let bytesWritten = 0;
         
@@ -169,10 +170,11 @@ class RingBufferWriter {
             const remaining = data.length - offset - bytesWritten;
             const chunkSize = Math.min(maxDataPerChunk, remaining);
             const payloadSize = 1 + keyBytes.length + chunkSize;
-            const msgSize = 3 + payloadSize;
+            const msgSize = 5 + payloadSize;
             
-            // Check if we have space for at least one chunk
-            if (!this.hasSpace(msgSize)) {
+            // Leave room for connection state, DNS, and UDP messages. Without
+            // this reserve a full data ring can permanently lose TCP END.
+            if (!this.hasSpace(msgSize + NET_CONTROL_RESERVE)) {
                 break; // No space, return what we've written so far
             }
             
@@ -264,34 +266,19 @@ class RingBufferWriter {
     }
 
     /**
-     * Write UDP receive event
-     * @param {Object} msg - UDP message with data, srcIP, srcPort, dstIP, dstPort
+     * Write a UDP datagram received by an existing NAT flow.
+     * @param {Object} msg - { key, data }
      */
     writeUdpRecv(msg) {
-        // Format: srcIPLen(1) + srcIP + srcPort(2) + dstIPLen(1) + dstIP + dstPort(2) + data
-        const srcIPBytes = Buffer.from(msg.srcIP, 'utf8');
-        const dstIPBytes = Buffer.from(msg.dstIP, 'utf8');
+        // Format: keyLen(1) + key + data. Endpoint metadata lives in the
+        // worker's flow table, which also prevents spoofed reply addresses.
+        const keyBytes = Buffer.from(msg.key, 'utf8');
+        if (keyBytes.length > 255) return false;
         const dataBytes = Buffer.isBuffer(msg.data) ? msg.data : Buffer.from(msg.data);
-        
-        const payload = Buffer.alloc(1 + srcIPBytes.length + 2 + 1 + dstIPBytes.length + 2 + dataBytes.length);
-        let offset = 0;
-        
-        payload[offset++] = srcIPBytes.length;
-        srcIPBytes.copy(payload, offset);
-        offset += srcIPBytes.length;
-        
-        payload.writeUInt16LE(msg.srcPort, offset);
-        offset += 2;
-        
-        payload[offset++] = dstIPBytes.length;
-        dstIPBytes.copy(payload, offset);
-        offset += dstIPBytes.length;
-        
-        payload.writeUInt16LE(msg.dstPort, offset);
-        offset += 2;
-        
-        dataBytes.copy(payload, offset);
-        
+        const payload = Buffer.alloc(1 + keyBytes.length + dataBytes.length);
+        payload[0] = keyBytes.length;
+        keyBytes.copy(payload, 1);
+        dataBytes.copy(payload, 1 + keyBytes.length);
         return this.writeMessage(NET_MSG_UDP_RECV, payload);
     }
     
@@ -381,12 +368,18 @@ class RingBufferReader {
         
         const ringStart = NET_RING_OFFSET;
         
-        // Read length (2 bytes, little-endian)
-        const lenLow = this.uint8[ringStart + tail];
-        tail = (tail + 1) % NET_RING_SIZE;
-        const lenHigh = this.uint8[ringStart + tail];
-        tail = (tail + 1) % NET_RING_SIZE;
-        const payloadLen = lenLow | (lenHigh << 8);
+        // Read length (4 bytes, little-endian)
+        let payloadLen = 0;
+        for (let shift = 0; shift < 32; shift += 8) {
+            payloadLen += this.uint8[ringStart + tail] * (2 ** shift);
+            tail = (tail + 1) % NET_RING_SIZE;
+        }
+        if (payloadLen > NET_RING_SIZE - 6) {
+            // Shared-memory corruption: drop queued data instead of allocating
+            // an unbounded payload.
+            Atomics.store(this.int32, NET_TAIL_INDEX, head);
+            return null;
+        }
         
         // Read type (1 byte)
         const type = this.uint8[ringStart + tail];
@@ -466,31 +459,12 @@ class RingBufferReader {
         return { key, name, qtype, ips, error };
     }
 
-    /**
-     * Parse UDP recv message
-     * @param {Buffer} payload 
-     * @returns {Object} - { srcIP, srcPort, dstIP, dstPort, data }
-     */
+    /** Parse a UDP receive message: { key, data }. */
     parseUdpRecv(payload) {
-        let offset = 0;
-        
-        const srcIPLen = payload[offset++];
-        const srcIP = payload.slice(offset, offset + srcIPLen).toString('utf8');
-        offset += srcIPLen;
-        
-        const srcPort = payload.readUInt16LE(offset);
-        offset += 2;
-        
-        const dstIPLen = payload[offset++];
-        const dstIP = payload.slice(offset, offset + dstIPLen).toString('utf8');
-        offset += dstIPLen;
-        
-        const dstPort = payload.readUInt16LE(offset);
-        offset += 2;
-        
-        const data = payload.slice(offset);
-        
-        return { srcIP, srcPort, dstIP, dstPort, data };
+        const keyLen = payload[0];
+        const key = payload.slice(1, 1 + keyLen).toString('utf8');
+        const data = payload.slice(1 + keyLen);
+        return { key, data };
     }
     
     /**

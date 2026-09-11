@@ -6,7 +6,7 @@
     "agentvm": "./bin/cli.js"
   },
   "scripts": {
-    "test": "node test/basic.test.js && node test/mount.test.js && node test/network/http.test.js"
+    "test": "node test/network/stack.test.js && node --test test/network/flows.test.js && node test/basic.test.js && node test/mount.test.js && node test/network/http.test.js"
   },
   "keywords": [
     "vm",
