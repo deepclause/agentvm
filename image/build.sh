@@ -40,6 +40,8 @@ git clone -q "$TINYEMU_REPO" "$WORK/tinyemu"
 git -C "$WORK/tinyemu" checkout -q "$TINYEMU_REV"
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-fence-tso.patch"
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-low-risk-performance.patch"
+# Generated without context to avoid preserving upstream trailing whitespace.
+git -C "$WORK/tinyemu" apply --unidiff-zero "$HERE/patches/tinyemu-fast-branch.patch"
 rm -rf "$WORK/tinyemu/.git"
 
 echo "==> Generating patched c2w Dockerfile"
