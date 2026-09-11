@@ -671,13 +671,14 @@ class NetworkStack extends EventEmitter {
         if (!pending) return;
         this.pendingDns.delete(key);
 
-        // Build a minimal DNS response for A (1) / AAAA (28).
+        // Build a minimal DNS response. The gateway is IPv4-only, so we
+        // answer A queries with IPv4 addresses and AAAA queries with an empty
+        // NOERROR response. Returning no AAAA records forces the guest to use
+        // IPv4, which this NAT can actually route (IPv6 frames would be dropped).
         const answers = [];
-        if (!error && Array.isArray(ips)) {
+        if (!error && qtype === 1 && Array.isArray(ips)) {
             for (const ip of ips) {
-                const family = String(ip).includes(':') ? 6 : 4;
-                if (qtype === 1 && family === 4) answers.push(ipToBuf(ip));
-                else if (qtype === 28 && family === 6) answers.push(this._ipv6ToBuf(ip));
+                if (!String(ip).includes(':')) answers.push(ipToBuf(ip));
             }
         }
 
