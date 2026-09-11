@@ -51,6 +51,7 @@ const NET_MSG_TCP_END = 3;
 const NET_MSG_TCP_ERROR = 4;
 const NET_MSG_TCP_CLOSE = 5;
 const NET_MSG_UDP_RECV = 6;
+const NET_MSG_DNS_RESULT = 7;
 
 /**
  * Ring buffer writer (used by main thread)
@@ -227,6 +228,42 @@ class RingBufferWriter {
     }
     
     /**
+     * Write a DNS lookup result
+     * @param {Object} msg - { key, name, qtype, ips, error }
+     */
+    writeDnsResult(msg) {
+        const keyB = Buffer.from(String(msg.key || ''), 'utf8');
+        const nameB = Buffer.from(String(msg.name || ''), 'utf8');
+        const errB = Buffer.from(String(msg.error || ''), 'utf8');
+        const ipList = (msg.ips || []).map((ip) => String(ip));
+        let ipBytes = 0;
+        for (const ip of ipList) ipBytes += 2 + Buffer.byteLength(ip);
+
+        const payload = Buffer.alloc(
+            1 + keyB.length +
+            1 + nameB.length +
+            2 +
+            1 + (msg.error ? 1 + errB.length : 0) +
+            1 + ipBytes
+        );
+        let o = 0;
+        payload[o++] = keyB.length; keyB.copy(payload, o); o += keyB.length;
+        payload[o++] = nameB.length; nameB.copy(payload, o); o += nameB.length;
+        payload.writeUInt16LE(msg.qtype || 0, o); o += 2;
+        payload[o++] = msg.error ? 1 : 0;
+        if (msg.error) { payload[o++] = errB.length; errB.copy(payload, o); o += errB.length; }
+        payload[o++] = ipList.length;
+        for (const ip of ipList) {
+            const family = ip.includes(':') ? 6 : 4;
+            const b = Buffer.from(ip, 'utf8');
+            payload[o++] = family;
+            payload[o++] = b.length;
+            b.copy(payload, o); o += b.length;
+        }
+        return this.writeMessage(NET_MSG_DNS_RESULT, payload);
+    }
+
+    /**
      * Write UDP receive event
      * @param {Object} msg - UDP message with data, srcIP, srcPort, dstIP, dstPort
      */
@@ -402,6 +439,34 @@ class RingBufferReader {
     }
     
     /**
+     * Parse DNS result message
+     * @param {Buffer} payload
+     * @returns {Object} - { key, name, qtype, ips, error }
+     */
+    parseDnsResult(payload) {
+        let o = 0;
+        const keyLen = payload[o++];
+        const key = payload.slice(o, o + keyLen).toString('utf8'); o += keyLen;
+        const nameLen = payload[o++];
+        const name = payload.slice(o, o + nameLen).toString('utf8'); o += nameLen;
+        const qtype = payload.readUInt16LE(o); o += 2;
+        const hasError = payload[o++];
+        let error = null;
+        if (hasError) {
+            const errLen = payload[o++];
+            error = payload.slice(o, o + errLen).toString('utf8'); o += errLen;
+        }
+        const count = payload[o++];
+        const ips = [];
+        for (let i = 0; i < count; i++) {
+            o++; // family (unused by the caller, the IP string is authoritative)
+            const ipLen = payload[o++];
+            ips.push(payload.slice(o, o + ipLen).toString('utf8')); o += ipLen;
+        }
+        return { key, name, qtype, ips, error };
+    }
+
+    /**
      * Parse UDP recv message
      * @param {Buffer} payload 
      * @returns {Object} - { srcIP, srcPort, dstIP, dstPort, data }
@@ -475,5 +540,6 @@ module.exports = {
     NET_MSG_TCP_END,
     NET_MSG_TCP_ERROR,
     NET_MSG_TCP_CLOSE,
-    NET_MSG_UDP_RECV
+    NET_MSG_UDP_RECV,
+    NET_MSG_DNS_RESULT
 };

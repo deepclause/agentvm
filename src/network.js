@@ -1,45 +1,71 @@
 const EventEmitter = require('events');
-const { 
-    RingBufferReader, 
-    NET_MSG_TCP_CONNECTED, 
-    NET_MSG_TCP_DATA, 
-    NET_MSG_TCP_END, 
-    NET_MSG_TCP_ERROR, 
-    NET_MSG_TCP_CLOSE, 
-    NET_MSG_UDP_RECV 
+const {
+    RingBufferReader,
+    NET_MSG_TCP_CONNECTED,
+    NET_MSG_TCP_DATA,
+    NET_MSG_TCP_END,
+    NET_MSG_TCP_ERROR,
+    NET_MSG_TCP_CLOSE,
+    NET_MSG_UDP_RECV,
+    NET_MSG_DNS_RESULT,
 } = require('./ringbuffer');
 
-// Protocol Constants
+// Protocol constants
 const ETH_P_IP = 0x0800;
 const ETH_P_ARP = 0x0806;
 const IP_PROTO_TCP = 6;
 const IP_PROTO_UDP = 17;
 const IP_PROTO_ICMP = 1;
 
-// DHCP Constants
+// TCP flags
+const TCP_FIN = 0x01;
+const TCP_SYN = 0x02;
+const TCP_RST = 0x04;
+const TCP_PSH = 0x08;
+const TCP_ACK = 0x10;
+
+const MSS = 1460; // 1500 - 20 IP - 20 TCP
+const INITIAL_WINDOW = 65535;
+
+// Timing (milliseconds)
+const TCP_RETRANSMIT_MS = 1000;
+const TCP_MAX_RETRANSMITS = 6;
+const TCP_IDLE_REAP_MS = 120000;
+const UDP_IDLE_REAP_MS = 30000;
+
+// DHCP constants
 const DHCP_SERVER_PORT = 67;
 const DHCP_CLIENT_PORT = 68;
 const DHCP_MAGIC_COOKIE = 0x63825363;
-
-// DHCP Message Types
 const DHCP_DISCOVER = 1;
 const DHCP_OFFER = 2;
 const DHCP_REQUEST = 3;
-const DHCP_DECLINE = 4;
 const DHCP_ACK = 5;
-const DHCP_NAK = 6;
-const DHCP_RELEASE = 7;
-
-// DHCP Options
 const DHCP_OPT_SUBNET_MASK = 1;
 const DHCP_OPT_ROUTER = 3;
 const DHCP_OPT_DNS = 6;
-const DHCP_OPT_HOSTNAME = 12;
-const DHCP_OPT_REQUESTED_IP = 50;
 const DHCP_OPT_LEASE_TIME = 51;
 const DHCP_OPT_MSG_TYPE = 53;
 const DHCP_OPT_SERVER_ID = 54;
 const DHCP_OPT_END = 255;
+
+function ipToString(buf) {
+    return `${buf[0]}.${buf[1]}.${buf[2]}.${buf[3]}`;
+}
+
+function ipToBuf(str) {
+    return Buffer.from(String(str).split('.').map(Number));
+}
+
+function wrap32(x) {
+    return x >>> 0;
+}
+
+// Sequence-number comparisons (mod 2^32).
+const seqLt = (a, b) => (((a - b) | 0) < 0);
+const seqLeq = (a, b) => (((a - b) | 0) <= 0);
+const seqGt = (a, b) => (((a - b) | 0) > 0);
+const seqGeq = (a, b) => (((a - b) | 0) >= 0);
 
 class NetworkStack extends EventEmitter {
     constructor(options = {}) {
@@ -47,843 +73,776 @@ class NetworkStack extends EventEmitter {
         this.gatewayIP = options.gatewayIP || '192.168.127.1';
         this.vmIP = options.vmIP || '192.168.127.3';
         this.gatewayMac = options.gatewayMac || Buffer.from([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xdd]);
-        this.vmMac = Buffer.from([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]); // Default VM MAC
-        
-        this.natTable = new Map(); // key -> { state, mySeq, myAck, ... } for TCP state tracking
-        
-        // Network I/O via shared ring buffer for INCOMING data (main → worker)
-        // No more MessagePort polling for data!
+        this.vmMac = options.vmMac ? Buffer.from(options.vmMac) : Buffer.from([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+
         this.ringReader = options.ringReader || null;
-        
-        // MessagePort still needed for OUTGOING control messages (worker → main)
         this.netPort = options.netPort || null;
-        
-        // QEMU Framing Buffer
-        this.txBuffer = Buffer.alloc(0); // Data sending TO the VM (queued)
-        this.rxBuffer = Buffer.alloc(0); // Data received FROM the VM (buffering for full frame)
-        
-        // TCP Flow Control: Maximum buffer before requesting pause
-        // Use larger buffers to reduce pause/resume cycle frequency and improve throughput
-        this.TX_BUFFER_HIGH_WATER = 256 * 1024;  // 256KB - request pause
-        this.TX_BUFFER_LOW_WATER = 64 * 1024;    // 64KB - request resume
-        this.txPaused = new Set(); // Set of TCP session keys that are paused
+
+        // Frames queued to the VM (QEMU-framed Ethernet). This is the only
+        // thing the emulator socket delivers to the guest NIC.
+        this.txBuffer = Buffer.alloc(0);
+        // Bytes received from the VM, reassembled into complete frames.
+        this.rxBuffer = Buffer.alloc(0);
+
+        this.tcpFlows = new Map();
+        this.udpFlows = new Map();
+        this.pendingDns = new Map(); // key -> { srcIp, srcPort, id, name, qtype }
+        this._lastTick = Date.now();
     }
-    
-    /**
-     * Check if there's network data available in the ring buffer
-     */
+
+    /* ------------------------------------------------------------------ *
+     * Frame pipe (worker <-> emulator socket)
+     * ------------------------------------------------------------------ */
+
     hasNetworkData() {
         return this.ringReader && this.ringReader.hasNetworkData();
     }
-    
-    /**
-     * Poll for network responses from ring buffer (synchronous, no waiting)
-     * Call this during poll_oneoff to check for incoming data
-     */
-    pollNetResponses() {
-        if (!this.ringReader) return;
-        
-        // Process more bytes per poll to improve throughput
-        // BUT: Always process control messages (END, ERROR, etc.) to avoid deadlocks!
-        const MAX_DATA_BYTES_PER_POLL = 512 * 1024; // 512KB max DATA per poll cycle
-        let dataBytesThisPoll = 0;
-        let hitDataLimit = false;
-        let messagesRead = 0;
-        
-        // Read messages from ring buffer (no polling needed - direct memory access!)
-        let msg;
-        while ((msg = this.ringReader.readNetworkMessage())) {
-            messagesRead++;
-            if (msg.type === NET_MSG_UDP_RECV) {
-                const parsed = this.ringReader.parseUdpRecv(msg.payload);
-                this._handleUdpResponse(parsed);
-            } else if (msg.type === NET_MSG_TCP_CONNECTED) {
-                const key = this.ringReader.parseKey(msg.payload);
-                this._handleTcpConnected({ key });
-            } else if (msg.type === NET_MSG_TCP_DATA) {
-                // Skip data if we've hit the limit - but keep processing control messages!
-                if (hitDataLimit) {
-                    // Put this message back? No, we can't. Instead, process it anyway
-                    // but set a flag to stop reading MORE data messages after this
-                }
-                const parsed = this.ringReader.parseTcpData(msg.payload);
-                this._handleTcpData(parsed);
-                dataBytesThisPoll += parsed.data.length;
-                if (dataBytesThisPoll >= MAX_DATA_BYTES_PER_POLL) {
-                    hitDataLimit = true;
-                    // Don't break! Continue processing to catch any control messages
-                }
-            } else if (msg.type === NET_MSG_TCP_END) {
-                // CRITICAL: Always process END messages to avoid deadlocks!
-                const key = this.ringReader.parseKey(msg.payload);
-                this._handleTcpEnd({ key });
-            } else if (msg.type === NET_MSG_TCP_ERROR) {
-                const parsed = this.ringReader.parseTcpError(msg.payload);
-                this._handleTcpError(parsed);
-            } else if (msg.type === NET_MSG_TCP_CLOSE) {
-                const key = this.ringReader.parseKey(msg.payload);
-                this._handleTcpClosed({ key });
-            }
-        }
-        
-        if (messagesRead > 0) {
-            this.emit('debug', `[NetStack] pollNetResponses: read ${messagesRead} messages, ${dataBytesThisPoll} data bytes, txBuf=${this.txBuffer.length}`);
-        }
-    }
-    
-    /**
-     * Handle UDP response from main thread
-     * @private
-     */
-    _handleUdpResponse(msg) {
-        const { data, srcIP, srcPort, dstIP, dstPort } = msg;
-        
-        // Build UDP response packet
-        const udpHeader = Buffer.alloc(8);
-        udpHeader.writeUInt16BE(dstPort, 0); // src port (from external server)
-        udpHeader.writeUInt16BE(srcPort, 2); // dst port (back to VM)
-        udpHeader.writeUInt16BE(8 + data.length, 4); // length
-        udpHeader.writeUInt16BE(0, 6); // checksum (optional)
-        
-        const payload = Buffer.concat([udpHeader, Buffer.from(data)]);
-        
-        // Send IP packet back to VM
-        const dstIPBuf = Buffer.from(dstIP.split('.').map(Number));
-        const srcIPBuf = Buffer.from(srcIP.split('.').map(Number));
-        
-        this.sendIP(payload, IP_PROTO_UDP, dstIPBuf, srcIPBuf);
-    }
-    
-    /**
-     * Handle TCP connected event from main thread
-     * @private
-     */
-    _handleTcpConnected(msg) {
-        const { key } = msg;
-        const session = this.natTable.get(key);
-        if (!session) return;
-        
-        session.state = 'ESTABLISHED';
-        // Send SYN-ACK to VM
-        this.sendTCP(session.srcIP, session.srcPort, session.dstIP, session.dstPort, 
-                     session.mySeq, session.myAck, 0x12); // SYN | ACK
-        session.mySeq++;
-    }
-    
-    /**
-     * Handle TCP data from main thread
-     * @private
-     */
-    _handleTcpData(msg) {
-        const { key, data } = msg;
-        const session = this.natTable.get(key);
-        if (!session) return;
-        
-        const payload = Buffer.from(data);
-        
-        // MTU is 1500, IP header is 20, TCP header is 20
-        // Maximum Segment Size (MSS) = 1500 - 20 - 20 = 1460
-        const MSS = 1460;
-        
-        // Segment the data if it exceeds MSS
-        let offset = 0;
-        while (offset < payload.length) {
-            const chunkSize = Math.min(MSS, payload.length - offset);
-            const chunk = payload.subarray(offset, offset + chunkSize);
-            const isLast = (offset + chunkSize >= payload.length);
-            
-            // Send PSH-ACK for last segment, just ACK for intermediate segments
-            const flags = isLast ? 0x18 : 0x10; // PSH|ACK or just ACK
-            this.sendTCP(session.srcIP, session.srcPort, session.dstIP, session.dstPort,
-                         session.mySeq, session.myAck, flags, chunk);
-            session.mySeq += chunk.length;
-            offset += chunkSize;
-        }
-        
-        // Note: Flow control is handled by ring buffer backpressure in main thread.
-        // When ring buffer is full, main thread pauses socket and buffers data.
-        // No need for worker-side txBuffer flow control - it would cause deadlocks.
-    }
-    
-    /**
-     * Handle TCP end (FIN from remote) from main thread
-     * @private
-     */
-    _handleTcpEnd(msg) {
-        const { key } = msg;
-        const session = this.natTable.get(key);
-        if (!session) {
-            this.emit('debug', `[TCP] FIN received for unknown session ${key}`);
-            return;
-        }
-        
-        this.emit('debug', `[TCP] FIN received for ${key}, state=${session.state}, txBuffer=${this.txBuffer.length}, mySeq=${session.mySeq}, myAck=${session.myAck}`);
-        
-        // Send FIN-ACK to VM
-        this.sendTCP(session.srcIP, session.srcPort, session.dstIP, session.dstPort,
-                     session.mySeq, session.myAck, 0x11); // FIN | ACK
-        session.mySeq++;
-        session.state = 'FIN_WAIT';
-    }
-    
-    /**
-     * Handle TCP error from main thread
-     * @private
-     */
-    _handleTcpError(msg) {
-        const { key } = msg;
-        const session = this.natTable.get(key);
-        if (!session) return;
-        
-        // Send RST to VM
-        this.sendTCP(session.srcIP, session.srcPort, session.dstIP, session.dstPort,
-                     session.mySeq, session.myAck, 0x04); // RST
-        this.natTable.delete(key);
-    }
-    
-    /**
-     * Handle TCP connection closed from main thread
-     * @private
-     */
-    _handleTcpClosed(msg) {
-        const { key } = msg;
-        const session = this.natTable.get(key);
-        if (session) {
-            // Mark session as closing - don't delete yet
-            // Wait for VM to send FIN before full cleanup
-            session.state = 'CLOSED_BY_REMOTE';
-        }
-    }
 
-    // Called when VM writes data to the network interface (FD 3)
-    // We need to unwrap QEMU framing (4-byte len) -> Frame
     writeToNetwork(data) {
-        this.rxBuffer = Buffer.concat([this.rxBuffer, data]);
-        
+        if (!data || data.length === 0) return;
+        this.rxBuffer = this.rxBuffer.length === 0
+            ? Buffer.from(data)
+            : Buffer.concat([this.rxBuffer, data]);
+
         while (this.rxBuffer.length >= 4) {
             const frameLen = this.rxBuffer.readUInt32BE(0);
-            if (this.rxBuffer.length < 4 + frameLen) {
-                break; // Wait for more data
-            }
-            
+            if (this.rxBuffer.length < 4 + frameLen) break;
             const frame = this.rxBuffer.subarray(4, 4 + frameLen);
-            this.receive(frame); // Process the frame
-            
             this.rxBuffer = this.rxBuffer.subarray(4 + frameLen);
+            try {
+                this.receive(frame);
+            } catch (err) {
+                this.emit('error', err);
+            }
+        }
+
+        // Safety: never let a malformed frame grow the reassembly buffer
+        // without bound.
+        if (this.rxBuffer.length > 1024 * 1024) {
+            this.rxBuffer = Buffer.alloc(0);
         }
     }
 
-    // Called when VM wants to read data from the network interface
     readFromNetwork(maxLen) {
         if (this.txBuffer.length === 0) return null;
-        
         const chunk = this.txBuffer.subarray(0, maxLen);
         this.txBuffer = this.txBuffer.subarray(chunk.length);
-        
         return chunk;
     }
-    
-    /**
-     * Get the current size of pending data in the TX buffer
-     * @returns {number} Number of bytes waiting to be read
-     */
-    pendingDataSize() {
-        return this.txBuffer.length;
-    }
-    
-    /**
-     * Close the active socket - send FIN to remote, notify main thread
-     */
-    closeSocket() {
-        // Find the active TCP session (the one that's in FIN_WAIT or ESTABLISHED)
-        for (const [key, session] of this.natTable) {
-            if (session.state === 'ESTABLISHED' || session.state === 'FIN_WAIT') {
-                this.emit('debug', `[TCP] VM closing socket ${key}, state=${session.state}, sending FIN`);
-                
-                // If we already received FIN from remote (FIN_WAIT), just send ACK
-                // Otherwise send FIN to initiate close from our side
-                if (session.state === 'FIN_WAIT') {
-                    // We already sent FIN-ACK when we received their FIN
-                    // Now just clean up - notify main thread to close the socket
-                    if (this.netPort) {
-                        this.netPort.postMessage({ type: 'tcp-close', key });
-                    }
-                } else {
-                    // ESTABLISHED - we're initiating close, send FIN
-                    this.sendTCP(session.srcIP, session.srcPort, session.dstIP, session.dstPort,
-                                 session.mySeq, session.myAck, 0x11); // FIN | ACK
-                    session.mySeq++;
-                    
-                    // Notify main thread to close the socket
-                    if (this.netPort) {
-                        this.netPort.postMessage({ type: 'tcp-close', key });
-                    }
-                }
-                // Delete the session to allow new connections
-                this.natTable.delete(key);
-                break; // Only close one socket (we only support one connection at a time currently)
-            }
-        }
-        
-        // Also clean up any stale closed sessions
-        for (const [key, session] of this.natTable) {
-            if (session.state === 'CLOSED_BY_REMOTE' || session.state === 'CLOSED' || session.state === 'FIN_SENT') {
-                this.emit('debug', `[TCP] Cleaning up stale session ${key}, state=${session.state}`);
-                this.natTable.delete(key);
-            }
-        }
-    }
-    
+
     hasPendingData() {
         return this.txBuffer.length > 0;
     }
-    
-    /**
-     * Check if any TCP session has received FIN (for EOF signaling)
-     * @returns {boolean}
-     */
-    hasReceivedFin() {
-        for (const [key, session] of this.natTable) {
-            if (session.state === 'FIN_WAIT' || session.state === 'CLOSED_BY_REMOTE') {
-                return true;
-            }
-        }
-        return false;
+
+    pendingDataSize() {
+        return this.txBuffer.length;
     }
 
-    // Called internally when we want to send a frame TO the VM
+    /**
+     * Close every flow. Called when the emulator socket itself is closed.
+     * Per-connection FIN/RST is handled inside handleTCP / tick, not here.
+     */
+    closeSocket() {
+        for (const [key, flow] of this.tcpFlows) {
+            this._destroyHost(key, true);
+        }
+        this.tcpFlows.clear();
+        for (const [key] of this.udpFlows) {
+            this._post({ type: 'udp-close', key });
+        }
+        this.udpFlows.clear();
+    }
+
+    /* ------------------------------------------------------------------ *
+     * Ring buffer <-> main thread event pump
+     * ------------------------------------------------------------------ */
+
+    pollNetResponses() {
+        if (!this.ringReader) return;
+
+        let msg;
+        let read = 0;
+        while ((msg = this.ringReader.readNetworkMessage())) {
+            read++;
+            switch (msg.type) {
+                case NET_MSG_UDP_RECV: {
+                    const p = this.ringReader.parseUdpRecv(msg.payload);
+                    this._handleUdpResponse(p);
+                    break;
+                }
+                case NET_MSG_DNS_RESULT: {
+                    const p = this.ringReader.parseDnsResult(msg.payload);
+                    this._handleDnsResult(p);
+                    break;
+                }
+                case NET_MSG_TCP_CONNECTED: {
+                    const key = this.ringReader.parseKey(msg.payload);
+                    this._handleTcpConnected(key);
+                    break;
+                }
+                case NET_MSG_TCP_DATA: {
+                    const p = this.ringReader.parseTcpData(msg.payload);
+                    this._handleTcpData(p);
+                    break;
+                }
+                case NET_MSG_TCP_END: {
+                    const key = this.ringReader.parseKey(msg.payload);
+                    this._handleTcpEnd(key);
+                    break;
+                }
+                case NET_MSG_TCP_ERROR: {
+                    const p = this.ringReader.parseTcpError(msg.payload);
+                    this._handleTcpError(p);
+                    break;
+                }
+                case NET_MSG_TCP_CLOSE: {
+                    const key = this.ringReader.parseKey(msg.payload);
+                    this._handleTcpClosed(key);
+                    break;
+                }
+            }
+        }
+        if (read) this.emit('network-activity');
+    }
+
+    /**
+     * Drive retransmission and idle reaping. Called periodically by the
+     * worker's poll_oneoff loop so we make progress even when the guest is
+     * blocked waiting for network data.
+     */
+    tick() {
+        const now = Date.now();
+        for (const [, flow] of this.tcpFlows) {
+            this._retransmit(flow, now);
+            if (now - flow.lastActivity > TCP_IDLE_REAP_MS) {
+                this._destroyHost(flow.key, true);
+                this.tcpFlows.delete(flow.key);
+            }
+        }
+        for (const [key, flow] of this.udpFlows) {
+            if (now - flow.lastActivity > UDP_IDLE_REAP_MS) {
+                this._post({ type: 'udp-close', key });
+                this.udpFlows.delete(key);
+            }
+        }
+        this._lastTick = now;
+    }
+
+    _post(msg) {
+        if (this.netPort) this.netPort.postMessage(msg);
+    }
+
+    _destroyHost(key, destroy) {
+        this._post({ type: 'tcp-close', key, destroy });
+    }
+
+    /* ------------------------------------------------------------------ *
+     * Ethernet / ARP / IP / ICMP
+     * ------------------------------------------------------------------ */
+
     send(payload, proto) {
-        if (!this.vmMac) return; 
-        
+        if (!this.vmMac) return;
         const frame = Buffer.alloc(14 + payload.length);
-        this.vmMac.copy(frame, 0); 
-        this.gatewayMac.copy(frame, 6); 
+        this.vmMac.copy(frame, 0);
+        this.gatewayMac.copy(frame, 6);
         frame.writeUInt16BE(proto, 12);
         payload.copy(frame, 14);
-        
-        // Wrap in QEMU framing
+
         const header = Buffer.alloc(4);
         header.writeUInt32BE(frame.length, 0);
-        
         this.txBuffer = Buffer.concat([this.txBuffer, header, frame]);
-        
-        this.emit('tx', frame); // For testing/debug
-        this.emit('network-activity'); // Notify worker to wake up poll
+        this.emit('tx', frame);
+        this.emit('network-activity');
     }
-    
-    // Send to broadcast MAC (for DHCP etc)
+
     sendBroadcast(payload, proto) {
         const broadcastMac = Buffer.from([0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
-        
         const frame = Buffer.alloc(14 + payload.length);
-        broadcastMac.copy(frame, 0); // Destination: broadcast
-        this.gatewayMac.copy(frame, 6); // Source: gateway MAC
+        broadcastMac.copy(frame, 0);
+        this.gatewayMac.copy(frame, 6);
         frame.writeUInt16BE(proto, 12);
         payload.copy(frame, 14);
-        
-        // Wrap in QEMU framing
+
         const header = Buffer.alloc(4);
         header.writeUInt32BE(frame.length, 0);
-        
         this.txBuffer = Buffer.concat([this.txBuffer, header, frame]);
-        
         this.emit('network-activity');
     }
 
     receive(frame) {
-        try {
-            if (frame.length < 14) return;
-            const etherType = frame.readUInt16BE(12);
-            const payload = frame.subarray(14);
-            
-            // Learn VM MAC
-            const srcMac = frame.subarray(6, 12);
-            if (!this.vmMac) {
-                 this.vmMac = Buffer.from(srcMac);
-            }
+        if (frame.length < 14) return;
+        const etherType = frame.readUInt16BE(12);
+        const payload = frame.subarray(14);
 
-            if (etherType === ETH_P_ARP) {
-                this.handleARP(payload);
-            } else if (etherType === ETH_P_IP) {
-                this.handleIP(payload);
-            }
-        } catch(err) {
-            this.emit('error', err);
-        }
+        const srcMac = frame.subarray(6, 12);
+        if (!this.vmMac) this.vmMac = Buffer.from(srcMac);
+
+        if (etherType === ETH_P_ARP) this.handleARP(payload);
+        else if (etherType === ETH_P_IP) this.handleIP(payload);
     }
 
     handleARP(packet) {
-        // Simple ARP Reply
-        // Hardware Type (2), Protocol (2), HLen (1), PLen (1), Op (2)
-        const op = packet.readUInt16BE(6);
-        if (op === 1) { // Request
-            // Target IP
-            const targetIP = packet.subarray(24, 28);
-            const targetIPStr = targetIP.join('.');
-            
-            if (targetIPStr === this.gatewayIP) {
-                // Reply
-                const reply = Buffer.alloc(28);
-                packet.copy(reply, 0, 0, 8); // Copy HW/Proto/Len
-                reply.writeUInt16BE(2, 6); // Reply Op
-                
-                this.gatewayMac.copy(reply, 8); // Sender HW
-                targetIP.copy(reply, 14); // Sender IP (Gateway)
-                
-                packet.subarray(8, 14).copy(reply, 18); // Target HW (VM)
-                packet.subarray(14, 18).copy(reply, 24); // Target IP (VM)
-                
-                this.send(reply, ETH_P_ARP);
-            }
-        }
+        if (packet.readUInt16BE(6) !== 1) return; // only requests
+        const targetIP = ipToString(packet.subarray(24, 28));
+        if (targetIP !== this.gatewayIP) return;
+
+        const reply = Buffer.alloc(28);
+        packet.copy(reply, 0, 0, 8);
+        reply.writeUInt16BE(2, 6);
+        this.gatewayMac.copy(reply, 8);
+        packet.subarray(24, 28).copy(reply, 14); // sender IP = target (gateway)
+        packet.subarray(8, 14).copy(reply, 18); // target HW = requester
+        packet.subarray(14, 18).copy(reply, 24); // target IP = requester
+        this.send(reply, ETH_P_ARP);
     }
 
     handleIP(packet) {
-        const version = packet[0] >> 4;
-        if (version !== 4) return;
-        
-        const headerLen = (packet[0] & 0x0F) * 4;
+        if ((packet[0] >> 4) !== 4) return;
+        const headerLen = (packet[0] & 0x0f) * 4;
         const totalLen = packet.readUInt16BE(2);
         const protocol = packet[9];
         const srcIP = packet.subarray(12, 16);
         const dstIP = packet.subarray(16, 20);
-        
-        const data = packet.subarray(headerLen, totalLen); // strict length?
-        
-        // this.emit('debug', `[IP] proto=${protocol} src=${srcIP.join('.')} dst=${dstIP.join('.')} len=${data.length}`);
+        const data = packet.subarray(headerLen, totalLen);
 
-        if (protocol === IP_PROTO_ICMP) {
-             this.handleICMP(data, srcIP, dstIP, packet.subarray(0, headerLen));
-        } else if (protocol === IP_PROTO_TCP) {
-             this.handleTCP(data, srcIP, dstIP, packet);
-        } else if (protocol === IP_PROTO_UDP) {
-             this.handleUDP(data, srcIP, dstIP);
-        }
+        if (protocol === IP_PROTO_ICMP) this.handleICMP(data, srcIP, dstIP);
+        else if (protocol === IP_PROTO_TCP) this.handleTCP(data, srcIP, dstIP);
+        else if (protocol === IP_PROTO_UDP) this.handleUDP(data, srcIP, dstIP);
     }
-    
-    // Checksum Helpers
+
     calculateChecksum(buf) {
         let sum = 0;
-        for (let i = 0; i < buf.length - 1; i += 2) {
-            sum += buf.readUInt16BE(i);
-        }
-        if (buf.length % 2 === 1) {
-            sum += (buf[buf.length - 1] << 8);
-        }
-        while (sum >> 16) {
-            sum = (sum & 0xFFFF) + (sum >> 16);
-        }
-        return ~sum & 0xFFFF;
+        for (let i = 0; i < buf.length - 1; i += 2) sum += buf.readUInt16BE(i);
+        if (buf.length % 2 === 1) sum += buf[buf.length - 1] << 8;
+        while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16);
+        return (~sum) & 0xffff;
     }
 
-    handleICMP(data, srcIP, dstIP, ipHeader) {
-        const type = data[0];
-        if (type === 8) { // Echo Request
-             // Reply
-             const reply = Buffer.alloc(data.length);
-             data.copy(reply);
-             reply[0] = 0; // Echo Reply
-             reply[2] = 0; reply[3] = 0; // Clear checksum
-             
-             const ck = this.calculateChecksum(reply);
-             reply.writeUInt16BE(ck, 2);
-             
-             this.sendIP(reply, IP_PROTO_ICMP, dstIP, srcIP);
-        }
+    handleICMP(data, srcIP, dstIP) {
+        if (data[0] !== 8) return; // echo request
+        const reply = Buffer.from(data);
+        reply[0] = 0; // echo reply
+        reply[2] = 0; reply[3] = 0;
+        reply.writeUInt16BE(this.calculateChecksum(reply), 2);
+        this.sendIP(reply, IP_PROTO_ICMP, dstIP, srcIP);
     }
 
     sendIP(payload, protocol, srcIP, dstIP) {
         const header = Buffer.alloc(20);
-        header[0] = 0x45; // v4, 5 words
-        header[1] = 0; // TOS
+        header[0] = 0x45;
+        header[1] = 0;
         header.writeUInt16BE(20 + payload.length, 2);
-        header.writeUInt16BE(0, 4); // ID
-        header.writeUInt16BE(0, 6); // Flags/Offset
-        header[8] = 64; // TTL
+        header.writeUInt16BE(0, 4);
+        header.writeUInt16BE(0x4000, 6); // DF
+        header[8] = 64;
         header[9] = protocol;
         srcIP.copy(header, 12);
         dstIP.copy(header, 16);
-        
-        // IP Checksum
         header.writeUInt16BE(this.calculateChecksum(header), 10);
-        
+
         const packet = Buffer.concat([header, payload]);
-        
-        // Check if destination is broadcast
-        if (dstIP[0] === 255 && dstIP[1] === 255 && dstIP[2] === 255 && dstIP[3] === 255) {
-            this.sendBroadcast(packet, ETH_P_IP);
-        } else {
-            this.send(packet, ETH_P_IP);
-        }
+        const isBroadcast = dstIP[0] === 255 && dstIP[1] === 255 && dstIP[2] === 255 && dstIP[3] === 255;
+        if (isBroadcast) this.sendBroadcast(packet, ETH_P_IP);
+        else this.send(packet, ETH_P_IP);
     }
-    
-    handleTCP(segment, srcIP, dstIP, fullIPPacket) {
-        const srcPort = segment.readUInt16BE(0);
-        const dstPort = segment.readUInt16BE(2);
-        const seq = segment.readUInt32BE(4);
-        const ack = segment.readUInt32BE(8);
-        const offset = (segment[12] >> 4) * 4;
-        const flags = segment[13];
-        const payload = segment.subarray(offset);
-        
-        const SYN = (flags & 0x02) !== 0;
-        const ACK = (flags & 0x10) !== 0;
-        const PSH = (flags & 0x08) !== 0;
-        const FIN = (flags & 0x01) !== 0;
-        const RST = (flags & 0x04) !== 0;
 
-        const key = `TCP:${srcIP.join('.')}:${srcPort}:${dstIP.join('.')}:${dstPort}`;
-        let session = this.natTable.get(key);
+    /* ------------------------------------------------------------------ *
+     * TCP (guest-facing endpoint + host net.Socket relay)
+     * ------------------------------------------------------------------ */
 
-        if (RST) {
-            if (session) {
-                // Tell main thread to destroy the socket
-                if (this.netPort) {
-                    this.netPort.postMessage({ type: 'tcp-close', key, destroy: true });
-                }
-                this.natTable.delete(key);
-                // Clean up flow control state
-                this.txPaused.delete(key);
-            }
-            return;
-        }
-
-        if (SYN && !session) {
-            // New Connection - create session state and tell main thread to connect
-            session = { 
-                state: 'SYN_SENT', 
-                srcIP: Buffer.from(srcIP),
-                srcPort,
-                dstIP: Buffer.from(dstIP),
-                dstPort,
-                vmSeq: seq, 
-                vmAck: ack,
-                mySeq: Math.floor(Math.random() * 0xFFFFFFF),
-                myAck: seq + 1 
-            };
-            this.natTable.set(key, session);
-            
-            // Request connection via main thread
-            if (this.netPort) {
-                this.netPort.postMessage({
-                    type: 'tcp-connect',
-                    key,
-                    dstIP: dstIP.join('.'),
-                    dstPort,
-                    srcIP: srcIP.join('.'),
-                    srcPort
-                });
-            }
-            return;
-        }
-
-        if (!session) {
-            // Unknown session, send RST
-            if (!SYN) {
-                 this.sendTCP(srcIP, srcPort, dstIP, dstPort, 0, seq + (payload.length || 1), 0x04);
-            }
-            return;
-        }
-
-        // Handle Data from VM
-        if (payload.length > 0) {
-            // Forward data to main thread
-            if (this.netPort) {
-                this.netPort.postMessage({
-                    type: 'tcp-send',
-                    key,
-                    data: Array.from(payload)
-                });
-            }
-            session.vmSeq += payload.length;
-            session.myAck += payload.length;
-            // Send ACK back to VM
-            this.sendTCP(session.srcIP, session.srcPort, session.dstIP, session.dstPort, 
-                         session.mySeq, session.myAck, 0x10); // ACK
-        }
-        
-        if (FIN) {
-            // Tell main thread to close the connection
-            this.emit('debug', `[TCP] VM sent FIN for ${key}, state=${session.state}`);
-            if (this.netPort && session.state !== 'CLOSED_BY_REMOTE') {
-                this.netPort.postMessage({ type: 'tcp-close', key, destroy: false });
-            }
-            session.myAck++;
-            this.sendTCP(session.srcIP, session.srcPort, session.dstIP, session.dstPort,
-                         session.mySeq, session.myAck, 0x10); // ACK
-            
-            // If remote already closed, we can now clean up the session
-            if (session.state === 'CLOSED_BY_REMOTE' || session.state === 'FIN_WAIT') {
-                this.natTable.delete(key);
-                // Clean up flow control state
-                this.txPaused.delete(key);
-            } else {
-                session.state = 'FIN_SENT';
-            }
-        }
+    _tcpKey(srcIP, srcPort, dstIP, dstPort) {
+        return `TCP:${ipToString(srcIP)}:${srcPort}:${ipToString(dstIP)}:${dstPort}`;
     }
 
     sendTCP(dstIP, dstPort, srcIP, srcPort, seq, ack, flags, payload = Buffer.alloc(0)) {
-        // Debug: log outgoing TCP packets
-        const flagStr = [];
-        if (flags & 0x01) flagStr.push('FIN');
-        if (flags & 0x02) flagStr.push('SYN');
-        if (flags & 0x04) flagStr.push('RST');
-        if (flags & 0x08) flagStr.push('PSH');
-        if (flags & 0x10) flagStr.push('ACK');
-        this.emit('debug', `[TCP OUT] ${srcIP.join('.')}:${srcPort} -> ${dstIP.join('.')}:${dstPort} [${flagStr.join(',')}] seq=${seq} ack=${ack} len=${payload.length}`);
-        
         const header = Buffer.alloc(20);
         header.writeUInt16BE(srcPort, 0);
         header.writeUInt16BE(dstPort, 2);
-        header.writeUInt32BE(seq, 4);
-        header.writeUInt32BE(ack, 8);
-        header[12] = 0x50; // Header len 20
+        header.writeUInt32BE(wrap32(seq), 4);
+        header.writeUInt32BE(wrap32(ack), 8);
+        header[12] = 0x50; // data offset = 5 words
         header[13] = flags;
-        header.writeUInt16BE(65535, 14); // Window
-        header.writeUInt16BE(0, 16); // Checksum
-        header.writeUInt16BE(0, 18); // Urgent
-        
-        // Pseudo Header for Checksum
+        header.writeUInt16BE(INITIAL_WINDOW, 14);
+        header.writeUInt16BE(0, 16);
+        header.writeUInt16BE(0, 18);
+
         const pseudo = Buffer.alloc(12);
         srcIP.copy(pseudo, 0);
         dstIP.copy(pseudo, 4);
         pseudo[8] = 0;
         pseudo[9] = IP_PROTO_TCP;
         pseudo.writeUInt16BE(20 + payload.length, 10);
-        
-        const ckData = Buffer.concat([pseudo, header, payload]);
-        const ck = this.calculateChecksum(ckData);
-        header.writeUInt16BE(ck, 16);
-        
+
+        header.writeUInt16BE(this.calculateChecksum(Buffer.concat([pseudo, header, payload])), 16);
         this.sendIP(Buffer.concat([header, payload]), IP_PROTO_TCP, srcIP, dstIP);
     }
-    
+
+    handleTCP(segment, srcIP, dstIP) {
+        if (segment.length < 20) return;
+        const srcPort = segment.readUInt16BE(0);
+        const dstPort = segment.readUInt16BE(2);
+        const seq = segment.readUInt32BE(4);
+        const ack = segment.readUInt32BE(8);
+        const offset = (segment[12] >> 4) * 4;
+        const flags = segment[13];
+        const window = segment.readUInt16BE(14);
+        const payload = segment.subarray(offset);
+
+        const key = this._tcpKey(srcIP, srcPort, dstIP, dstPort);
+        let flow = this.tcpFlows.get(key);
+
+        if (flags & TCP_RST) {
+            if (flow) {
+                this._destroyHost(key, true);
+                this.tcpFlows.delete(key);
+            }
+            return;
+        }
+
+        if ((flags & TCP_SYN) && !flow) {
+            // Guest initiates a connection.
+            flow = {
+                key,
+                srcIP: Buffer.from(srcIP),
+                srcPort,
+                dstIP: Buffer.from(dstIP),
+                dstPort,
+                state: 'SYN_SENT',
+                guestSeq: wrap32(seq + 1),
+                guestWindow: window || INITIAL_WINDOW,
+                hostSeq: (Math.random() * 0x7fffffff) | 0,
+                hostAcked: 0,
+                pending: [],
+                unacked: [],
+                hostClosed: false,
+                guestClosed: false,
+                finSentToGuest: false,
+                lastActivity: Date.now(),
+                retransmits: 0,
+            };
+            this.tcpFlows.set(key, flow);
+            this._post({
+                type: 'tcp-connect',
+                key,
+                dstIP: ipToString(dstIP),
+                dstPort,
+                srcIP: ipToString(srcIP),
+                srcPort,
+            });
+            return;
+        }
+
+        if (!flow) {
+            // No session; only respond with RST to non-RST segments.
+            if (!(flags & TCP_RST)) {
+                this.sendTCP(srcIP, srcPort, dstIP, dstPort, 0, wrap32(seq + (payload.length || 1)), TCP_RST);
+            }
+            return;
+        }
+
+        flow.lastActivity = Date.now();
+
+        // Acknowledge our data and honor the guest's advertised window.
+        if (flags & TCP_ACK) {
+            flow.guestWindow = window || flow.guestWindow;
+            this._purgeUnacked(flow, ack);
+        }
+
+        // Guest -> host payload.
+        if (payload.length > 0) {
+            if (flow.state !== 'SYN_SENT' && !flow.hostClosed) {
+                this._post({ type: 'tcp-send', key, data: Array.from(payload) });
+            }
+            flow.guestSeq = wrap32(flow.guestSeq + payload.length);
+            this.sendTCP(flow.srcIP, flow.srcPort, flow.dstIP, flow.dstPort,
+                         flow.hostSeq, flow.guestSeq, TCP_ACK);
+        }
+
+        if (flags & TCP_FIN) {
+            flow.guestSeq = wrap32(flow.guestSeq + 1);
+            flow.guestClosed = true;
+            this.sendTCP(flow.srcIP, flow.srcPort, flow.dstIP, flow.dstPort,
+                         flow.hostSeq, flow.guestSeq, TCP_ACK);
+            if (!flow.hostClosed) {
+                this._post({ type: 'tcp-close', key, destroy: false }); // half-close host write side
+            }
+            // Deliver any remaining host data, then FIN/cleanup if fully done.
+            this._maybeSend(flow);
+            return;
+        }
+
+        this._maybeSend(flow);
+    }
+
+    _purgeUnacked(flow, ack) {
+        while (flow.unacked.length > 0) {
+            const e = flow.unacked[0];
+            const end = wrap32(e.seq + e.data.length);
+            if (seqLeq(end, ack)) {
+                // Fully acknowledged.
+                flow.unacked.shift();
+                flow.hostAcked = end;
+                continue;
+            }
+            if (seqGt(ack, e.seq)) {
+                // Partially acknowledged: trim the acked prefix.
+                const acked = wrap32(ack - e.seq);
+                e.data = e.data.subarray(acked);
+                e.seq = ack;
+                flow.hostAcked = ack;
+            }
+            break;
+        }
+    }
+
+    _maybeSend(flow) {
+        if (flow.state === 'SYN_SENT') return;
+        let inFlight = 0;
+        for (const e of flow.unacked) inFlight += e.data.length;
+
+        while (flow.pending.length > 0 && inFlight < flow.guestWindow) {
+            const data = flow.pending.shift();
+            const seg = data.subarray(0, Math.min(MSS, data.length));
+            const rest = data.subarray(seg.length);
+            if (rest.length > 0) flow.pending.unshift(rest);
+
+            const isLast = rest.length === 0;
+            this.sendTCP(flow.srcIP, flow.srcPort, flow.dstIP, flow.dstPort,
+                         flow.hostSeq, flow.guestSeq, isLast ? (TCP_ACK | TCP_PSH) : TCP_ACK, seg);
+            flow.unacked.push({ seq: flow.hostSeq, data: Buffer.from(seg), sentAt: Date.now() });
+            flow.hostSeq = wrap32(flow.hostSeq + seg.length);
+            inFlight += seg.length;
+        }
+
+        // Once all host data has been queued to the guest, send FIN if the
+        // host side has closed. FIN is ordered after the data by sequence
+        // number, so unacked-but-sent data is fine.
+        if (flow.hostClosed && !flow.finSentToGuest && flow.pending.length === 0) {
+            flow.finSentToGuest = true;
+            this.sendTCP(flow.srcIP, flow.srcPort, flow.dstIP, flow.dstPort,
+                         flow.hostSeq, flow.guestSeq, TCP_FIN | TCP_ACK);
+            flow.hostSeq = wrap32(flow.hostSeq + 1);
+        }
+
+        if (flow.hostClosed && flow.guestClosed && flow.pending.length === 0 && flow.unacked.length === 0) {
+            this.tcpFlows.delete(flow.key);
+        }
+    }
+
+    _retransmit(flow, now) {
+        if (flow.unacked.length === 0) return;
+        if (flow.retransmits >= TCP_MAX_RETRANSMITS) return;
+        const e = flow.unacked[0];
+        if (now - e.sentAt < TCP_RETRANSMIT_MS) return;
+
+        e.sentAt = now;
+        flow.retransmits++;
+        this.sendTCP(flow.srcIP, flow.srcPort, flow.dstIP, flow.dstPort,
+                     e.seq, flow.guestSeq, TCP_ACK, e.data);
+    }
+
+    _handleTcpConnected(key) {
+        const flow = this.tcpFlows.get(key);
+        if (!flow || flow.state !== 'SYN_SENT') return;
+        flow.state = 'ESTABLISHED';
+        flow.lastActivity = Date.now();
+        this.sendTCP(flow.srcIP, flow.srcPort, flow.dstIP, flow.dstPort,
+                     flow.hostSeq, flow.guestSeq, TCP_SYN | TCP_ACK);
+        flow.hostSeq = wrap32(flow.hostSeq + 1); // SYN consumes one sequence
+    }
+
+    _handleTcpData({ key, data }) {
+        const flow = this.tcpFlows.get(key);
+        // A guest FIN does not prevent us from delivering remaining response
+        // data to the guest (TCP half-close). Only host-close stops new data.
+        if (!flow || flow.hostClosed) return;
+        flow.lastActivity = Date.now();
+        flow.pending.push(Buffer.from(data));
+        this._maybeSend(flow);
+    }
+
+    _handleTcpEnd(key) {
+        const flow = this.tcpFlows.get(key);
+        if (!flow) return;
+        flow.hostClosed = true;
+        flow.lastActivity = Date.now();
+        // FIN is sent from _maybeSend() once pending data is drained, so the
+        // FIN never overtakes un-delivered bytes.
+        this._maybeSend(flow);
+    }
+
+    _handleTcpError({ key }) {
+        const flow = this.tcpFlows.get(key);
+        if (!flow) return;
+        this.sendTCP(flow.srcIP, flow.srcPort, flow.dstIP, flow.dstPort,
+                     flow.hostSeq, flow.guestSeq, TCP_RST);
+        this.tcpFlows.delete(key);
+    }
+
+    _handleTcpClosed(key) {
+        const flow = this.tcpFlows.get(key);
+        if (!flow) return;
+        flow.hostClosed = true;
+        if (flow.guestClosed) this.tcpFlows.delete(key);
+    }
+
+    /* ------------------------------------------------------------------ *
+     * UDP (DHCP + DNS + NAT)
+     * ------------------------------------------------------------------ */
+
     handleUDP(segment, srcIP, dstIP) {
+        if (segment.length < 8) return;
         const srcPort = segment.readUInt16BE(0);
         const dstPort = segment.readUInt16BE(2);
         const payload = segment.subarray(8);
-        
-        // this.emit('debug', `[UDP] ${srcIP.join('.')}:${srcPort} -> ${dstIP.join('.')}:${dstPort} (${payload.length} bytes)`);
-        
-        // Intercept DHCP: Client sends from port 68 to port 67
+
+        // DHCP
         if (srcPort === DHCP_CLIENT_PORT && dstPort === DHCP_SERVER_PORT) {
             this.handleDHCP(payload);
             return;
         }
-        
-        // Send UDP via main thread (which has access to event loop for async responses)
-        if (this.netPort) {
-            const key = `UDP:${srcIP.join('.')}:${srcPort}:${dstIP.join('.')}:${dstPort}`;
-            // this.emit('debug', `[UDP NAT] Sending ${payload.length} bytes to ${dstIP.join('.')}:${dstPort} via main thread`);
-            
-            this.netPort.postMessage({
-                type: 'udp-send',
-                key,
-                dstIP: dstIP.join('.'),
-                dstPort,
-                srcIP: srcIP.join('.'),
-                srcPort,
-                payload: Array.from(payload)
-            });
+
+        // DNS: terminate locally, resolve via the host.
+        if (dstPort === 53) {
+            this._handleDnsQuery(srcIP, srcPort, payload);
+            return;
         }
+
+        const key = `UDP:${ipToString(srcIP)}:${srcPort}:${ipToString(dstIP)}:${dstPort}`;
+        const flow = this.udpFlows.get(key) || {
+            key,
+            srcIP: ipToString(srcIP),
+            srcPort,
+            dstIP: ipToString(dstIP),
+            dstPort,
+            lastActivity: Date.now(),
+        };
+        flow.lastActivity = Date.now();
+        this.udpFlows.set(key, flow);
+
+        this._post({
+            type: 'udp-send',
+            key,
+            dstIP: flow.dstIP,
+            dstPort,
+            srcIP: flow.srcIP,
+            srcPort,
+            payload: Array.from(payload),
+        });
     }
-    
+
+    _handleUdpResponse({ data, srcIP, srcPort, dstIP, dstPort }) {
+        const udpHeader = Buffer.alloc(8);
+        udpHeader.writeUInt16BE(dstPort, 0);
+        udpHeader.writeUInt16BE(srcPort, 2);
+        udpHeader.writeUInt16BE(8 + data.length, 4);
+        udpHeader.writeUInt16BE(0, 6);
+        this.sendIP(Buffer.concat([udpHeader, Buffer.from(data)]), IP_PROTO_UDP,
+                    ipToBuf(srcIP), ipToBuf(dstIP));
+    }
+
+    _handleDnsQuery(srcIP, srcPort, data) {
+        if (data.length < 12) return;
+        const id = data.readUInt16BE(0);
+        const qdcount = data.readUInt16BE(4);
+        if (qdcount !== 1) return;
+
+        let off = 12;
+        let name = '';
+        while (off < data.length) {
+            const len = data[off];
+            if (len === 0) { off++; break; }
+            if ((len & 0xc0) === 0xc0) { off += 2; break; } // pointer (rare in queries)
+            if (off + 1 + len > data.length) return;
+            name += (name ? '.' : '') + data.subarray(off + 1, off + 1 + len).toString('ascii');
+            off += 1 + len;
+        }
+        if (off + 4 > data.length) return;
+        const qtype = data.readUInt16BE(off);
+        off += 4;
+
+        const key = `DNS:${ipToString(srcIP)}:${srcPort}:${id}`;
+        this.pendingDns.set(key, { srcIP: ipToString(srcIP), srcPort, id, name, qtype });
+        this._post({ type: 'dns-lookup', key, name, qtype });
+    }
+
+    _handleDnsResult({ key, name, qtype, ips, error }) {
+        const pending = this.pendingDns.get(key);
+        if (!pending) return;
+        this.pendingDns.delete(key);
+
+        // Build a minimal DNS response for A (1) / AAAA (28).
+        const answers = [];
+        if (!error && Array.isArray(ips)) {
+            for (const ip of ips) {
+                const family = String(ip).includes(':') ? 6 : 4;
+                if (qtype === 1 && family === 4) answers.push(ipToBuf(ip));
+                else if (qtype === 28 && family === 6) answers.push(this._ipv6ToBuf(ip));
+            }
+        }
+
+        const header = Buffer.alloc(12);
+        header.writeUInt16BE(pending.id, 0);
+        header.writeUInt16BE(0x8180, 2); // QR|RD|RA
+        header.writeUInt16BE(1, 4); // QDCOUNT
+        header.writeUInt16BE(answers.length, 6); // ANCOUNT
+        header.writeUInt16BE(0, 8); // NSCOUNT
+        header.writeUInt16BE(0, 10); // ARCOUNT
+
+        const question = this._encodeDnsName(pending.name);
+        const qtail = Buffer.alloc(4);
+        qtail.writeUInt16BE(pending.qtype, 0);
+        qtail.writeUInt16BE(1, 2); // IN
+
+        const rrs = [];
+        for (const rdata of answers) {
+            const rr = Buffer.alloc(12 + rdata.length);
+            rr.writeUInt16BE(0xc00c, 0); // pointer to question name
+            rr.writeUInt16BE(pending.qtype, 2);
+            rr.writeUInt16BE(1, 4); // class IN
+            rr.writeUInt32BE(60, 6); // TTL
+            rr.writeUInt16BE(rdata.length, 10); // RDLENGTH
+            rdata.copy(rr, 12);
+            rrs.push(rr);
+        }
+
+        const dnsResponse = Buffer.concat([header, question, qtail, ...rrs]);
+        this._sendUdpToGuest(pending.srcIP, pending.srcPort, 53, dnsResponse);
+    }
+
+    _sendUdpToGuest(dstIP, dstPort, srcPort, payload) {
+        const udpHeader = Buffer.alloc(8);
+        udpHeader.writeUInt16BE(srcPort, 0);
+        udpHeader.writeUInt16BE(dstPort, 2);
+        udpHeader.writeUInt16BE(8 + payload.length, 4);
+        udpHeader.writeUInt16BE(0, 6);
+        this.sendIP(Buffer.concat([udpHeader, payload]), IP_PROTO_UDP,
+                    ipToBuf(this.gatewayIP), ipToBuf(dstIP));
+    }
+
+    _encodeDnsName(name) {
+        const parts = String(name).split('.').filter(Boolean);
+        const bufs = [];
+        for (const p of parts) {
+            const b = Buffer.alloc(1 + p.length);
+            b[0] = p.length;
+            b.write(p, 1, 'ascii');
+            bufs.push(b);
+        }
+        bufs.push(Buffer.from([0]));
+        return Buffer.concat(bufs);
+    }
+
+    _ipv6ToBuf(ip) {
+        // Minimal IPv6 address parser.
+        const full = this._expandIpv6(String(ip));
+        const groups = full.split(':').map((g) => parseInt(g || '0', 16));
+        const buf = Buffer.alloc(16);
+        groups.forEach((g, i) => buf.writeUInt16BE(g, i * 2));
+        return buf;
+    }
+
+    _expandIpv6(ip) {
+        let [head, tail] = ip.split('::');
+        head = head || '';
+        tail = tail || '';
+        const headParts = head ? head.split(':') : [];
+        const tailParts = tail ? tail.split(':') : [];
+        const missing = 8 - headParts.length - tailParts.length;
+        return [...headParts, ...Array(missing).fill('0'), ...tailParts].join(':');
+    }
+
+    /* ------------------------------------------------------------------ *
+     * DHCP (static lease)
+     * ------------------------------------------------------------------ */
+
     handleDHCP(data) {
-        if (data.length < 240) return; // Minimum DHCP packet size
-        
-        const op = data[0];
-        if (op !== 1) return; // Only handle BOOTREQUEST (1)
-        
-        const htype = data[1];
-        const hlen = data[2];
-        const xid = data.readUInt32BE(4); // Transaction ID
+        if (data.length < 240) return;
+        if (data[0] !== 1) return;
+        const xid = data.readUInt32BE(4);
         const flags = data.readUInt16BE(10);
-        const chaddr = data.subarray(28, 28 + 16); // Client hardware address
-        
-        // Check magic cookie at offset 236
-        const magic = data.readUInt32BE(236);
-        if (magic !== DHCP_MAGIC_COOKIE) return;
-        
-        // Parse options starting at offset 240
+        const chaddr = data.subarray(28, 28 + 16);
+        if (data.readUInt32BE(236) !== DHCP_MAGIC_COOKIE) return;
+
         let msgType = 0;
-        let requestedIP = null;
         let i = 240;
         while (i < data.length) {
             const opt = data[i];
             if (opt === DHCP_OPT_END) break;
-            if (opt === 0) { i++; continue; } // Pad
-            
+            if (opt === 0) { i++; continue; }
             const len = data[i + 1];
-            const optData = data.subarray(i + 2, i + 2 + len);
-            
-            if (opt === DHCP_OPT_MSG_TYPE && len >= 1) {
-                msgType = optData[0];
-            } else if (opt === DHCP_OPT_REQUESTED_IP && len >= 4) {
-                requestedIP = optData.subarray(0, 4);
-            }
-            
+            if (opt === DHCP_OPT_MSG_TYPE && len >= 1) msgType = data[i + 2];
             i += 2 + len;
         }
-        
-        if (msgType === DHCP_DISCOVER) {
-            this.sendDHCPOffer(xid, chaddr, flags);
-        } else if (msgType === DHCP_REQUEST) {
-            this.sendDHCPAck(xid, chaddr, flags);
-        }
+
+        if (msgType === DHCP_DISCOVER) this._sendDhcpReply(DHCP_OFFER, xid, chaddr, flags);
+        else if (msgType === DHCP_REQUEST) this._sendDhcpReply(DHCP_ACK, xid, chaddr, flags);
     }
-    
-    sendDHCPOffer(xid, chaddr, flags) {
-        this.sendDHCPReply(DHCP_OFFER, xid, chaddr, flags);
-    }
-    
-    sendDHCPAck(xid, chaddr, flags) {
-        this.sendDHCPReply(DHCP_ACK, xid, chaddr, flags);
-    }
-    
-    sendDHCPReply(msgType, xid, chaddr, flags) {
-        // Build DHCP reply packet
-        const reply = Buffer.alloc(300); // Enough for basic DHCP
-        
-        reply[0] = 2; // BOOTREPLY
-        reply[1] = 1; // Ethernet
-        reply[2] = 6; // Hardware address length
-        reply[3] = 0; // Hops
-        reply.writeUInt32BE(xid, 4); // Transaction ID
-        reply.writeUInt16BE(0, 8); // Secs
-        reply.writeUInt16BE(flags, 10); // Flags (broadcast if client requested)
-        
-        // CIAddr (0.0.0.0) - offset 12
-        // YIAddr (your/assigned IP) - offset 16
+
+    _sendDhcpReply(msgType, xid, chaddr, flags) {
         const vmIPParts = this.vmIP.split('.').map(Number);
-        reply[16] = vmIPParts[0];
-        reply[17] = vmIPParts[1];
-        reply[18] = vmIPParts[2];
-        reply[19] = vmIPParts[3];
-        
-        // SIAddr (server IP) - offset 20
         const gwIPParts = this.gatewayIP.split('.').map(Number);
-        reply[20] = gwIPParts[0];
-        reply[21] = gwIPParts[1];
-        reply[22] = gwIPParts[2];
-        reply[23] = gwIPParts[3];
-        
-        // GIAddr (gateway IP for relay) - offset 24 - leave 0
-        
-        // CHAddr (client hardware address) - offset 28
+
+        const reply = Buffer.alloc(300);
+        reply[0] = 2; // BOOTREPLY
+        reply[1] = 1;
+        reply[2] = 6;
+        reply.writeUInt32BE(xid, 4);
+        reply.writeUInt16BE(flags, 10);
+        reply[16] = vmIPParts[0]; reply[17] = vmIPParts[1]; reply[18] = vmIPParts[2]; reply[19] = vmIPParts[3];
+        reply[20] = gwIPParts[0]; reply[21] = gwIPParts[1]; reply[22] = gwIPParts[2]; reply[23] = gwIPParts[3];
         chaddr.copy(reply, 28);
-        
-        // SName (server name) - offset 44 - leave 0 (64 bytes)
-        // File (boot file) - offset 108 - leave 0 (128 bytes)
-        
-        // Magic cookie at offset 236
         reply.writeUInt32BE(DHCP_MAGIC_COOKIE, 236);
-        
-        // Options start at offset 240
-        let optOffset = 240;
-        
-        // Option 53: DHCP Message Type
-        reply[optOffset++] = DHCP_OPT_MSG_TYPE;
-        reply[optOffset++] = 1;
-        reply[optOffset++] = msgType;
-        
-        // Option 54: Server Identifier
-        reply[optOffset++] = DHCP_OPT_SERVER_ID;
-        reply[optOffset++] = 4;
-        reply[optOffset++] = gwIPParts[0];
-        reply[optOffset++] = gwIPParts[1];
-        reply[optOffset++] = gwIPParts[2];
-        reply[optOffset++] = gwIPParts[3];
-        
-        // Option 51: Lease Time (1 day = 86400 seconds)
-        reply[optOffset++] = DHCP_OPT_LEASE_TIME;
-        reply[optOffset++] = 4;
-        reply.writeUInt32BE(86400, optOffset);
-        optOffset += 4;
-        
-        // Option 1: Subnet Mask
-        reply[optOffset++] = DHCP_OPT_SUBNET_MASK;
-        reply[optOffset++] = 4;
-        reply[optOffset++] = 255;
-        reply[optOffset++] = 255;
-        reply[optOffset++] = 255;
-        reply[optOffset++] = 0;
-        
-        // Option 3: Router
-        reply[optOffset++] = DHCP_OPT_ROUTER;
-        reply[optOffset++] = 4;
-        reply[optOffset++] = gwIPParts[0];
-        reply[optOffset++] = gwIPParts[1];
-        reply[optOffset++] = gwIPParts[2];
-        reply[optOffset++] = gwIPParts[3];
-        
-        // Option 6: DNS Server (use 8.8.8.8)
-        reply[optOffset++] = DHCP_OPT_DNS;
-        reply[optOffset++] = 4;
-        reply[optOffset++] = 8;
-        reply[optOffset++] = 8;
-        reply[optOffset++] = 8;
-        reply[optOffset++] = 8;
-        
-        // Option 28: Broadcast Address
-        reply[optOffset++] = 28; // DHCP_OPT_BROADCAST
-        reply[optOffset++] = 4;
-        reply[optOffset++] = vmIPParts[0];
-        reply[optOffset++] = vmIPParts[1];
-        reply[optOffset++] = vmIPParts[2];
-        reply[optOffset++] = 255; // x.x.x.255 for /24 subnet
-        
-        // End option
-        reply[optOffset++] = DHCP_OPT_END;
-        
-        // DHCP/BOOTP requires minimum 300 bytes - send the full buffer (already 0-padded)
-        const dhcpLen = 300; // Always send 300 bytes
-        
-        // Build UDP header
-        const udpLen = 8 + dhcpLen;
+
+        let o = 240;
+        reply[o++] = DHCP_OPT_MSG_TYPE; reply[o++] = 1; reply[o++] = msgType;
+        reply[o++] = DHCP_OPT_SERVER_ID; reply[o++] = 4;
+        reply[o++] = gwIPParts[0]; reply[o++] = gwIPParts[1]; reply[o++] = gwIPParts[2]; reply[o++] = gwIPParts[3];
+        reply[o++] = DHCP_OPT_LEASE_TIME; reply[o++] = 4;
+        reply.writeUInt32BE(86400, o); o += 4;
+        reply[o++] = DHCP_OPT_SUBNET_MASK; reply[o++] = 4;
+        reply[o++] = 255; reply[o++] = 255; reply[o++] = 255; reply[o++] = 0;
+        reply[o++] = DHCP_OPT_ROUTER; reply[o++] = 4;
+        reply[o++] = gwIPParts[0]; reply[o++] = gwIPParts[1]; reply[o++] = gwIPParts[2]; reply[o++] = gwIPParts[3];
+        reply[o++] = DHCP_OPT_DNS; reply[o++] = 4;
+        reply[o++] = gwIPParts[0]; reply[o++] = gwIPParts[1]; reply[o++] = gwIPParts[2]; reply[o++] = gwIPParts[3];
+        reply[o++] = DHCP_OPT_END;
+
         const udpHeader = Buffer.alloc(8);
-        udpHeader.writeUInt16BE(DHCP_SERVER_PORT, 0); // Source port
-        udpHeader.writeUInt16BE(DHCP_CLIENT_PORT, 2); // Dest port
-        udpHeader.writeUInt16BE(udpLen, 4); // Length
-        udpHeader.writeUInt16BE(0, 6); // Checksum (optional for UDP)
-        
-        const udpPayload = Buffer.concat([udpHeader, reply]); // Send full 300-byte DHCP packet
-        
-        // Build IP header
-        const srcIP = Buffer.from(gwIPParts);
-        const dstIP = Buffer.from([255, 255, 255, 255]);
-        
-        const ipHeader = Buffer.alloc(20);
-        ipHeader[0] = 0x45; // v4, 5 words
-        ipHeader[1] = 0; // TOS
-        ipHeader.writeUInt16BE(20 + udpPayload.length, 2);
-        ipHeader.writeUInt16BE(0, 4); // ID
-        ipHeader.writeUInt16BE(0, 6); // Flags/Offset
-        ipHeader[8] = 64; // TTL
-        ipHeader[9] = IP_PROTO_UDP;
-        srcIP.copy(ipHeader, 12);
-        dstIP.copy(ipHeader, 16);
-        ipHeader.writeUInt16BE(this.calculateChecksum(ipHeader), 10);
-        
-        const ipPacket = Buffer.concat([ipHeader, udpPayload]);
-        
-        // Build Ethernet frame - use client MAC directly for unicast, or broadcast MAC if flags indicate broadcast
+        udpHeader.writeUInt16BE(DHCP_SERVER_PORT, 0);
+        udpHeader.writeUInt16BE(DHCP_CLIENT_PORT, 2);
+        udpHeader.writeUInt16BE(8 + 300, 4);
+        udpHeader.writeUInt16BE(0, 6);
+
         const dstMac = (flags & 0x8000) ? Buffer.from([0xff, 0xff, 0xff, 0xff, 0xff, 0xff]) : chaddr.subarray(0, 6);
-        
+        const ipPacket = this._buildIpPacket(ipToBuf(this.gatewayIP), ipToBuf('255.255.255.255'), IP_PROTO_UDP, Buffer.concat([udpHeader, reply]));
+
         const frame = Buffer.alloc(14 + ipPacket.length);
-        dstMac.copy(frame, 0); // Destination: client MAC or broadcast
-        this.gatewayMac.copy(frame, 6); // Source: gateway MAC
+        dstMac.copy(frame, 0);
+        this.gatewayMac.copy(frame, 6);
         frame.writeUInt16BE(ETH_P_IP, 12);
         ipPacket.copy(frame, 14);
-        
-        // Wrap in QEMU framing
+
         const header = Buffer.alloc(4);
         header.writeUInt32BE(frame.length, 0);
-        
         this.txBuffer = Buffer.concat([this.txBuffer, header, frame]);
-        
         this.emit('network-activity');
         this.emit('dhcp', msgType === DHCP_OFFER ? 'OFFER' : 'ACK', this.vmIP);
+    }
+
+    _buildIpPacket(srcIP, dstIP, protocol, payload) {
+        const header = Buffer.alloc(20);
+        header[0] = 0x45;
+        header[1] = 0;
+        header.writeUInt16BE(20 + payload.length, 2);
+        header.writeUInt16BE(0, 4);
+        header.writeUInt16BE(0x4000, 6);
+        header[8] = 64;
+        header[9] = protocol;
+        srcIP.copy(header, 12);
+        dstIP.copy(header, 16);
+        header.writeUInt16BE(this.calculateChecksum(header), 10);
+        return Buffer.concat([header, payload]);
     }
 }
 

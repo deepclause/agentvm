@@ -11,7 +11,8 @@ const ringReader = new RingBufferReader(sharedBuffer);
 
 let localBuffer = new Uint8Array(0);
 
-// Buffer for sock_recv to handle partial reads
+// Leftover frame-pipe bytes from a previous partial sock_recv read.
+// This is a byte-stream buffer only; it is NEVER tied to a TCP FIN.
 let sockRecvBuffer = Buffer.alloc(0);
 
 // Initialize Network Stack with:
@@ -564,11 +565,10 @@ async function start() {
             fakeFdMap.delete(fd);
             return 0;
         }
-        // Handle network socket close
+        // Handle network socket close: tear down every flow over the pipe.
         if (fd === NET_CONN_FD) {
             parentPort.postMessage({ type: 'debug', msg: `fd_close(${fd}) - closing network socket` });
             netStack.closeSocket();
-            // Reset connection state so new connections can be accepted
             netConnectionAccepted = false;
             sockRecvBuffer = Buffer.alloc(0);
             return 0;
@@ -1017,10 +1017,11 @@ async function start() {
         // This ensures TCP data from main thread is received even when 
         // we're polling for both read and write (common during TLS handshake).
         netStack.pollNetResponses();
+        netStack.tick();
         
         // 2. Check Immediate Status
         // Include sockRecvBuffer in readability check - it may have data from a previous partial read
-        const netReadable = sockRecvBuffer.length > 0 || netStack.hasPendingData() || netStack.hasReceivedFin();
+        const netReadable = sockRecvBuffer.length > 0 || netStack.hasPendingData();
         const netWritable = true; // Always writable
         const stdinReadable = localBuffer.length > 0 || ringReader.hasStdinData();
         
@@ -1057,7 +1058,7 @@ async function start() {
                      if (hasStdin && ringReader.hasStdinData()) break;
                      
                      // Check if network data became available (including buffered data)
-                     if (sockRecvBuffer.length > 0 || netStack.hasPendingData() || netStack.hasReceivedFin()) break;
+                     if (sockRecvBuffer.length > 0 || netStack.hasPendingData()) break;
                      
                      // Check if there's more network data in the ring buffer
                      if (ringReader.hasNetworkData()) {
@@ -1077,7 +1078,7 @@ async function start() {
         
         // Refresh status (include sockRecvBuffer in check)
         const postStdinReadable = localBuffer.length > 0 || ringReader.hasStdinData();
-        const postNetReadable = sockRecvBuffer.length > 0 || netStack.hasPendingData() || netStack.hasReceivedFin();
+        const postNetReadable = sockRecvBuffer.length > 0 || netStack.hasPendingData();
         
         for(let i=0; i<nsubscriptions; i++) {
              const base = in_ptr + i * 48;
@@ -1166,61 +1167,31 @@ async function start() {
                 return 6; // WASI_ERRNO_AGAIN - would block
             },
             sock_recv: (fd, ri_data_ptr, ri_data_len, ri_flags, ro_datalen_ptr, ro_flags_ptr) => {
-                // Poll for network responses first
                 netStack.pollNetResponses();
-                
-                parentPort.postMessage({ type: 'debug', msg: `sock_recv(${fd}) called, sockRecvBuf=${sockRecvBuffer.length}, txBuf=${netStack.txBuffer.length}, fin=${netStack.hasReceivedFin()}` });
-                
+
                 if (fd !== NET_CONN_FD) {
-                    // parentPort.postMessage({ type: 'debug', msg: `sock_recv(${fd}) - wrong fd` });
                     return 8; // WASI_ERRNO_BADF
                 }
-                
                 if (!instance) return 0;
                 const view = new DataView(instance.exports.memory.buffer);
-                
-                // First check if we have buffered data from a previous partial read
+
+                // The emulator socket is a frame pipe. Empty == EAGAIN, and we
+                // must never synthesize EOF from a per-connection FIN here.
                 if (sockRecvBuffer.length === 0) {
-                    // Read larger chunks for better throughput - the VM will consume what it needs
                     const data = netStack.readFromNetwork(65536);
-                    parentPort.postMessage({ type: 'debug', msg: `sock_recv readFromNetwork returned ${data ? data.length : 'null'} bytes, txBuf now=${netStack.txBuffer.length}` });
                     if (!data || data.length === 0) {
-                        // Check if FIN was received - if so, return EOF (0 bytes) instead of EAGAIN
-                        if (netStack.hasReceivedFin()) {
-                            parentPort.postMessage({ type: 'debug', msg: `sock_recv(${fd}) returning EOF due to FIN` });
-                            view.setUint32(ro_datalen_ptr, 0, true);
-                            view.setUint16(ro_flags_ptr, 0, true);
-                            // Clean up the connection to allow new connections
-                            netStack.closeSocket();
-                            netConnectionAccepted = false;
-                            sockRecvBuffer = Buffer.alloc(0);
-                            return 0; // Success with 0 bytes = EOF
-                        }
-                        parentPort.postMessage({ type: 'debug', msg: `sock_recv(${fd}) returning EAGAIN` });
                         view.setUint32(ro_datalen_ptr, 0, true);
                         view.setUint16(ro_flags_ptr, 0, true);
-                        // Return EAGAIN to indicate no data available yet
                         return 6; // WASI_ERRNO_AGAIN
                     }
                     sockRecvBuffer = data;
                 }
-                
-                // parentPort.postMessage({ type: 'debug', msg: `sock_recv(${fd}) have ${sockRecvBuffer.length} bytes to deliver` });
-                
-                // Write data to iovec buffers
+
                 const bytesWritten = writeIOVs(view, ri_data_ptr, ri_data_len, sockRecvBuffer);
-                
-                // Debug: show how much we wrote vs how much we had
-                parentPort.postMessage({ type: 'debug', msg: `sock_recv wrote ${bytesWritten}/${sockRecvBuffer.length} bytes to ${ri_data_len} iovecs` });
-                
-                // Keep any unwritten data for the next call
                 sockRecvBuffer = sockRecvBuffer.subarray(bytesWritten);
-                
-                // parentPort.postMessage({ type: 'debug', msg: `sock_recv(${fd}) wrote ${bytesWritten} bytes, remaining=${sockRecvBuffer.length}` });
                 view.setUint32(ro_datalen_ptr, bytesWritten, true);
                 view.setUint16(ro_flags_ptr, 0, true);
-                
-                return 0; // Success
+                return 0;
             },
             sock_send: (fd, si_data_ptr, si_data_len, si_flags, so_datalen_ptr) => {
                 if (fd !== NET_CONN_FD) {

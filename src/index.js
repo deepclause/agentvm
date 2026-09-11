@@ -2,6 +2,7 @@ const { Worker, MessageChannel, SHARE_ENV } = require('node:worker_threads');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const dgram = require('node:dgram');
+const dns = require('node:dns');
 const { RingBufferWriter, TOTAL_BUFFER_SIZE, IO_READY_INDEX, STDIN_FLAG_INDEX, STDIN_AREA_SIZE } = require('./ringbuffer');
 
 class AgentVM {
@@ -62,6 +63,10 @@ class AgentVM {
                 this._handleTcpSend(msg);
             } else if (msg.type === 'tcp-close') {
                 this._handleTcpClose(msg);
+            } else if (msg.type === 'udp-close') {
+                this._handleUdpClose(msg);
+            } else if (msg.type === 'dns-lookup') {
+                this._handleDnsLookup(msg);
             }
             // Note: tcp-pause/tcp-resume removed - using ring buffer backpressure only
         });
@@ -200,6 +205,36 @@ class AgentVM {
         }
     }
     
+    /**
+     * Handle a DNS lookup request from the worker. Resolution runs on the main
+     * thread because worker threads must not call the async DNS resolver.
+     * @private
+     */
+    async _handleDnsLookup(msg) {
+        const { key, name, qtype } = msg;
+        try {
+            const family = qtype === 28 ? 6 : (qtype === 1 ? 4 : 0);
+            const options = family === 0 ? { all: true, verbatim: true } : { all: true, family, verbatim: true };
+            const results = await dns.promises.lookup(name, options);
+            const ips = results.map((r) => r.address);
+            this.ringWriter.writeDnsResult({ key, name, qtype, ips });
+        } catch (err) {
+            this.ringWriter.writeDnsResult({ key, name, qtype, error: err.message });
+        }
+    }
+
+    /**
+     * Close an idle UDP session on the main thread.
+     * @private
+     */
+    _handleUdpClose(msg) {
+        const session = this.udpSessions.get(msg.key);
+        if (session) {
+            try { session.socket.close(); } catch (e) {}
+            this.udpSessions.delete(msg.key);
+        }
+    }
+
     /**
      * Handle UDP send request from worker
      * @private
