@@ -72,7 +72,7 @@ async function main() {
 
         // 2. pip install (pure Python, exercises HTTPS download)
         console.log('--- 2. pip install ---');
-        r = await withTimeout(vm.exec('pip install --no-cache-dir cowsay 2>&1 | tail -3'), 300000);
+        r = await withTimeout(vm.exec('pip install --no-cache-dir --break-system-packages cowsay 2>&1 | tail -3'), 300000);
         report('pip install cowsay', r.exitCode === 0 && /Successfully installed cowsay/.test(r.stdout), r.stdout.trim().split('\n').pop());
 
         // 3. npm install (many small concurrent HTTPS requests)
