@@ -8,7 +8,7 @@ function compile(instructions) {
     const memory = new WebAssembly.Memory({ initial: 1 });
     const instance = new WebAssembly.Instance(module, { env: { memory } });
     return {
-        run: (regs, memBase, pc) => instance.exports.run(regs, memBase, pc),
+        run: (regs, memBase, pc) => Number(instance.exports.run(regs, memBase, BigInt(pc))),
         view: new BigInt64Array(memory.buffer),
         data: new DataView(memory.buffer),
     };

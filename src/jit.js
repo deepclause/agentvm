@@ -82,8 +82,8 @@ class RiscVBlockJit {
         const typeSection = section(1, Buffer.concat([
             u32leb(1),               // one type
             Buffer.from([0x60]),     // func
-            u32leb(3), Buffer.from([0x7f, 0x7f, 0x7f]), // regs base, mem base, start pc
-            u32leb(1), Buffer.from([0x7f]), // one i32 result: next pc
+            u32leb(3), Buffer.from([0x7f, 0x7f, 0x7e]), // regs base, mem base, start pc (i64)
+            u32leb(1), Buffer.from([0x7e]), // one i64 result: next pc
         ]));
 
         const importSection = section(2, Buffer.concat([
@@ -128,10 +128,9 @@ class RiscVBlockJit {
         }
 
         // Fall through: return startPc + 4 * instruction count.
-        out.push(Buffer.from([0x20, 0x02])); // local.get 2 (start pc)
-        out.push(Buffer.from([0x41]));
-        out.push(s32leb(pc));
-        out.push(Buffer.from([0x6a])); // i32.add
+        out.push(Buffer.from([0x20, 0x02])); // local.get 2 (start pc, i64)
+        this._const64(out, pc);
+        out.push(Buffer.from([0x7c])); // i64.add
         out.push(Buffer.from([0x0f])); // return
         out.push(Buffer.from([0x0b])); // end
         return Buffer.concat(out);
@@ -185,20 +184,17 @@ class RiscVBlockJit {
 
     // Return startPc + offset. startPc is local 2.
     _emitReturnRel(out, offset) {
-        out.push(Buffer.from([0x20, 0x02])); // local.get 2 (start pc)
-        out.push(Buffer.from([0x41])); // i32.const
-        out.push(s32leb(offset));
-        out.push(Buffer.from([0x6a])); // i32.add
+        out.push(Buffer.from([0x20, 0x02])); // local.get 2 (start pc, i64)
+        this._const64(out, offset);
+        out.push(Buffer.from([0x7c])); // i64.add
         out.push(Buffer.from([0x0f])); // return
     }
 
     // Push (startPc + offset) as i64.
     _emitPcConst(out, offset) {
-        out.push(Buffer.from([0x20, 0x02])); // local.get 2
-        out.push(Buffer.from([0x41])); // i32.const
-        out.push(s32leb(offset));
-        out.push(Buffer.from([0x6a])); // i32.add
-        out.push(Buffer.from([0xad])); // i64.extend_i32_u
+        out.push(Buffer.from([0x20, 0x02])); // local.get 2 (i64)
+        this._const64(out, offset);
+        out.push(Buffer.from([0x7c])); // i64.add
     }
 
     _emitConditionalBranch(out, opcode, rs1, rs2, target) {
@@ -325,7 +321,6 @@ class RiscVBlockJit {
                 out.push(Buffer.from([0x7c])); // i64.add
                 this._const64(out, -2n);
                 out.push(Buffer.from([0x83])); // i64.and (mask ~1)
-                out.push(Buffer.from([0xa7])); // i32.wrap_i64
                 out.push(Buffer.from([0x0f])); // return
                 break;
             }

@@ -50,7 +50,7 @@ async function main() {
             run = new WebAssembly.Instance(module, { env: { memory } }).exports.run;
             cache.set(pc, run);
         }
-        pc = run(0, 256, pc);
+        pc = Number(run(0, 256, BigInt(pc)));
     }
 
     assert.strictEqual(view[7], 499500n, 'sum(0..999)');
