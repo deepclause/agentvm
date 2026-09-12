@@ -43,6 +43,7 @@ git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-fence-tso.patch"
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-low-risk-performance.patch"
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-rv64-only.patch"
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-jit-exports.patch"
+git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-jit-hook.patch"
 # Generated without context to avoid preserving upstream trailing whitespace.
 git -C "$WORK/tinyemu" apply --unidiff-zero "$HERE/patches/tinyemu-fast-branch.patch"
 rm -rf "$WORK/tinyemu/.git"
