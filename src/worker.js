@@ -1150,6 +1150,36 @@ async function start() {
         return { word: Number(exports.jit_read_u32(statePtr, addr)), size: 4n };
     };
 
+    const jitLoad = (statePtr, addr, size) => {
+        const e = instance.exports;
+        switch (size) {
+            case 1: return e.jit_read_u8(statePtr, addr);
+            case 2: return e.jit_read_u16(statePtr, addr);
+            case 4: return e.jit_read_u32(statePtr, addr);
+            case 8: return e.jit_read_u64(statePtr, addr);
+            default: return 0n;
+        }
+    };
+
+    const jitStore = (statePtr, addr, size, val) => {
+        const e = instance.exports;
+        switch (size) {
+            case 1: e.jit_write_u8(statePtr, addr, val); break;
+            case 2: e.jit_write_u16(statePtr, addr, val); break;
+            case 4: e.jit_write_u32(statePtr, addr, val); break;
+            case 8: e.jit_write_u64(statePtr, addr, val); break;
+        }
+        return 0;
+    };
+
+    const compileJitBlock = (instructions, sizes) => {
+        const module = new RiscVBlockJit(instructions, sizes, { externalMemory: true }).compile();
+        const jitInstance = new WebAssembly.Instance(module, {
+            env: { memory: instance.exports.memory, load: jitLoad, store: jitStore },
+        });
+        return jitInstance.exports.run;
+    };
+
     const precompileJitPage = (exports, statePtr, pageStart) => {
         const pageEnd = pageStart + 0x1000n;
         let cursor = pageStart;
@@ -1177,9 +1207,7 @@ async function start() {
                 const key = `${blockStart.toString(16)}:${instructions.map((n) => n.toString(16)).join(',')}`;
                 if (!jitBlockCache.has(key)) {
                     try {
-                        const module = new RiscVBlockJit(instructions, sizes).compile();
-                        const jitInstance = new WebAssembly.Instance(module, { env: { memory: exports.memory } });
-                        jitBlockCache.set(key, jitInstance.exports.run);
+                        jitBlockCache.set(key, compileJitBlock(instructions, sizes));
                     } catch (err) {
                         // Leave this block to the interpreter.
                     }
@@ -1231,14 +1259,12 @@ async function start() {
                     const key = `${pcKey}:${instructions.map((n) => n.toString(16)).join(',')}`;
                     let run = jitBlockCache.get(key);
                     if (!run) {
-                        const module = new RiscVBlockJit(instructions, sizes).compile();
-                        const jitInstance = new WebAssembly.Instance(module, { env: { memory: exports.memory } });
-                        run = jitInstance.exports.run;
+                        run = compileJitBlock(instructions, sizes);
                         jitBlockCache.set(key, run);
                     }
 
                     const regsPtr = Number(exports.jit_regs_ptr(statePtr));
-                    const nextPc = run(regsPtr, 0, pc);
+                    const nextPc = run(regsPtr, 0, pc, statePtr);
                     exports.jit_sub_cycles(statePtr, instructions.length);
                     exports.jit_set_pc(statePtr, nextPc);
                     if (DEBUG_JIT) {
