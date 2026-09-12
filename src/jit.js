@@ -185,6 +185,12 @@ class RiscVBlockJit {
         this._endStore(out, rd);
     }
 
+    // Sign-extend the low 32 bits of the current i64 value.
+    _emitSignExtend32(out) {
+        out.push(Buffer.from([0xa7])); // i32.wrap_i64
+        out.push(Buffer.from([0xac])); // i64.extend_i32_s
+    }
+
     // Return startPc + offset. startPc is local 2.
     _emitReturnRel(out, offset) {
         out.push(Buffer.from([0x20, 0x02])); // local.get 2 (start pc, i64)
@@ -270,6 +276,80 @@ class RiscVBlockJit {
                     }
                     default:
                         throw new Error(`unsupported OP-IMM funct3=${funct3}`);
+                }
+                break;
+            }
+            case 0x1b: { // OP-IMM-32
+                switch (funct3) {
+                    case 0: { // ADDIW
+                        this._beginStore(out, rd);
+                        this._loadReg(out, rs1);
+                        this._const64(out, immI);
+                        out.push(Buffer.from([0x7c])); // i64.add
+                        this._emitSignExtend32(out);
+                        this._endStore(out, rd);
+                        break;
+                    }
+                    case 1: { // SLLIW
+                        this._beginStore(out, rd);
+                        this._loadReg(out, rs1);
+                        this._const64(out, immI & 0x1f);
+                        out.push(Buffer.from([0x86])); // i64.shl
+                        this._emitSignExtend32(out);
+                        this._endStore(out, rd);
+                        break;
+                    }
+                    case 5: { // SRLIW / SRAIW
+                        const isArithmetic = (insn >>> 25) & 1;
+                        this._beginStore(out, rd);
+                        this._loadReg(out, rs1);
+                        this._const64(out, immI & 0x1f);
+                        out.push(Buffer.from([isArithmetic ? 0x87 : 0x88]));
+                        this._emitSignExtend32(out);
+                        this._endStore(out, rd);
+                        break;
+                    }
+                    default:
+                        throw new Error(`unsupported OP-IMM-32 funct3=${funct3}`);
+                }
+                break;
+            }
+            case 0x3b: { // OP-32
+                switch (funct3) {
+                    case 0: { // ADDW / SUBW
+                        this._beginStore(out, rd);
+                        this._loadReg(out, rs1);
+                        this._loadReg(out, rs2);
+                        out.push(Buffer.from([funct7 === 0x20 ? 0x7d : 0x7c]));
+                        this._emitSignExtend32(out);
+                        this._endStore(out, rd);
+                        break;
+                    }
+                    case 1: { // SLLW
+                        this._beginStore(out, rd);
+                        this._loadReg(out, rs1);
+                        this._loadReg(out, rs2);
+                        this._const64(out, 0x1fn);
+                        out.push(Buffer.from([0x83])); // i64.and
+                        out.push(Buffer.from([0x86])); // i64.shl
+                        this._emitSignExtend32(out);
+                        this._endStore(out, rd);
+                        break;
+                    }
+                    case 5: { // SRLW / SRAW
+                        const isArithmetic = funct7 === 0x20;
+                        this._beginStore(out, rd);
+                        this._loadReg(out, rs1);
+                        this._loadReg(out, rs2);
+                        this._const64(out, 0x1fn);
+                        out.push(Buffer.from([0x83])); // i64.and
+                        out.push(Buffer.from([isArithmetic ? 0x87 : 0x88]));
+                        this._emitSignExtend32(out);
+                        this._endStore(out, rd);
+                        break;
+                    }
+                    default:
+                        throw new Error(`unsupported OP-32 funct3=${funct3}`);
                 }
                 break;
             }
@@ -384,7 +464,7 @@ class RiscVBlockJit {
 function decodeBlock(code, pc) {
     const instructions = [];
     const sizes = [];
-    const supported = new Set([0x13, 0x33, 0x03, 0x23, 0x37, 0x17, 0x6f, 0x67, 0x63]);
+    const supported = new Set([0x13, 0x33, 0x1b, 0x3b, 0x03, 0x23, 0x37, 0x17, 0x6f, 0x67, 0x63]);
     let cursor = pc;
     while (cursor < code.length) {
         const decoded = decodeRiscV(code, cursor);

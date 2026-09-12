@@ -53,6 +53,19 @@ async function main() {
         assert.strictEqual(data.getBigInt64(256, true), 123n, 'memory contains stored value');
     }
 
+    // Block 5: OP-IMM-32 / OP-32
+    {
+        const { run, view } = compile([
+            0x0010029b, // addiw x5, x0, 1
+            0x0052833b, // addw  x6, x5, x5
+            0x0023139b, // slliw x7, x6, 2
+        ]);
+        run(0, 256, 0);
+        assert.strictEqual(view[5], 1n, 'x5 = 1');
+        assert.strictEqual(view[6], 2n, 'x6 = 2');
+        assert.strictEqual(view[7], 8n, 'x7 = 8');
+    }
+
     console.log('JIT spike passed');
 }
 
