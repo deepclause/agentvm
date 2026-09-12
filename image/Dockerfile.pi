@@ -14,4 +14,15 @@ RUN apk add --no-cache \
 
 COPY --link preinstalled/usrlocal /usr/local
 
+# V8's concurrent GC threads contend on the emulated single hart. Disabling
+# concurrent GC measurably speeds Node CPU work and short-lived CLI startup.
+RUN rm -f /usr/local/bin/pi && \
+    printf '%s\n' '#!/bin/sh' \
+      'exec /usr/bin/node --single-threaded-gc /usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js "$@"' \
+      > /usr/local/bin/pi && \
+    chmod +x /usr/local/bin/pi && \
+    printf '%s\n' '#!/bin/sh' 'exec /usr/bin/node --single-threaded-gc "$@"' \
+      > /usr/local/bin/node && \
+    chmod +x /usr/local/bin/node
+
 CMD ["/bin/sh"]

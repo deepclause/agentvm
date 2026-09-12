@@ -28,6 +28,17 @@ new build, pass another output name:
 C2W=/path/to/c2w ./build.sh agentvm-alpine-python-node-optimized.wasm
 ```
 
+### Preinstalled pi variant
+
+`build-pi.sh` produces `agentvm-alpine-python-node-pi.wasm`, which has the
+`pi` coding agent preinstalled so runtime `npm install -g` is not needed.
+`preinstall-pi.sh` generates `preinstalled/usrlocal` by running the real npm
+install inside a working AgentVM.
+
+The pi image also wraps both `pi` and `node` with `--single-threaded-gc`.
+V8's concurrent GC threads contend with the interpreter on the emulated
+single hart; disabling concurrent GC roughly halves guest Node CPU time.
+
 ## Low-risk runtime optimizations
 
 The build applies the compatibility patch plus
