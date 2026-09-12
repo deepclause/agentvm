@@ -191,19 +191,21 @@ class RiscVBlockJit {
         out.push(s64leb(value));
     }
 
-    _emitBinary(out, opcode, rd, rs1, rs2) {
+    _emitBinary(out, opcode, rd, rs1, rs2, extendU32 = false) {
         this._beginStore(out, rd);
         this._loadReg(out, rs1);
         this._loadReg(out, rs2);
         out.push(Buffer.from([opcode]));
+        if (extendU32) out.push(Buffer.from([0xad])); // i64.extend_i32_u
         this._endStore(out, rd);
     }
 
-    _emitBinaryImm(out, opcode, rd, rs1, imm) {
+    _emitBinaryImm(out, opcode, rd, rs1, imm, extendU32 = false) {
         this._beginStore(out, rd);
         this._loadReg(out, rs1);
         this._const64(out, imm);
         out.push(Buffer.from([opcode]));
+        if (extendU32) out.push(Buffer.from([0xad])); // i64.extend_i32_u
         this._endStore(out, rd);
     }
 
@@ -277,8 +279,8 @@ class RiscVBlockJit {
                     case 4: this._emitBinaryImm(out, 0x85, rd, rs1, immI); break; // xori
                     case 6: this._emitBinaryImm(out, 0x84, rd, rs1, immI); break; // ori
                     case 7: this._emitBinaryImm(out, 0x83, rd, rs1, immI); break; // andi
-                    case 2: this._emitBinaryImm(out, 0x53, rd, rs1, immI); break; // slti (i64.lt_s)
-                    case 3: this._emitBinaryImm(out, 0x54, rd, rs1, immI); break; // sltiu (i64.lt_u)
+                    case 2: this._emitBinaryImm(out, 0x53, rd, rs1, immI, true); break; // slti (i64.lt_s)
+                    case 3: this._emitBinaryImm(out, 0x54, rd, rs1, immI, true); break; // sltiu (i64.lt_u)
                     case 1: { // slli
                         this._beginStore(out, rd);
                         this._loadReg(out, rs1);
@@ -379,8 +381,8 @@ class RiscVBlockJit {
                 switch (funct3) {
                     case 0: this._emitBinary(out, funct7 === 0x20 ? 0x7d : 0x7c, rd, rs1, rs2); break; // add/sub
                     case 1: this._emitBinary(out, 0x86, rd, rs1, rs2); break; // sll
-                    case 2: this._emitBinary(out, 0x53, rd, rs1, rs2); break; // slt
-                    case 3: this._emitBinary(out, 0x54, rd, rs1, rs2); break; // sltu
+                    case 2: this._emitBinary(out, 0x53, rd, rs1, rs2, true); break; // slt
+                    case 3: this._emitBinary(out, 0x54, rd, rs1, rs2, true); break; // sltu
                     case 4: this._emitBinary(out, 0x85, rd, rs1, rs2); break; // xor
                     case 5: this._emitBinary(out, funct7 === 0x20 ? 0x87 : 0x88, rd, rs1, rs2); break; // srl/sra
                     case 6: this._emitBinary(out, 0x84, rd, rs1, rs2); break; // or
