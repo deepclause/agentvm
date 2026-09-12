@@ -3,6 +3,7 @@ const { WASI } = require('node:wasi');
 const fs = require('node:fs');
 const { NetworkStack } = require('./network');
 const { RiscVBlockJit } = require('./jit');
+const { expandCompressed } = require('./riscv-c');
 const { RingBufferReader } = require('./ringbuffer');
 
 const { wasmPath, sharedBuffer, mounts, network, mac, netPort } = workerData;
@@ -75,8 +76,9 @@ const JIT_HIT_THRESHOLD = 50;
 const jitHitCounts = new Map();
 const jitBlockCache = new Map();
 const jitUnsupported = new Set();
+const jitPageCompiled = new Set();
 const JIT_TERMINAL = new Set([0x63, 0x6f, 0x67]);
-const JIT_SUPPORTED = new Set([0x13, 0x33, 0x37, 0x17, 0x6f, 0x67, 0x63]);
+const JIT_SUPPORTED = new Set([0x13, 0x33, 0x1b, 0x3b, 0x03, 0x23, 0x37, 0x17, 0x6f, 0x67, 0x63]);
 
 async function start() {
     const wasmBuffer = fs.readFileSync(wasmPath);
@@ -1139,12 +1141,60 @@ async function start() {
 
 
 
+    const readGuestInsn = (exports, statePtr, addr) => {
+        const first = Number(exports.jit_read_u16(statePtr, addr));
+        if ((first & 3) !== 3) {
+            const expanded = expandCompressed(first);
+            return expanded === null ? null : { word: expanded, size: 2n };
+        }
+        return { word: Number(exports.jit_read_u32(statePtr, addr)), size: 4n };
+    };
+
+    const precompileJitPage = (exports, statePtr, pageStart) => {
+        const pageEnd = pageStart + 0x1000n;
+        let cursor = pageStart;
+        while (cursor < pageEnd) {
+            const first = readGuestInsn(exports, statePtr, cursor);
+            if (!first) { cursor += 2n; continue; }
+            const opcode = first.word & 0x7f;
+            if (!JIT_SUPPORTED.has(opcode)) { cursor += first.size; continue; }
+
+            const instructions = [];
+            const sizes = [];
+            const blockStart = cursor;
+            let blockCursor = cursor;
+            for (;;) {
+                const insn = readGuestInsn(exports, statePtr, blockCursor);
+                if (!insn) break;
+                const op = insn.word & 0x7f;
+                if (!JIT_SUPPORTED.has(op)) break;
+                instructions.push(insn.word >>> 0);
+                sizes.push(Number(insn.size));
+                blockCursor += insn.size;
+                if (JIT_TERMINAL.has(op)) break;
+            }
+            if (instructions.length > 0) {
+                const key = `${blockStart.toString(16)}:${instructions.map((n) => n.toString(16)).join(',')}`;
+                if (!jitBlockCache.has(key)) {
+                    try {
+                        const module = new RiscVBlockJit(instructions, sizes).compile();
+                        const jitInstance = new WebAssembly.Instance(module, { env: { memory: exports.memory } });
+                        jitBlockCache.set(key, jitInstance.exports.run);
+                    } catch (err) {
+                        // Leave this block to the interpreter.
+                    }
+                }
+            }
+            cursor = blockCursor;
+        }
+    };
+
     const { instance: inst } = await WebAssembly.instantiate(wasmBuffer, {
         env: {
             jit_try_block: (statePtr) => {
                 if (!JIT_ENABLED || !instance) return 0;
                 const exports = instance.exports;
-                if (!exports.jit_get_pc || !exports.jit_read_u32 || !exports.jit_regs_ptr) return 0;
+                if (!exports.jit_get_pc || !exports.jit_read_u16 || !exports.jit_read_u32 || !exports.jit_regs_ptr) return 0;
 
                 try {
                     const pc = exports.jit_get_pc(statePtr);
@@ -1155,24 +1205,33 @@ async function start() {
                     jitHitCounts.set(pcKey, hits);
                     if (hits < JIT_HIT_THRESHOLD) return 0;
 
+                    const pageStart = pc & ~0xfffn;
+                    if (!jitPageCompiled.has(pageStart.toString(16))) {
+                        precompileJitPage(exports, statePtr, pageStart);
+                        jitPageCompiled.add(pageStart.toString(16));
+                    }
+
                     const instructions = [];
+                    const sizes = [];
                     let cursor = pc;
                     for (;;) {
-                        const insn = Number(exports.jit_read_u32(statePtr, cursor));
-                        const opcode = insn & 0x7f;
+                        const insn = readGuestInsn(exports, statePtr, cursor);
+                        if (!insn) return 0;
+                        const opcode = insn.word & 0x7f;
                         if (!JIT_SUPPORTED.has(opcode)) {
                             jitUnsupported.add(pcKey);
                             return 0;
                         }
-                        instructions.push(insn >>> 0);
+                        instructions.push(insn.word >>> 0);
+                        sizes.push(Number(insn.size));
+                        cursor += insn.size;
                         if (JIT_TERMINAL.has(opcode)) break;
-                        cursor += 4n;
                     }
 
                     const key = `${pcKey}:${instructions.map((n) => n.toString(16)).join(',')}`;
                     let run = jitBlockCache.get(key);
                     if (!run) {
-                        const module = new RiscVBlockJit(instructions).compile();
+                        const module = new RiscVBlockJit(instructions, sizes).compile();
                         const jitInstance = new WebAssembly.Instance(module, { env: { memory: exports.memory } });
                         run = jitInstance.exports.run;
                         jitBlockCache.set(key, run);
