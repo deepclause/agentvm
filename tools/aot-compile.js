@@ -86,19 +86,25 @@ async function main() {
         process.exit(2);
     }
 
+    const limit = Number(process.env.AOT_LIMIT || 0);
     const blocks = [];
     for (const elf of elfs) {
         const collected = collectBlocks(elf);
         console.log(`${elf}: ${collected.length} blocks`);
-        blocks.push(...collected);
+        for (const block of collected) blocks.push(block);
     }
 
-    if (blocks.length === 0) throw new Error('no translatable blocks found');
+    let selected = blocks;
+    if (limit > 0) {
+        selected = blocks.slice(0, limit);
+        console.log(`limiting to ${selected.length} blocks`);
+    }
+    if (selected.length === 0) throw new Error('no translatable blocks found');
 
     // Some compressed/edge encodings are not yet fully supported by the
     // decoder. AOT skips those blocks and leaves them to the interpreter.
     const good = [];
-    for (const block of blocks) {
+    for (const block of selected) {
         try {
             new RiscVBlockJit(block.instructions, block.sizes).compile();
             good.push(block);
