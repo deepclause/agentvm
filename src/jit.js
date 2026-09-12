@@ -1,5 +1,7 @@
 'use strict';
 
+const { decodeRiscV } = require('./riscv-c');
+
 // Minimal RISC-V (RV64) integer block translator -> WebAssembly.
 //
 // This is the first JIT milestone. It translates straight-line sequences of
@@ -67,8 +69,9 @@ function sext(value, bits) {
 }
 
 class RiscVBlockJit {
-    constructor(instructions) {
+    constructor(instructions, sizes = null) {
         this.instructions = instructions;
+        this.sizes = sizes || instructions.map(() => 4);
     }
 
     compile() {
@@ -122,9 +125,9 @@ class RiscVBlockJit {
         out.push(Buffer.from([0x00])); // zero locals
 
         let pc = 0;
-        for (const insn of this.instructions) {
-            this._emitInstruction(out, insn, pc);
-            pc += 4;
+        for (let i = 0; i < this.instructions.length; i++) {
+            this._emitInstruction(out, this.instructions[i], pc);
+            pc += this.sizes[i];
         }
 
         // Fall through: return startPc + 4 * instruction count.
@@ -380,21 +383,27 @@ class RiscVBlockJit {
 
 function decodeBlock(code, pc) {
     const instructions = [];
+    const sizes = [];
     const supported = new Set([0x13, 0x33, 0x03, 0x23, 0x37, 0x17, 0x6f, 0x67, 0x63]);
     let cursor = pc;
-    while (cursor / 4 < code.length) {
-        const insn = code[cursor / 4] >>> 0;
+    while (cursor < code.length) {
+        const decoded = decodeRiscV(code, cursor);
+        if (!decoded) {
+            return { instructions, sizes, terminal: 'unsupported', nextPc: cursor };
+        }
+        const insn = decoded.word >>> 0;
         const opcode = insn & 0x7f;
         if (!supported.has(opcode)) {
-            return { instructions, terminal: 'unsupported', nextPc: cursor, opcode };
+            return { instructions, sizes, terminal: 'unsupported', nextPc: cursor };
         }
         instructions.push(insn);
+        sizes.push(decoded.size);
         if (opcode === 0x63 || opcode === 0x6f || opcode === 0x67) {
-            return { instructions, terminal: opcode === 0x63 ? 'branch' : opcode === 0x6f ? 'jal' : 'jalr', nextPc: cursor + 4 };
+            return { instructions, sizes, terminal: opcode === 0x63 ? 'branch' : opcode === 0x6f ? 'jal' : 'jalr', nextPc: cursor + decoded.size };
         }
-        cursor += 4;
+        cursor += decoded.size;
     }
-    return { instructions, terminal: 'fallthrough', nextPc: cursor };
+    return { instructions, sizes, terminal: 'fallthrough', nextPc: cursor };
 }
 
 module.exports = { RiscVBlockJit, decodeBlock, u32leb, s32leb, s64leb, sext };
