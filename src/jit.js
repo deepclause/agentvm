@@ -74,41 +74,49 @@ class RiscVBlockJit {
         this.sizes = sizes || instructions.map(() => 4);
     }
 
-    compile() {
-        const body = this._emitBody();
-        const codeSection = section(10, Buffer.concat([
-            u32leb(1),               // one function body
-            u32leb(body.length),
-            body,
-        ]));
-
-        const typeSection = section(1, Buffer.concat([
+    _typeSection() {
+        return section(1, Buffer.concat([
             u32leb(1),               // one type
             Buffer.from([0x60]),     // func
             u32leb(3), Buffer.from([0x7f, 0x7f, 0x7e]), // regs base, mem base, start pc (i64)
             u32leb(1), Buffer.from([0x7e]), // one i64 result: next pc
         ]));
+    }
 
-        const importSection = section(2, Buffer.concat([
+    _importSection() {
+        return section(2, Buffer.concat([
             u32leb(1),
             stringBytes('env'),
             stringBytes('memory'),
             Buffer.from([0x02, 0x00, 0x01]), // memory, min 1 page
         ]));
+    }
+
+    _buildModule(functions, exportNames) {
+        const typeSection = this._typeSection();
+        const importSection = this._importSection();
 
         const functionSection = section(3, Buffer.concat([
-            u32leb(1),
-            u32leb(0),
+            u32leb(functions.length),
+            ...functions.map(() => u32leb(0)),
         ]));
 
-        const exportSection = section(7, Buffer.concat([
-            u32leb(1),
-            stringBytes('run'),
-            Buffer.from([0x00]),     // function
-            u32leb(0),
-        ]));
+        const exportParts = [u32leb(functions.length)];
+        functions.forEach((_, i) => {
+            exportParts.push(stringBytes(exportNames[i] || `run_${i}`));
+            exportParts.push(Buffer.from([0x00])); // function
+            exportParts.push(u32leb(i));
+        });
+        const exportSection = section(7, Buffer.concat(exportParts));
 
-        const binary = Buffer.concat([
+        const codeParts = [u32leb(functions.length)];
+        for (const body of functions) {
+            codeParts.push(u32leb(body.length));
+            codeParts.push(body);
+        }
+        const codeSection = section(10, Buffer.concat(codeParts));
+
+        return Buffer.concat([
             Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]),
             typeSection,
             importSection,
@@ -116,18 +124,32 @@ class RiscVBlockJit {
             exportSection,
             codeSection,
         ]);
-
-        return new WebAssembly.Module(binary);
     }
 
-    _emitBody() {
+    compile() {
+        const body = this._emitBody(this.instructions, this.sizes);
+        return new WebAssembly.Module(this._buildModule([body], ['run']));
+    }
+
+    // Compile many blocks into one module with exports run_0, run_1, ...
+    static compileMany(blocks) {
+        return new WebAssembly.Module(RiscVBlockJit.compileManyBytes(blocks));
+    }
+
+    static compileManyBytes(blocks) {
+        const instance = new RiscVBlockJit([], []);
+        const bodies = blocks.map((block) => instance._emitBody(block.instructions, block.sizes));
+        return instance._buildModule(bodies, blocks.map((_, i) => `run_${i}`));
+    }
+
+    _emitBody(instructions, sizes) {
         const out = [];
         out.push(Buffer.from([0x00])); // zero locals
 
         let pc = 0;
-        for (let i = 0; i < this.instructions.length; i++) {
-            this._emitInstruction(out, this.instructions[i], pc);
-            pc += this.sizes[i];
+        for (let i = 0; i < instructions.length; i++) {
+            this._emitInstruction(out, instructions[i], pc);
+            pc += sizes[i];
         }
 
         // Fall through: return startPc + 4 * instruction count.
