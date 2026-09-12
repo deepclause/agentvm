@@ -2,6 +2,7 @@ const { parentPort, workerData } = require('node:worker_threads');
 const { WASI } = require('node:wasi');
 const fs = require('node:fs');
 const { NetworkStack } = require('./network');
+const { RiscVBlockJit } = require('./jit');
 const { RingBufferReader } = require('./ringbuffer');
 
 const { wasmPath, sharedBuffer, mounts, network, mac, netPort } = workerData;
@@ -68,6 +69,14 @@ function writeIOVs(view, iovs_ptr, iovs_len, data) {
 }
 
 let instance = null;
+const JIT_ENABLED = process.env.AGENTVM_JIT === '1';
+const DEBUG_JIT = process.env.DEBUG_JIT === '1';
+const JIT_HIT_THRESHOLD = 50;
+const jitHitCounts = new Map();
+const jitBlockCache = new Map();
+const jitUnsupported = new Set();
+const JIT_TERMINAL = new Set([0x63, 0x6f, 0x67]);
+const JIT_SUPPORTED = new Set([0x13, 0x33, 0x37, 0x17, 0x6f, 0x67, 0x63]);
 
 async function start() {
     const wasmBuffer = fs.readFileSync(wasmPath);
@@ -1132,7 +1141,56 @@ async function start() {
 
     const { instance: inst } = await WebAssembly.instantiate(wasmBuffer, {
         env: {
-            jit_try_block: () => 0,
+            jit_try_block: (statePtr) => {
+                if (!JIT_ENABLED || !instance) return 0;
+                const exports = instance.exports;
+                if (!exports.jit_get_pc || !exports.jit_read_u32 || !exports.jit_regs_ptr) return 0;
+
+                try {
+                    const pc = exports.jit_get_pc(statePtr);
+                    const pcKey = pc.toString(16);
+                    if (jitUnsupported.has(pcKey)) return 0;
+
+                    const hits = (jitHitCounts.get(pcKey) || 0) + 1;
+                    jitHitCounts.set(pcKey, hits);
+                    if (hits < JIT_HIT_THRESHOLD) return 0;
+
+                    const instructions = [];
+                    let cursor = pc;
+                    for (;;) {
+                        const insn = Number(exports.jit_read_u32(statePtr, cursor));
+                        const opcode = insn & 0x7f;
+                        if (!JIT_SUPPORTED.has(opcode)) {
+                            jitUnsupported.add(pcKey);
+                            return 0;
+                        }
+                        instructions.push(insn >>> 0);
+                        if (JIT_TERMINAL.has(opcode)) break;
+                        cursor += 4n;
+                    }
+
+                    const key = `${pcKey}:${instructions.map((n) => n.toString(16)).join(',')}`;
+                    let run = jitBlockCache.get(key);
+                    if (!run) {
+                        const module = new RiscVBlockJit(instructions).compile();
+                        const jitInstance = new WebAssembly.Instance(module, { env: { memory: exports.memory } });
+                        run = jitInstance.exports.run;
+                        jitBlockCache.set(key, run);
+                    }
+
+                    const regsPtr = Number(exports.jit_regs_ptr(statePtr));
+                    const nextPc = run(regsPtr, 0, pc);
+                    exports.jit_sub_cycles(statePtr, instructions.length);
+                    exports.jit_set_pc(statePtr, nextPc);
+                    if (DEBUG_JIT) {
+                        parentPort.postMessage({ type: 'debug', msg: `JIT block pc=0x${pcKey} -> 0x${nextPc.toString(16)} (${instructions.length} insns, hits=${hits})` });
+                    }
+                    return 1;
+                } catch (err) {
+                    if (DEBUG_JIT) parentPort.postMessage({ type: 'debug', msg: `JIT fallback: ${err.message}` });
+                    return 0;
+                }
+            },
         },
         wasi_snapshot_preview1: {
             ...wasiImport,
