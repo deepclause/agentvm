@@ -79,6 +79,9 @@ const jitUnsupported = new Set();
 const jitPageCompiled = new Set();
 const JIT_TERMINAL = new Set([0x63, 0x6f, 0x67]);
 const JIT_SUPPORTED = new Set([0x13, 0x33, 0x1b, 0x3b, 0x03, 0x23, 0x37, 0x17, 0x6f, 0x67, 0x63]);
+const aotWasmPath = process.env.AGENTVM_AOT_WASM || null;
+const aotIndexPath = process.env.AGENTVM_AOT_INDEX || null;
+const aotSigMap = new Map();
 
 async function start() {
     const wasmBuffer = fs.readFileSync(wasmPath);
@@ -1256,7 +1259,17 @@ async function start() {
                         if (JIT_TERMINAL.has(opcode)) break;
                     }
 
-                    const key = `${pcKey}:${instructions.map((n) => n.toString(16)).join(',')}`;
+                    const sig = instructions.map((n) => n.toString(16)).join(',');
+                    const aotRun = aotSigMap.get(sig);
+                    if (aotRun) {
+                        const regsPtr = Number(exports.jit_regs_ptr(statePtr));
+                        const nextPc = aotRun(regsPtr, 0, pc, statePtr);
+                        exports.jit_sub_cycles(statePtr, instructions.length);
+                        exports.jit_set_pc(statePtr, nextPc);
+                        return 1;
+                    }
+
+                    const key = `${pcKey}:${sig}`;
                     let run = jitBlockCache.get(key);
                     if (!run) {
                         run = compileJitBlock(instructions, sizes);
@@ -1364,6 +1377,23 @@ async function start() {
     });
     
     instance = inst;
+
+    if (JIT_ENABLED && aotWasmPath && aotIndexPath) {
+        try {
+            const aotBytes = fs.readFileSync(aotWasmPath);
+            const aotModule = new WebAssembly.Module(aotBytes);
+            const aotInstance = new WebAssembly.Instance(aotModule, {
+                env: { memory: instance.exports.memory, load: jitLoad, store: jitStore },
+            });
+            const index = JSON.parse(fs.readFileSync(aotIndexPath, 'utf8'));
+            for (const entry of index) {
+                aotSigMap.set(entry.sig, aotInstance.exports[entry.export]);
+            }
+            if (DEBUG_JIT) parentPort.postMessage({ type: 'debug', msg: `AOT loaded: ${aotSigMap.size} blocks` });
+        } catch (err) {
+            parentPort.postMessage({ type: 'debug', msg: `AOT load failed: ${err.message}` });
+        }
+    }
 
     parentPort.postMessage({ type: 'ready' });
 
