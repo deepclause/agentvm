@@ -1,0 +1,14 @@
+--- a/Makefile
++++ b/Makefile
+@@ -46,9 +46,9 @@
+ endif
+ CC=$(CROSS_PREFIX)gcc
+ STRIP=$(CROSS_PREFIX)strip
+-CFLAGS=-O2 -Wall -g -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -MMD
++CFLAGS=-O3 -flto -Wall -DNDEBUG -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -MMD
+ CFLAGS+=-D_GNU_SOURCE -DCONFIG_VERSION=\"$(shell cat VERSION)\"
+-LDFLAGS=
++LDFLAGS=-O3 -flto -Wl,--strip-all
+ 
+ bindir=/usr/local/bin
+ INSTALL=install

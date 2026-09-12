@@ -1,0 +1,36 @@
+diff --git a/riscv_cpu.c b/riscv_cpu.c
+index b0bd964..4386ce4 100644
+--- a/riscv_cpu.c
++++ b/riscv_cpu.c
+@@ -50,6 +50,12 @@
+ 
+ #include "riscv_cpu_priv.h"
+ 
++#ifdef CONFIG_JIT
++extern int initialized;
++__attribute__((import_module("env"), import_name("jit_try_block")))
++int32_t jit_try_block(uint32_t state_ptr);
++#endif
++
+ #ifdef CONFIG_JIT
+ static int csr_read(RISCVCPUState *s, target_ulong *pval, uint32_t csr, BOOL will_write);
+ static int csr_write(RISCVCPUState *s, uint32_t csr, target_ulong val);
+diff --git a/riscv_cpu_template.h b/riscv_cpu_template.h
+index 3613fa5..3f7fa29 100644
+--- a/riscv_cpu_template.h
++++ b/riscv_cpu_template.h
+@@ -256,6 +256,14 @@ static void no_inline glue(riscv_cpu_interp_x, XLEN)(RISCVCPUState *s,
+                 }
+             }
+     
++#ifdef CONFIG_JIT
++            if (initialized && jit_try_block((uint32_t)(uintptr_t)s)) {
++                code_to_pc_addend = s->pc;
++                code_ptr = NULL;
++                code_end = NULL;
++                continue;
++            }
++#endif
+             addr = s->pc;
+             tlb_idx = (addr >> PG_SHIFT) & (TLB_SIZE - 1);
+             if (likely(s->tlb_code[tlb_idx].vaddr == (addr & ~PG_MASK))) {

@@ -1,0 +1,18 @@
+# Acceptance image for AgentVM 0.2: riscv64 Alpine with Python + Node/npm.
+#
+# This is a *build-time* input. The shipped artifact is a portable .wasm file;
+# the runtime never needs Docker or this Dockerfile.
+
+# Alpine 3.21 ships Node 22 (pi requires >=22.19.0); 3.20 ships Node 20.
+FROM alpine:3.21
+
+# riscv64 Alpine has nodejs, npm, python3 and py3-pip. git/bash/curl are
+# included so the VM can install and drive the pi coding agent.
+RUN apk add --no-cache \
+        python3 py3-pip \
+        nodejs npm \
+        bash curl git \
+        coreutils
+
+# A shell is the entrypoint AgentVM exec() talks to.
+CMD ["/bin/sh"]

@@ -1,8 +1,9 @@
-const { parentPort, workerData, receiveMessageOnPort } = require('node:worker_threads');
+const { parentPort, workerData } = require('node:worker_threads');
 const { WASI } = require('node:wasi');
 const fs = require('node:fs');
 const { NetworkStack } = require('./network');
-const { RingBufferReader, IO_READY_INDEX, STDIN_FLAG_INDEX, STDIN_SIZE_INDEX, STDIN_DATA_OFFSET, NET_RING_OFFSET } = require('./ringbuffer');
+const { RiscVBlockJit } = require('./jit');
+const { RingBufferReader } = require('./ringbuffer');
 
 const { wasmPath, sharedBuffer, mounts, network, mac, netPort } = workerData;
 
@@ -11,13 +12,18 @@ const ringReader = new RingBufferReader(sharedBuffer);
 
 let localBuffer = new Uint8Array(0);
 
-// Buffer for sock_recv to handle partial reads
+// Leftover frame-pipe bytes from a previous partial sock_recv read.
+// This is a byte-stream buffer only; it is NEVER tied to a TCP FIN.
 let sockRecvBuffer = Buffer.alloc(0);
 
 // Initialize Network Stack with:
 // - ringReader for incoming data (main → worker, via SharedArrayBuffer)
 // - netPort for outgoing control messages (worker → main, via MessagePort)
-const netStack = new NetworkStack({ ringReader, netPort });
+const netStack = new NetworkStack({
+    ringReader,
+    netPort,
+    debugStats: process.env.DEBUG_NETWORK_STATS === '1',
+});
 const NET_FD = 3; // Standard for LISTEN_FDS=1 (listening socket)
 const NET_CONN_FD = 4; // Connected socket for actual I/O
 let netConnectionAccepted = false;
@@ -63,6 +69,14 @@ function writeIOVs(view, iovs_ptr, iovs_len, data) {
 }
 
 let instance = null;
+const JIT_ENABLED = process.env.AGENTVM_JIT === '1';
+const DEBUG_JIT = process.env.DEBUG_JIT === '1';
+const JIT_HIT_THRESHOLD = 50;
+const jitHitCounts = new Map();
+const jitBlockCache = new Map();
+const jitUnsupported = new Set();
+const JIT_TERMINAL = new Set([0x63, 0x6f, 0x67]);
+const JIT_SUPPORTED = new Set([0x13, 0x33, 0x37, 0x17, 0x6f, 0x67, 0x63]);
 
 async function start() {
     const wasmBuffer = fs.readFileSync(wasmPath);
@@ -351,13 +365,10 @@ async function start() {
                 const buf_len = view.getUint32(iovs_ptr + i * 8 + 4, true);
                 
                 try {
-                    const buffer = Buffer.alloc(buf_len);
+                    // readSync is synchronous, so a zero-copy view over WASM
+                    // memory is safe for the duration of the call.
+                    const buffer = Buffer.from(mem.buffer, mem.byteOffset + buf_ptr, buf_len);
                     const bytesRead = fs.readSync(handle.nodeFd, buffer, 0, buf_len, null);
-                    
-                    // Copy to WASM memory
-                    for (let j = 0; j < bytesRead; j++) {
-                        mem[buf_ptr + j] = buffer[j];
-                    }
                     totalRead += bytesRead;
                     
                     if (bytesRead < buf_len) break; // EOF or partial read
@@ -412,13 +423,8 @@ async function start() {
                 const buf_len = view.getUint32(iovs_ptr + i * 8 + 4, true);
                 
                 try {
-                    const buffer = Buffer.alloc(buf_len);
+                    const buffer = Buffer.from(mem.buffer, mem.byteOffset + buf_ptr, buf_len);
                     const bytesRead = fs.readSync(handle.nodeFd, buffer, 0, buf_len, currentOffset);
-                    
-                    // Copy to WASM memory
-                    for (let j = 0; j < bytesRead; j++) {
-                        mem[buf_ptr + j] = buffer[j];
-                    }
                     totalRead += bytesRead;
                     currentOffset += bytesRead;
                     
@@ -468,7 +474,9 @@ async function start() {
                 const buf_len = view.getUint32(iovs_ptr + i * 8 + 4, true);
                 
                 try {
-                    const buffer = Buffer.from(mem.slice(buf_ptr, buf_ptr + buf_len));
+                    // fs.writeSync is synchronous, so a zero-copy view over
+                    // WASM memory is safe for the duration of the call.
+                    const buffer = Buffer.from(mem.buffer, mem.byteOffset + buf_ptr, buf_len);
                     const bytesWritten = fs.writeSync(handle.nodeFd, buffer, 0, buf_len, currentOffset);
                     
                     totalWritten += bytesWritten;
@@ -516,7 +524,7 @@ async function start() {
                 const buf_len = view.getUint32(iovs_ptr + i * 8 + 4, true);
                 
                 try {
-                    const buffer = Buffer.from(mem.slice(buf_ptr, buf_ptr + buf_len));
+                    const buffer = Buffer.from(mem.buffer, mem.byteOffset + buf_ptr, buf_len);
                     const bytesWritten = fs.writeSync(handle.nodeFd, buffer);
                     totalWritten += bytesWritten;
                 } catch (err) {
@@ -548,7 +556,6 @@ async function start() {
     // Custom fd_close for our handles
     const origFdClose = wasiImport.fd_close;
     wasiImport.fd_close = (fd) => {
-        parentPort.postMessage({ type: 'debug', msg: `fd_close(${fd}) called` });
         if (customFdHandles.has(fd)) {
             const handle = customFdHandles.get(fd);
             // Only close if it's a file handle with a nodeFd (directories don't have one)
@@ -564,11 +571,12 @@ async function start() {
             fakeFdMap.delete(fd);
             return 0;
         }
-        // Handle network socket close
-        if (fd === NET_CONN_FD) {
-            parentPort.postMessage({ type: 'debug', msg: `fd_close(${fd}) - closing network socket` });
+        // Handle network socket close: tear down every flow over the pipe.
+        if (network && fd === NET_CONN_FD) {
+            if (process.env.DEBUG_NETWORK_STATS === '1') {
+                parentPort.postMessage({ type: 'debug', msg: 'network frame pipe closed via fd_close' });
+            }
             netStack.closeSocket();
-            // Reset connection state so new connections can be accepted
             netConnectionAccepted = false;
             sockRecvBuffer = Buffer.alloc(0);
             return 0;
@@ -676,7 +684,6 @@ async function start() {
             return origFdReaddir(fakeFdMap.get(fd), buf_ptr, buf_len, cookie, bufused_ptr);
         }
         
-        console.error(`[fd_readdir] FALLBACK`);
         return origFdReaddir(fd, buf_ptr, buf_len, cookie, bufused_ptr);
     };
     
@@ -744,8 +751,6 @@ async function start() {
                 const pathStr = new TextDecoder().decode(pathBytes);
                 const fullPath = require('path').join(handle.hostPath, pathStr);
                 
-                require('fs').writeSync(2, `[path_filestat_get] custom fd=${fd}, path="${pathStr}", fullPath="${fullPath}"\n`);
-                
                 try {
                     const stat = fs.statSync(fullPath);
                     
@@ -778,7 +783,6 @@ async function start() {
                     
                     return 0;
                 } catch (err) {
-                    require('fs').writeSync(2, `[path_filestat_get] ERROR: ${err.message}\n`);
                     if (err.code === 'ENOENT') return 44; // WASI_ERRNO_NOENT
                     if (err.code === 'EACCES') return 2;  // WASI_ERRNO_ACCES
                     return 29; // WASI_ERRNO_IO
@@ -845,7 +849,7 @@ async function start() {
     const originalFdWrite = wasiImport.fd_write;
     wasiImport.fd_write = (fd, iovs_ptr, iovs_len, nwritten_ptr) => {
         try {
-            if (fd === NET_FD) {
+            if (network && fd === NET_FD) {
                 if (!instance) return 0;
                 const view = new DataView(instance.exports.memory.buffer);
                 const buffers = readIOVs(view, iovs_ptr, iovs_len);
@@ -889,7 +893,7 @@ async function start() {
 
     const originalFdRead = wasiImport.fd_read;
     wasiImport.fd_read = (fd, iovs_ptr, iovs_len, nread_ptr) => {
-        if (fd === NET_FD) {
+        if (network && fd === NET_FD) {
             // parentPort.postMessage({ type: 'debug', msg: `fd_read(${fd}) - network read attempt` });
             if (!instance) return 0;
             const view = new DataView(instance.exports.memory.buffer);
@@ -936,7 +940,7 @@ async function start() {
 
     const originalFdFdstatGet = wasiImport.fd_fdstat_get;
     wasiImport.fd_fdstat_get = (fd, bufPtr) => {
-        if (fd === NET_FD || fd === NET_FD + 1) { // fd 3 (listen) or fd 4 (connection)
+        if (network && (fd === NET_FD || fd === NET_FD + 1)) { // fd 3 (listen) or fd 4 (connection)
             // // parentPort.postMessage({ type: 'debug', msg: `fd_fdstat_get(${fd})` });
             if (!instance) return 0;
             const view = new DataView(instance.exports.memory.buffer);
@@ -980,10 +984,10 @@ async function start() {
              if (type === 1) { // FD_READ
                  const fd = view.getUint32(base + 16, true);
                  if (fd === 0) hasStdin = true;
-                 else if (fd === NET_FD) {
+                 else if (network && fd === NET_FD) {
                      hasNetListen = true;
                  }
-                 else if (fd === NET_FD + 1) {
+                 else if (network && fd === NET_FD + 1) {
                      hasNetRead = true;
                  }
                  else {
@@ -991,7 +995,7 @@ async function start() {
                  }
              } else if (type === 2) { // FD_WRITE
                  const fd = view.getUint32(base + 16, true);
-                 if (fd === NET_FD + 1) {
+                 if (network && fd === NET_FD + 1) {
                      hasNetWrite = true;
                  }
                  else {
@@ -1009,23 +1013,21 @@ async function start() {
              }
         }
         
-        // Log what we're waiting for
-        const pollStart = Date.now();
-        parentPort.postMessage({ type: 'debug', msg: `poll_oneoff: hasStdin=${hasStdin}, hasNetRead=${hasNetRead}, hasNetWrite=${hasNetWrite}, timeout=${minTimeout}ms, sockRecvBuf=${sockRecvBuffer.length}, txBuf=${netStack.txBuffer.length}` });
-        
         // IMPORTANT: Always poll for network responses first!
         // This ensures TCP data from main thread is received even when 
         // we're polling for both read and write (common during TLS handshake).
         netStack.pollNetResponses();
+        netStack.tick();
         
         // 2. Check Immediate Status
         // Include sockRecvBuffer in readability check - it may have data from a previous partial read
-        const netReadable = sockRecvBuffer.length > 0 || netStack.hasPendingData() || netStack.hasReceivedFin();
+        const netReadable = sockRecvBuffer.length > 0 || netStack.hasPendingData();
         const netWritable = true; // Always writable
         const stdinReadable = localBuffer.length > 0 || ringReader.hasStdinData();
         
         let ready = false;
         if (hasStdin && stdinReadable) ready = true;
+        if (hasNetListen && !netConnectionAccepted) ready = true;
         if (hasNetRead && netReadable) ready = true;
         if (hasNetWrite && netWritable) ready = true;
         
@@ -1050,14 +1052,15 @@ async function start() {
                      const elapsed = Date.now() - startTime;
                      if (elapsed >= t) break;
                      
-                     // Poll for network responses from ring buffer (no busy-wait needed!)
+                     // Poll for network responses and retransmission timers.
                      netStack.pollNetResponses();
+                     netStack.tick();
                      
                      // Check if stdin became available
                      if (hasStdin && ringReader.hasStdinData()) break;
                      
                      // Check if network data became available (including buffered data)
-                     if (sockRecvBuffer.length > 0 || netStack.hasPendingData() || netStack.hasReceivedFin()) break;
+                     if (sockRecvBuffer.length > 0 || netStack.hasPendingData()) break;
                      
                      // Check if there's more network data in the ring buffer
                      if (ringReader.hasNetworkData()) {
@@ -1077,7 +1080,7 @@ async function start() {
         
         // Refresh status (include sockRecvBuffer in check)
         const postStdinReadable = localBuffer.length > 0 || ringReader.hasStdinData();
-        const postNetReadable = sockRecvBuffer.length > 0 || netStack.hasPendingData() || netStack.hasReceivedFin();
+        const postNetReadable = sockRecvBuffer.length > 0 || netStack.hasPendingData();
         
         for(let i=0; i<nsubscriptions; i++) {
              const base = in_ptr + i * 48;
@@ -1094,19 +1097,21 @@ async function start() {
                      triggered = true;
                      evType = 1;
                      nbytes = localBuffer.length || 1;
-                 } else if (fd === NET_FD && netConnectionAccepted) {
-                     // Listen socket - always readable if we haven't accepted yet (to trigger sock_accept)
-                     // But we've already accepted, so not readable
-                 } else if (fd === NET_FD + 1 && postNetReadable) {
+                 } else if (network && fd === NET_FD && !netConnectionAccepted) {
+                     // The one synthetic connection from TinyEMU is ready to
+                     // accept exactly once.
+                     triggered = true;
+                     evType = 1;
+                     nbytes = 1;
+                 } else if (network && fd === NET_FD + 1 && postNetReadable) {
                      // Connected socket - readable if there's data
                      triggered = true;
                      evType = 1;
-                     nbytes = netStack.txBuffer.length;
-                     // // parentPort.postMessage({ type: 'debug', msg: `poll: conn fd readable, ${nbytes} bytes` });
+                     nbytes = sockRecvBuffer.length + netStack.pendingDataSize();
                  }
              } else if (type === 2) { // WRITE
                  const fd = view.getUint32(base + 16, true);
-                 if (fd === NET_FD + 1) {
+                 if (network && fd === NET_FD + 1) {
                      // Connected socket - always writable
                      triggered = true;
                      evType = 2;
@@ -1129,16 +1134,64 @@ async function start() {
         }
         
         view.setUint32(nevents_ptr, eventsWritten, true);
-        const pollDuration = Date.now() - pollStart;
-        if (pollDuration > 5) {
-            parentPort.postMessage({ type: 'debug', msg: `poll_oneoff completed in ${pollDuration}ms, events=${eventsWritten}` });
-        }
         return 0; // Success
     };
 
 
 
     const { instance: inst } = await WebAssembly.instantiate(wasmBuffer, {
+        env: {
+            jit_try_block: (statePtr) => {
+                if (!JIT_ENABLED || !instance) return 0;
+                const exports = instance.exports;
+                if (!exports.jit_get_pc || !exports.jit_read_u32 || !exports.jit_regs_ptr) return 0;
+
+                try {
+                    const pc = exports.jit_get_pc(statePtr);
+                    const pcKey = pc.toString(16);
+                    if (jitUnsupported.has(pcKey)) return 0;
+
+                    const hits = (jitHitCounts.get(pcKey) || 0) + 1;
+                    jitHitCounts.set(pcKey, hits);
+                    if (hits < JIT_HIT_THRESHOLD) return 0;
+
+                    const instructions = [];
+                    let cursor = pc;
+                    for (;;) {
+                        const insn = Number(exports.jit_read_u32(statePtr, cursor));
+                        const opcode = insn & 0x7f;
+                        if (!JIT_SUPPORTED.has(opcode)) {
+                            jitUnsupported.add(pcKey);
+                            return 0;
+                        }
+                        instructions.push(insn >>> 0);
+                        if (JIT_TERMINAL.has(opcode)) break;
+                        cursor += 4n;
+                    }
+
+                    const key = `${pcKey}:${instructions.map((n) => n.toString(16)).join(',')}`;
+                    let run = jitBlockCache.get(key);
+                    if (!run) {
+                        const module = new RiscVBlockJit(instructions).compile();
+                        const jitInstance = new WebAssembly.Instance(module, { env: { memory: exports.memory } });
+                        run = jitInstance.exports.run;
+                        jitBlockCache.set(key, run);
+                    }
+
+                    const regsPtr = Number(exports.jit_regs_ptr(statePtr));
+                    const nextPc = run(regsPtr, 0, pc);
+                    exports.jit_sub_cycles(statePtr, instructions.length);
+                    exports.jit_set_pc(statePtr, nextPc);
+                    if (DEBUG_JIT) {
+                        parentPort.postMessage({ type: 'debug', msg: `JIT block pc=0x${pcKey} -> 0x${nextPc.toString(16)} (${instructions.length} insns, hits=${hits})` });
+                    }
+                    return 1;
+                } catch (err) {
+                    if (DEBUG_JIT) parentPort.postMessage({ type: 'debug', msg: `JIT fallback: ${err.message}` });
+                    return 0;
+                }
+            },
+        },
         wasi_snapshot_preview1: {
             ...wasiImport,
             // WASI Socket Extensions (for network support)
@@ -1146,7 +1199,7 @@ async function start() {
                 // Poll for network responses first - TCP-connected messages may be pending
                 netStack.pollNetResponses();
                 
-                if (fd !== NET_FD) {
+                if (!network || fd !== NET_FD) {
                     // parentPort.postMessage({ type: 'debug', msg: `sock_accept(${fd}) - wrong fd` });
                     return 8; // WASI_ERRNO_BADF
                 }
@@ -1166,64 +1219,34 @@ async function start() {
                 return 6; // WASI_ERRNO_AGAIN - would block
             },
             sock_recv: (fd, ri_data_ptr, ri_data_len, ri_flags, ro_datalen_ptr, ro_flags_ptr) => {
-                // Poll for network responses first
                 netStack.pollNetResponses();
-                
-                parentPort.postMessage({ type: 'debug', msg: `sock_recv(${fd}) called, sockRecvBuf=${sockRecvBuffer.length}, txBuf=${netStack.txBuffer.length}, fin=${netStack.hasReceivedFin()}` });
-                
-                if (fd !== NET_CONN_FD) {
-                    // parentPort.postMessage({ type: 'debug', msg: `sock_recv(${fd}) - wrong fd` });
+
+                if (!network || fd !== NET_CONN_FD) {
                     return 8; // WASI_ERRNO_BADF
                 }
-                
                 if (!instance) return 0;
                 const view = new DataView(instance.exports.memory.buffer);
-                
-                // First check if we have buffered data from a previous partial read
+
+                // The emulator socket is a frame pipe. Empty == EAGAIN, and we
+                // must never synthesize EOF from a per-connection FIN here.
                 if (sockRecvBuffer.length === 0) {
-                    // Read larger chunks for better throughput - the VM will consume what it needs
                     const data = netStack.readFromNetwork(65536);
-                    parentPort.postMessage({ type: 'debug', msg: `sock_recv readFromNetwork returned ${data ? data.length : 'null'} bytes, txBuf now=${netStack.txBuffer.length}` });
                     if (!data || data.length === 0) {
-                        // Check if FIN was received - if so, return EOF (0 bytes) instead of EAGAIN
-                        if (netStack.hasReceivedFin()) {
-                            parentPort.postMessage({ type: 'debug', msg: `sock_recv(${fd}) returning EOF due to FIN` });
-                            view.setUint32(ro_datalen_ptr, 0, true);
-                            view.setUint16(ro_flags_ptr, 0, true);
-                            // Clean up the connection to allow new connections
-                            netStack.closeSocket();
-                            netConnectionAccepted = false;
-                            sockRecvBuffer = Buffer.alloc(0);
-                            return 0; // Success with 0 bytes = EOF
-                        }
-                        parentPort.postMessage({ type: 'debug', msg: `sock_recv(${fd}) returning EAGAIN` });
                         view.setUint32(ro_datalen_ptr, 0, true);
                         view.setUint16(ro_flags_ptr, 0, true);
-                        // Return EAGAIN to indicate no data available yet
                         return 6; // WASI_ERRNO_AGAIN
                     }
                     sockRecvBuffer = data;
                 }
-                
-                // parentPort.postMessage({ type: 'debug', msg: `sock_recv(${fd}) have ${sockRecvBuffer.length} bytes to deliver` });
-                
-                // Write data to iovec buffers
+
                 const bytesWritten = writeIOVs(view, ri_data_ptr, ri_data_len, sockRecvBuffer);
-                
-                // Debug: show how much we wrote vs how much we had
-                parentPort.postMessage({ type: 'debug', msg: `sock_recv wrote ${bytesWritten}/${sockRecvBuffer.length} bytes to ${ri_data_len} iovecs` });
-                
-                // Keep any unwritten data for the next call
                 sockRecvBuffer = sockRecvBuffer.subarray(bytesWritten);
-                
-                // parentPort.postMessage({ type: 'debug', msg: `sock_recv(${fd}) wrote ${bytesWritten} bytes, remaining=${sockRecvBuffer.length}` });
                 view.setUint32(ro_datalen_ptr, bytesWritten, true);
                 view.setUint16(ro_flags_ptr, 0, true);
-                
-                return 0; // Success
+                return 0;
             },
             sock_send: (fd, si_data_ptr, si_data_len, si_flags, so_datalen_ptr) => {
-                if (fd !== NET_CONN_FD) {
+                if (!network || fd !== NET_CONN_FD) {
                     return 8; // WASI_ERRNO_BADF
                 }
                 
@@ -1243,8 +1266,14 @@ async function start() {
                 return 0; // Success
             },
             sock_shutdown: (fd, how) => {
-                parentPort.postMessage({ type: 'debug', msg: `sock_shutdown(${fd}, ${how})` });
-                return 0; // Success
+                if (!network || fd !== NET_CONN_FD) return 8; // WASI_ERRNO_BADF
+                if (process.env.DEBUG_NETWORK_STATS === '1') {
+                    parentPort.postMessage({ type: 'debug', msg: `ignored frame-pipe shutdown (${how})` });
+                }
+                // fd 4 is the permanent QEMU Ethernet frame pipe, not one of
+                // the proxied TCP flows. A guest-side half-close must not tear
+                // down the NIC or poison subsequent DNS/connections.
+                return 0;
             }
         }
     });

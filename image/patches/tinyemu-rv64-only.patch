@@ -1,0 +1,72 @@
+diff --git a/riscv_cpu.c b/riscv_cpu.c
+index 4499cb9..f8fe9e2 100644
+--- a/riscv_cpu.c
++++ b/riscv_cpu.c
+@@ -1213,8 +1213,43 @@ static inline uint32_t get_field1(uint32_t val, int src_pos,
+         return (val >> (src_pos - dst_pos)) & mask;
+ }
+ 
++#ifdef CONFIG_RISCV_ONLY_64
++/* RV64's DIVW/REMW instructions need 32-bit arithmetic semantics, but not the
++   full duplicate RV32 decoder. */
++static inline int32_t div32(int32_t a, int32_t b)
++{
++    if (b == 0)
++        return -1;
++    if (a == INT32_MIN && b == -1)
++        return a;
++    return a / b;
++}
++
++static inline uint32_t divu32(uint32_t a, uint32_t b)
++{
++    return b == 0 ? UINT32_MAX : a / b;
++}
++
++static inline int32_t rem32(int32_t a, int32_t b)
++{
++    if (b == 0)
++        return a;
++    if (a == INT32_MIN && b == -1)
++        return 0;
++    return a % b;
++}
++
++static inline uint32_t remu32(uint32_t a, uint32_t b)
++{
++    return b == 0 ? a : a % b;
++}
++#endif
++
++#ifndef CONFIG_RISCV_ONLY_64
+ #define XLEN 32
+ #include "riscv_cpu_template.h"
++#endif
++
+ 
+ #if MAX_XLEN >= 64
+ #define XLEN 64
+@@ -1238,9 +1273,11 @@ static void glue(riscv_cpu_interp, MAX_XLEN)(RISCVCPUState *s, int n_cycles)
+            (int)(timeout - s->insn_counter) > 0) {
+         n_cycles = timeout - s->insn_counter;
+         switch(s->cur_xlen) {
++#ifndef CONFIG_RISCV_ONLY_64
+         case 32:
+             riscv_cpu_interp_x32(s, n_cycles);
+             break;
++#endif
+ #if MAX_XLEN >= 64
+         case 64:
+             riscv_cpu_interp_x64(s, n_cycles);
+@@ -1356,9 +1393,11 @@ RISCVCPUState *riscv_cpu_init(PhysMemoryMap *mem_map, int max_xlen)
+         c = &glue(riscv_cpu_class, MAX_XLEN);
+         break;
+ #else
++#ifndef CONFIG_RISCV_ONLY_64
+     case 32:
+         c = &riscv_cpu_class32;
+         break;
++#endif
+     case 64:
+         c = &riscv_cpu_class64;
+         break;

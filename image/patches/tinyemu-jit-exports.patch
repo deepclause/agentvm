@@ -1,0 +1,100 @@
+diff --git a/riscv_cpu.c b/riscv_cpu.c
+index 4499cb9..34bcb7b 100644
+--- a/riscv_cpu.c
++++ b/riscv_cpu.c
+@@ -50,6 +50,95 @@
+ 
+ #include "riscv_cpu_priv.h"
+ 
++#ifdef CONFIG_JIT
++static int csr_read(RISCVCPUState *s, target_ulong *pval, uint32_t csr, BOOL will_write);
++static int csr_write(RISCVCPUState *s, uint32_t csr, target_ulong val);
++
++#define JIT_ACCESSOR_LOAD(sz)                                                 \
++__attribute__((export_name("jit_read_" #sz)))                                  \
++uint64_t jit_read_##sz(uint32_t state_ptr, uint64_t addr)                       \
++{                                                                              \
++    RISCVCPUState *s = (RISCVCPUState *)(uintptr_t)state_ptr;                   \
++    uint64_t val = 0;                                                          \
++    if (target_read_##sz(s, &val, addr)) return 0;                             \
++    return val;                                                                \
++}
++#define JIT_ACCESSOR_STORE(sz)                                                 \
++__attribute__((export_name("jit_write_" #sz)))                                 \
++int32_t jit_write_##sz(uint32_t state_ptr, uint64_t addr, uint64_t val)         \
++{                                                                              \
++    RISCVCPUState *s = (RISCVCPUState *)(uintptr_t)state_ptr;                   \
++    return target_write_##sz(s, addr, val);                                    \
++}
++JIT_ACCESSOR_LOAD(u8)
++JIT_ACCESSOR_LOAD(u16)
++JIT_ACCESSOR_LOAD(u32)
++JIT_ACCESSOR_LOAD(u64)
++JIT_ACCESSOR_STORE(u8)
++JIT_ACCESSOR_STORE(u16)
++JIT_ACCESSOR_STORE(u32)
++JIT_ACCESSOR_STORE(u64)
++#undef JIT_ACCESSOR_LOAD
++#undef JIT_ACCESSOR_STORE
++
++__attribute__((export_name("jit_get_pc")))
++uint64_t jit_get_pc(uint32_t state_ptr)
++{
++    return ((RISCVCPUState *)(uintptr_t)state_ptr)->pc;
++}
++
++__attribute__((export_name("jit_set_pc")))
++void jit_set_pc(uint32_t state_ptr, uint64_t pc)
++{
++    ((RISCVCPUState *)(uintptr_t)state_ptr)->pc = pc;
++}
++
++__attribute__((export_name("jit_regs_ptr")))
++uint32_t jit_regs_ptr(uint32_t state_ptr)
++{
++    return (uint32_t)(uintptr_t)((RISCVCPUState *)(uintptr_t)state_ptr)->reg;
++}
++
++__attribute__((export_name("jit_fp_read")))
++uint64_t jit_fp_read(uint32_t state_ptr, uint32_t idx)
++{
++    return ((RISCVCPUState *)(uintptr_t)state_ptr)->fp_reg[idx & 31];
++}
++
++__attribute__((export_name("jit_fp_write")))
++void jit_fp_write(uint32_t state_ptr, uint32_t idx, uint64_t val)
++{
++    ((RISCVCPUState *)(uintptr_t)state_ptr)->fp_reg[idx & 31] = val;
++}
++
++__attribute__((export_name("jit_csr_read")))
++uint64_t jit_csr_read(uint32_t state_ptr, uint32_t csr)
++{
++    RISCVCPUState *s = (RISCVCPUState *)(uintptr_t)state_ptr;
++    target_ulong val = 0;
++    if (csr_read(s, &val, csr, FALSE)) return UINT64_MAX;
++    return val;
++}
++
++__attribute__((export_name("jit_csr_write")))
++int32_t jit_csr_write(uint32_t state_ptr, uint32_t csr, uint64_t val)
++{
++    return csr_write((RISCVCPUState *)(uintptr_t)state_ptr, csr, val);
++}
++
++__attribute__((export_name("jit_get_cycles")))
++int32_t jit_get_cycles(uint32_t state_ptr)
++{
++    return ((RISCVCPUState *)(uintptr_t)state_ptr)->n_cycles;
++}
++
++__attribute__((export_name("jit_sub_cycles")))
++void jit_sub_cycles(uint32_t state_ptr, uint32_t cycles)
++{
++    ((RISCVCPUState *)(uintptr_t)state_ptr)->n_cycles -= cycles;
++}
++#endif
++
+ #if FLEN > 0
+ #include "softfp.h"
+ #endif

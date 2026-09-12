@@ -1,0 +1,43 @@
+diff --git a/riscv_cpu_template.h b/riscv_cpu_template.h
+index 5092062..a58c7f7 100644
+--- a/riscv_cpu_template.h
++++ b/riscv_cpu_template.h
+@@ -198,0 +199,11 @@ static inline uintx_t glue(mulhsu, XLEN)(intx_t a, uintx_t b)
++#define FAST_JUMP_INSN do {                                               \
++        target_ulong new_pc__ = s->pc;                                  \
++        target_ulong old_pc__ = GET_PC();                               \
++        if (likely(s->n_cycles > 0 &&                                   \
++                   (s->mip & s->mie) == 0 &&                            \
++                   ((new_pc__ ^ old_pc__) & ~(target_ulong)PG_MASK) == 0)) { \
++            code_ptr = (uint8_t *)((uintptr_t)new_pc__ - code_to_pc_addend); \
++            goto jump_insn;                                             \
++        }                                                               \
++        JUMP_INSN;                                                            \
++    } while (0)
+@@ -474 +485 @@ static void no_inline glue(riscv_cpu_interp_x, XLEN)(RISCVCPUState *s,
+-                JUMP_INSN;
++                FAST_JUMP_INSN;
+@@ -577 +588 @@ static void no_inline glue(riscv_cpu_interp_x, XLEN)(RISCVCPUState *s,
+-                JUMP_INSN;
++                FAST_JUMP_INSN;
+@@ -587 +598 @@ static void no_inline glue(riscv_cpu_interp_x, XLEN)(RISCVCPUState *s,
+-                    JUMP_INSN;
++                    FAST_JUMP_INSN;
+@@ -599 +610 @@ static void no_inline glue(riscv_cpu_interp_x, XLEN)(RISCVCPUState *s,
+-                    JUMP_INSN;
++                    FAST_JUMP_INSN;
+@@ -701 +712 @@ static void no_inline glue(riscv_cpu_interp_x, XLEN)(RISCVCPUState *s,
+-                        JUMP_INSN;
++                        FAST_JUMP_INSN;
+@@ -718 +729 @@ static void no_inline glue(riscv_cpu_interp_x, XLEN)(RISCVCPUState *s,
+-                            JUMP_INSN;
++                            FAST_JUMP_INSN;
+@@ -795 +806 @@ static void no_inline glue(riscv_cpu_interp_x, XLEN)(RISCVCPUState *s,
+-            JUMP_INSN;
++            FAST_JUMP_INSN;
+@@ -802 +813 @@ static void no_inline glue(riscv_cpu_interp_x, XLEN)(RISCVCPUState *s,
+-            JUMP_INSN;
++            FAST_JUMP_INSN;
+@@ -826 +837 @@ static void no_inline glue(riscv_cpu_interp_x, XLEN)(RISCVCPUState *s,
+-                JUMP_INSN;
++                FAST_JUMP_INSN;

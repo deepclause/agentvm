@@ -1,0 +1,28 @@
+# AgentVM image with the pi coding agent preinstalled.
+#
+# `image/preinstalled/usrlocal` is produced by image/preinstall-pi.sh (it runs
+# `npm install -g @earendil-works/pi-coding-agent` inside a working AgentVM and
+# exports the resulting /usr/local tree). Baking it in removes the runtime
+# five-minute npm install entirely.
+FROM alpine:3.21
+
+RUN apk add --no-cache \
+        python3 py3-pip \
+        nodejs npm \
+        bash curl git \
+        coreutils
+
+COPY --link preinstalled/usrlocal /usr/local
+
+# V8's concurrent GC threads contend on the emulated single hart. Disabling
+# concurrent GC measurably speeds Node CPU work and short-lived CLI startup.
+RUN rm -f /usr/local/bin/pi && \
+    printf '%s\n' '#!/bin/sh' \
+      'exec /usr/bin/node --single-threaded-gc /usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js "$@"' \
+      > /usr/local/bin/pi && \
+    chmod +x /usr/local/bin/pi && \
+    printf '%s\n' '#!/bin/sh' 'exec /usr/bin/node --single-threaded-gc "$@"' \
+      > /usr/local/bin/node && \
+    chmod +x /usr/local/bin/node
+
+CMD ["/bin/sh"]

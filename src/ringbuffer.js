@@ -22,7 +22,7 @@
  * 
  * Network Message Format in ring buffer:
  * ┌──────────┬──────────┬──────────────────────────────────────┐
- * │ Uint16   │ Uint8    │ Variable length                      │
+ * │ Uint32   │ Uint8    │ Variable length                      │
  * │ length   │ type     │ payload                              │
  * └──────────┴──────────┴──────────────────────────────────────┘
  */
@@ -42,6 +42,7 @@ const NET_RING_OFFSET = HEADER_SIZE + STDIN_AREA_SIZE;
 
 // Total buffer size: 32 + 4096 + 1MB = ~1MB
 const NET_RING_SIZE = 1024 * 1024;  // 1MB ring buffer for larger transfers
+const NET_CONTROL_RESERVE = 16 * 1024; // Data cannot starve FIN/error/DNS events
 const TOTAL_BUFFER_SIZE = HEADER_SIZE + STDIN_AREA_SIZE + NET_RING_SIZE;
 
 // Network message types
@@ -51,6 +52,7 @@ const NET_MSG_TCP_END = 3;
 const NET_MSG_TCP_ERROR = 4;
 const NET_MSG_TCP_CLOSE = 5;
 const NET_MSG_UDP_RECV = 6;
+const NET_MSG_DNS_RESULT = 7;
 
 /**
  * Ring buffer writer (used by main thread)
@@ -97,6 +99,14 @@ class RingBufferWriter {
         Atomics.notify(this.int32, IO_READY_INDEX);
     }
     
+    _writeRingBytes(position, bytes) {
+        const firstLength = Math.min(bytes.length, NET_RING_SIZE - position);
+        this.uint8.set(bytes.subarray(0, firstLength), NET_RING_OFFSET + position);
+        const remaining = bytes.length - firstLength;
+        if (remaining > 0) this.uint8.set(bytes.subarray(firstLength), NET_RING_OFFSET);
+        return (position + bytes.length) % NET_RING_SIZE;
+    }
+
     /**
      * Write a network message to the ring buffer
      * @param {number} type - Message type (NET_MSG_*)
@@ -104,32 +114,19 @@ class RingBufferWriter {
      * @returns {boolean} - True if written, false if no space
      */
     writeMessage(type, payload) {
-        const msgLen = 3 + payload.length; // 2 bytes length + 1 byte type + payload
-        
-        if (this.availableSpace() < msgLen) {
-            return false; // No space
+        const msgLen = 5 + payload.length; // 4 bytes length + 1 byte type + payload
+        if (msgLen >= NET_RING_SIZE || this.availableSpace() < msgLen) {
+            return false;
         }
-        
+
+        const header = Buffer.allocUnsafe(5);
+        header.writeUInt32LE(payload.length, 0);
+        header[4] = type;
         let head = Atomics.load(this.int32, NET_HEAD_INDEX);
-        const ringStart = NET_RING_OFFSET;
-        
-        // Write length (2 bytes, little-endian)
-        this.uint8[ringStart + head] = payload.length & 0xFF;
-        head = (head + 1) % NET_RING_SIZE;
-        this.uint8[ringStart + head] = (payload.length >> 8) & 0xFF;
-        head = (head + 1) % NET_RING_SIZE;
-        
-        // Write type (1 byte)
-        this.uint8[ringStart + head] = type;
-        head = (head + 1) % NET_RING_SIZE;
-        
-        // Write payload
-        for (let i = 0; i < payload.length; i++) {
-            this.uint8[ringStart + head] = payload[i];
-            head = (head + 1) % NET_RING_SIZE;
-        }
-        
-        // Update head atomically and signal
+        head = this._writeRingBytes(head, header);
+        head = this._writeRingBytes(head, payload);
+
+        // Publish only after both bulk copies are complete.
         Atomics.store(this.int32, NET_HEAD_INDEX, head);
         Atomics.add(this.int32, IO_READY_INDEX, 1);
         Atomics.notify(this.int32, IO_READY_INDEX);
@@ -160,7 +157,7 @@ class RingBufferWriter {
         // Max payload size is 65535 - 1 (keyLen) - keyBytes.length
         // Use 60000 as safe chunk size to leave room for header
         const maxDataPerChunk = 60000;
-        const perChunkOverhead = 3 + 1 + keyBytes.length; // 3 bytes msg header + 1 keyLen + key
+        if (keyBytes.length > 255) return 0;
         
         let bytesWritten = 0;
         
@@ -168,10 +165,11 @@ class RingBufferWriter {
             const remaining = data.length - offset - bytesWritten;
             const chunkSize = Math.min(maxDataPerChunk, remaining);
             const payloadSize = 1 + keyBytes.length + chunkSize;
-            const msgSize = 3 + payloadSize;
+            const msgSize = 5 + payloadSize;
             
-            // Check if we have space for at least one chunk
-            if (!this.hasSpace(msgSize)) {
+            // Leave room for connection state, DNS, and UDP messages. Without
+            // this reserve a full data ring can permanently lose TCP END.
+            if (!this.hasSpace(msgSize + NET_CONTROL_RESERVE)) {
                 break; // No space, return what we've written so far
             }
             
@@ -227,34 +225,55 @@ class RingBufferWriter {
     }
     
     /**
-     * Write UDP receive event
-     * @param {Object} msg - UDP message with data, srcIP, srcPort, dstIP, dstPort
+     * Write a DNS lookup result
+     * @param {Object} msg - { key, name, qtype, ips, error }
+     */
+    writeDnsResult(msg) {
+        const keyB = Buffer.from(String(msg.key || ''), 'utf8');
+        const nameB = Buffer.from(String(msg.name || ''), 'utf8');
+        const errB = Buffer.from(String(msg.error || ''), 'utf8');
+        const ipList = (msg.ips || []).map((ip) => String(ip));
+        let ipBytes = 0;
+        for (const ip of ipList) ipBytes += 2 + Buffer.byteLength(ip);
+
+        const payload = Buffer.alloc(
+            1 + keyB.length +
+            1 + nameB.length +
+            2 +
+            1 + (msg.error ? 1 + errB.length : 0) +
+            1 + ipBytes
+        );
+        let o = 0;
+        payload[o++] = keyB.length; keyB.copy(payload, o); o += keyB.length;
+        payload[o++] = nameB.length; nameB.copy(payload, o); o += nameB.length;
+        payload.writeUInt16LE(msg.qtype || 0, o); o += 2;
+        payload[o++] = msg.error ? 1 : 0;
+        if (msg.error) { payload[o++] = errB.length; errB.copy(payload, o); o += errB.length; }
+        payload[o++] = ipList.length;
+        for (const ip of ipList) {
+            const family = ip.includes(':') ? 6 : 4;
+            const b = Buffer.from(ip, 'utf8');
+            payload[o++] = family;
+            payload[o++] = b.length;
+            b.copy(payload, o); o += b.length;
+        }
+        return this.writeMessage(NET_MSG_DNS_RESULT, payload);
+    }
+
+    /**
+     * Write a UDP datagram received by an existing NAT flow.
+     * @param {Object} msg - { key, data }
      */
     writeUdpRecv(msg) {
-        // Format: srcIPLen(1) + srcIP + srcPort(2) + dstIPLen(1) + dstIP + dstPort(2) + data
-        const srcIPBytes = Buffer.from(msg.srcIP, 'utf8');
-        const dstIPBytes = Buffer.from(msg.dstIP, 'utf8');
+        // Format: keyLen(1) + key + data. Endpoint metadata lives in the
+        // worker's flow table, which also prevents spoofed reply addresses.
+        const keyBytes = Buffer.from(msg.key, 'utf8');
+        if (keyBytes.length > 255) return false;
         const dataBytes = Buffer.isBuffer(msg.data) ? msg.data : Buffer.from(msg.data);
-        
-        const payload = Buffer.alloc(1 + srcIPBytes.length + 2 + 1 + dstIPBytes.length + 2 + dataBytes.length);
-        let offset = 0;
-        
-        payload[offset++] = srcIPBytes.length;
-        srcIPBytes.copy(payload, offset);
-        offset += srcIPBytes.length;
-        
-        payload.writeUInt16LE(msg.srcPort, offset);
-        offset += 2;
-        
-        payload[offset++] = dstIPBytes.length;
-        dstIPBytes.copy(payload, offset);
-        offset += dstIPBytes.length;
-        
-        payload.writeUInt16LE(msg.dstPort, offset);
-        offset += 2;
-        
-        dataBytes.copy(payload, offset);
-        
+        const payload = Buffer.alloc(1 + keyBytes.length + dataBytes.length);
+        payload[0] = keyBytes.length;
+        keyBytes.copy(payload, 1);
+        dataBytes.copy(payload, 1 + keyBytes.length);
         return this.writeMessage(NET_MSG_UDP_RECV, payload);
     }
     
@@ -344,23 +363,33 @@ class RingBufferReader {
         
         const ringStart = NET_RING_OFFSET;
         
-        // Read length (2 bytes, little-endian)
-        const lenLow = this.uint8[ringStart + tail];
-        tail = (tail + 1) % NET_RING_SIZE;
-        const lenHigh = this.uint8[ringStart + tail];
-        tail = (tail + 1) % NET_RING_SIZE;
-        const payloadLen = lenLow | (lenHigh << 8);
+        // Read length (4 bytes, little-endian)
+        let payloadLen = 0;
+        for (let shift = 0; shift < 32; shift += 8) {
+            payloadLen += this.uint8[ringStart + tail] * (2 ** shift);
+            tail = (tail + 1) % NET_RING_SIZE;
+        }
+        if (payloadLen > NET_RING_SIZE - 6) {
+            // Shared-memory corruption: drop queued data instead of allocating
+            // an unbounded payload.
+            Atomics.store(this.int32, NET_TAIL_INDEX, head);
+            return null;
+        }
         
         // Read type (1 byte)
         const type = this.uint8[ringStart + tail];
         tail = (tail + 1) % NET_RING_SIZE;
         
-        // Read payload
-        const payload = Buffer.alloc(payloadLen);
-        for (let i = 0; i < payloadLen; i++) {
-            payload[i] = this.uint8[ringStart + tail];
-            tail = (tail + 1) % NET_RING_SIZE;
+        // Copy the payload in at most two operations instead of executing one
+        // JavaScript loop iteration per network byte.
+        const payload = Buffer.allocUnsafe(payloadLen);
+        const firstLength = Math.min(payloadLen, NET_RING_SIZE - tail);
+        payload.set(this.uint8.subarray(ringStart + tail, ringStart + tail + firstLength), 0);
+        const remaining = payloadLen - firstLength;
+        if (remaining > 0) {
+            payload.set(this.uint8.subarray(ringStart, ringStart + remaining), firstLength);
         }
+        tail = (tail + payloadLen) % NET_RING_SIZE;
         
         // Update tail atomically
         Atomics.store(this.int32, NET_TAIL_INDEX, tail);
@@ -402,30 +431,39 @@ class RingBufferReader {
     }
     
     /**
-     * Parse UDP recv message
-     * @param {Buffer} payload 
-     * @returns {Object} - { srcIP, srcPort, dstIP, dstPort, data }
+     * Parse DNS result message
+     * @param {Buffer} payload
+     * @returns {Object} - { key, name, qtype, ips, error }
      */
+    parseDnsResult(payload) {
+        let o = 0;
+        const keyLen = payload[o++];
+        const key = payload.slice(o, o + keyLen).toString('utf8'); o += keyLen;
+        const nameLen = payload[o++];
+        const name = payload.slice(o, o + nameLen).toString('utf8'); o += nameLen;
+        const qtype = payload.readUInt16LE(o); o += 2;
+        const hasError = payload[o++];
+        let error = null;
+        if (hasError) {
+            const errLen = payload[o++];
+            error = payload.slice(o, o + errLen).toString('utf8'); o += errLen;
+        }
+        const count = payload[o++];
+        const ips = [];
+        for (let i = 0; i < count; i++) {
+            o++; // family (unused by the caller, the IP string is authoritative)
+            const ipLen = payload[o++];
+            ips.push(payload.slice(o, o + ipLen).toString('utf8')); o += ipLen;
+        }
+        return { key, name, qtype, ips, error };
+    }
+
+    /** Parse a UDP receive message: { key, data }. */
     parseUdpRecv(payload) {
-        let offset = 0;
-        
-        const srcIPLen = payload[offset++];
-        const srcIP = payload.slice(offset, offset + srcIPLen).toString('utf8');
-        offset += srcIPLen;
-        
-        const srcPort = payload.readUInt16LE(offset);
-        offset += 2;
-        
-        const dstIPLen = payload[offset++];
-        const dstIP = payload.slice(offset, offset + dstIPLen).toString('utf8');
-        offset += dstIPLen;
-        
-        const dstPort = payload.readUInt16LE(offset);
-        offset += 2;
-        
-        const data = payload.slice(offset);
-        
-        return { srcIP, srcPort, dstIP, dstPort, data };
+        const keyLen = payload[0];
+        const key = payload.slice(1, 1 + keyLen).toString('utf8');
+        const data = payload.slice(1 + keyLen);
+        return { key, data };
     }
     
     /**
@@ -475,5 +513,6 @@ module.exports = {
     NET_MSG_TCP_END,
     NET_MSG_TCP_ERROR,
     NET_MSG_TCP_CLOSE,
-    NET_MSG_UDP_RECV
+    NET_MSG_UDP_RECV,
+    NET_MSG_DNS_RESULT
 };
