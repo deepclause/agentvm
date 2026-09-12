@@ -183,10 +183,22 @@ class RiscVBlockJit {
         this._endStore(out, rd);
     }
 
-    _emitReturn(out, target) {
+    // Return startPc + offset. startPc is local 2.
+    _emitReturnRel(out, offset) {
+        out.push(Buffer.from([0x20, 0x02])); // local.get 2 (start pc)
         out.push(Buffer.from([0x41])); // i32.const
-        out.push(s32leb(target));
+        out.push(s32leb(offset));
+        out.push(Buffer.from([0x6a])); // i32.add
         out.push(Buffer.from([0x0f])); // return
+    }
+
+    // Push (startPc + offset) as i64.
+    _emitPcConst(out, offset) {
+        out.push(Buffer.from([0x20, 0x02])); // local.get 2
+        out.push(Buffer.from([0x41])); // i32.const
+        out.push(s32leb(offset));
+        out.push(Buffer.from([0x6a])); // i32.add
+        out.push(Buffer.from([0xad])); // i64.extend_i32_u
     }
 
     _emitConditionalBranch(out, opcode, rs1, rs2, target) {
@@ -194,7 +206,7 @@ class RiscVBlockJit {
         this._loadReg(out, rs2);
         out.push(Buffer.from([opcode])); // i64 comparison -> i32
         out.push(Buffer.from([0x04, 0x40])); // if (empty block type)
-        this._emitReturn(out, target);
+        this._emitReturnRel(out, target);
         out.push(Buffer.from([0x0b])); // end if
     }
 
@@ -284,8 +296,9 @@ class RiscVBlockJit {
                 break;
             }
             case 0x17: { // AUIPC
+                const immUpper = sext(insn & 0xfffff000, 32);
                 this._beginStore(out, rd);
-                this._const64(out, (pc + sext(insn & 0xfffff000, 32)));
+                this._emitPcConst(out, pc + immUpper);
                 this._endStore(out, rd);
                 break;
             }
@@ -298,14 +311,14 @@ class RiscVBlockJit {
                     21,
                 );
                 this._beginStore(out, rd);
-                this._const64(out, pc + 4);
+                this._emitPcConst(out, pc + 4);
                 this._endStore(out, rd);
-                this._emitReturn(out, pc + imm);
+                this._emitReturnRel(out, pc + imm);
                 break;
             }
             case 0x67: { // JALR
                 this._beginStore(out, rd);
-                this._const64(out, pc + 4);
+                this._emitPcConst(out, pc + 4);
                 this._endStore(out, rd);
                 this._loadReg(out, rs1);
                 this._const64(out, immI);
@@ -370,4 +383,23 @@ class RiscVBlockJit {
     }
 }
 
-module.exports = { RiscVBlockJit, u32leb, s32leb, s64leb, sext };
+function decodeBlock(code, pc) {
+    const instructions = [];
+    const supported = new Set([0x13, 0x33, 0x03, 0x23, 0x37, 0x17, 0x6f, 0x67, 0x63]);
+    let cursor = pc;
+    while (cursor / 4 < code.length) {
+        const insn = code[cursor / 4] >>> 0;
+        const opcode = insn & 0x7f;
+        if (!supported.has(opcode)) {
+            return { instructions, terminal: 'unsupported', nextPc: cursor, opcode };
+        }
+        instructions.push(insn);
+        if (opcode === 0x63 || opcode === 0x6f || opcode === 0x67) {
+            return { instructions, terminal: opcode === 0x63 ? 'branch' : opcode === 0x6f ? 'jal' : 'jalr', nextPc: cursor + 4 };
+        }
+        cursor += 4;
+    }
+    return { instructions, terminal: 'fallthrough', nextPc: cursor };
+}
+
+module.exports = { RiscVBlockJit, decodeBlock, u32leb, s32leb, s64leb, sext };
