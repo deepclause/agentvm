@@ -69,26 +69,65 @@ function sext(value, bits) {
 }
 
 class RiscVBlockJit {
-    constructor(instructions, sizes = null) {
+    constructor(instructions, sizes = null, options = {}) {
         this.instructions = instructions;
         this.sizes = sizes || instructions.map(() => 4);
+        this.externalMemory = !!options.externalMemory;
     }
 
     _typeSection() {
-        return section(1, Buffer.concat([
-            u32leb(1),               // one type
-            Buffer.from([0x60]),     // func
-            u32leb(3), Buffer.from([0x7f, 0x7f, 0x7e]), // regs base, mem base, start pc (i64)
-            u32leb(1), Buffer.from([0x7e]), // one i64 result: next pc
+        const parts = [];
+        const runParams = this.externalMemory
+            ? [0x7f, 0x7f, 0x7e, 0x7f] // regs, mem, pc (i64), statePtr
+            : [0x7f, 0x7f, 0x7e];
+        parts.push(Buffer.concat([
+            Buffer.from([0x60]), u32leb(runParams.length), Buffer.from(runParams),
+            u32leb(1), Buffer.from([0x7e]),
         ]));
+        if (this.externalMemory) {
+            parts.push(Buffer.concat([
+                Buffer.from([0x60]),
+                u32leb(3), Buffer.from([0x7f, 0x7e, 0x7f]), // load(statePtr, addr, size)
+                u32leb(1), Buffer.from([0x7e]),
+            ]));
+            parts.push(Buffer.concat([
+                Buffer.from([0x60]),
+                u32leb(4), Buffer.from([0x7f, 0x7e, 0x7f, 0x7e]), // store(statePtr, addr, size, val)
+                u32leb(1), Buffer.from([0x7f]),
+            ]));
+        }
+        return section(1, Buffer.concat([u32leb(parts.length), ...parts]));
     }
 
     _importSection() {
-        return section(2, Buffer.concat([
-            u32leb(1),
+        if (!this.externalMemory) {
+            return section(2, Buffer.concat([
+                u32leb(1),
+                stringBytes('env'),
+                stringBytes('memory'),
+                Buffer.from([0x02, 0x00, 0x01]), // memory, min 1 page
+            ]));
+        }
+        const envMemory = Buffer.concat([
             stringBytes('env'),
             stringBytes('memory'),
-            Buffer.from([0x02, 0x00, 0x01]), // memory, min 1 page
+            Buffer.from([0x02, 0x00, 0x01]),
+        ]);
+        const envLoad = Buffer.concat([
+            stringBytes('env'),
+            stringBytes('load'),
+            Buffer.from([0x00]), u32leb(1),
+        ]);
+        const envStore = Buffer.concat([
+            stringBytes('env'),
+            stringBytes('store'),
+            Buffer.from([0x00]), u32leb(2),
+        ]);
+        return section(2, Buffer.concat([
+            u32leb(3),
+            envMemory,
+            envLoad,
+            envStore,
         ]));
     }
 
@@ -101,11 +140,13 @@ class RiscVBlockJit {
             ...functions.map(() => u32leb(0)),
         ]));
 
+        // Imported functions occupy indices before defined functions.
+        const functionIndexBase = this.externalMemory ? 2 : 0;
         const exportParts = [u32leb(functions.length)];
         functions.forEach((_, i) => {
             exportParts.push(stringBytes(exportNames[i] || `run_${i}`));
             exportParts.push(Buffer.from([0x00])); // function
-            exportParts.push(u32leb(i));
+            exportParts.push(u32leb(functionIndexBase + i));
         });
         const exportSection = section(7, Buffer.concat(exportParts));
 
@@ -249,14 +290,38 @@ class RiscVBlockJit {
         out.push(Buffer.from([0x6a])); // i32.add
     }
 
-    _emitLoad(out, rd, rs1, imm, opcode) {
+    _emitLoad(out, rd, rs1, imm, opcode, size) {
+        if (this.externalMemory) {
+            this._beginStore(out, rd);
+            out.push(Buffer.from([0x20, 0x03])); // local.get 3 (statePtr)
+            this._loadReg(out, rs1);
+            this._const64(out, imm);
+            out.push(Buffer.from([0x7c])); // i64.add
+            out.push(Buffer.from([0x41])); // i32.const size
+            out.push(s32leb(size));
+            out.push(Buffer.from([0x10, 0x00])); // call 0 (env.load)
+            this._endStore(out, rd);
+            return;
+        }
         this._beginStore(out, rd);
         this._emitAddress(out, rs1, imm);
         out.push(Buffer.from([opcode, 0x00, 0x00])); // load, align=0 offset=0
         this._endStore(out, rd);
     }
 
-    _emitStore(out, rs1, rs2, imm, opcode) {
+    _emitStore(out, rs1, rs2, imm, opcode, size) {
+        if (this.externalMemory) {
+            out.push(Buffer.from([0x20, 0x03])); // local.get 3 (statePtr)
+            this._loadReg(out, rs1);
+            this._const64(out, imm);
+            out.push(Buffer.from([0x7c])); // i64.add
+            out.push(Buffer.from([0x41])); // i32.const size
+            out.push(s32leb(size));
+            this._loadReg(out, rs2);
+            out.push(Buffer.from([0x10, 0x01])); // call 1 (env.store)
+            out.push(Buffer.from([0x1a]));       // drop result
+            return;
+        }
         this._emitAddress(out, rs1, imm);
         this._loadReg(out, rs2);
         out.push(Buffer.from([opcode, 0x00, 0x00])); // store, align=0 offset=0
@@ -443,7 +508,8 @@ class RiscVBlockJit {
                 };
                 const loadOpcode = loads[funct3];
                 if (loadOpcode === undefined) throw new Error(`unsupported LOAD funct3=${funct3}`);
-                this._emitLoad(out, rd, rs1, immI, loadOpcode);
+                const loadSize = [1, 2, 4, 8, 1, 2, 4][funct3];
+                this._emitLoad(out, rd, rs1, immI, loadOpcode, loadSize);
                 break;
             }
             case 0x23: { // STORE
@@ -455,7 +521,8 @@ class RiscVBlockJit {
                 };
                 const storeOpcode = stores[funct3];
                 if (storeOpcode === undefined) throw new Error(`unsupported STORE funct3=${funct3}`);
-                this._emitStore(out, rs1, rs2, immS, storeOpcode);
+                const storeSize = [1, 2, 4, 8][funct3];
+                this._emitStore(out, rs1, rs2, immS, storeOpcode, storeSize);
                 break;
             }
             case 0x63: { // BRANCH
