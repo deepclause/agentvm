@@ -14,7 +14,8 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="${1:-$HERE/agentvm-alpine-python-node.wasm}"
-IMAGE_NAME="agentvm-alpine-python-node:riscv64"
+DOCKERFILE="${DOCKERFILE:-Dockerfile.acceptance}"
+IMAGE_NAME="${IMAGE_NAME:-agentvm-alpine-python-node:riscv64}"
 C2W="${C2W:-c2w}"
 # Guest RAM. The writable overlay (and /run tmpfs) default to ~half of this,
 # so the pi coding agent needs substantially more than the 128 MiB default.
@@ -31,7 +32,7 @@ echo "==> Building riscv64 source image: $IMAGE_NAME"
 docker buildx build \
     --platform linux/riscv64 \
     -t "$IMAGE_NAME" \
-    -f "$HERE/Dockerfile.acceptance" \
+    -f "$HERE/$DOCKERFILE" \
     --load \
     "$HERE"
 

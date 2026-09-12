@@ -1,0 +1,17 @@
+# AgentVM image with the pi coding agent preinstalled.
+#
+# `image/preinstalled/usrlocal` is produced by image/preinstall-pi.sh (it runs
+# `npm install -g @earendil-works/pi-coding-agent` inside a working AgentVM and
+# exports the resulting /usr/local tree). Baking it in removes the runtime
+# five-minute npm install entirely.
+FROM alpine:3.21
+
+RUN apk add --no-cache \
+        python3 py3-pip \
+        nodejs npm \
+        bash curl git \
+        coreutils
+
+COPY --link preinstalled/usrlocal /usr/local
+
+CMD ["/bin/sh"]
