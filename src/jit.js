@@ -82,7 +82,7 @@ class RiscVBlockJit {
         const typeSection = section(1, Buffer.concat([
             u32leb(1),               // one type
             Buffer.from([0x60]),     // func
-            u32leb(2), Buffer.from([0x7f, 0x7f]), // two i32 params: regs base, start pc
+            u32leb(3), Buffer.from([0x7f, 0x7f, 0x7f]), // regs base, mem base, start pc
             u32leb(1), Buffer.from([0x7f]), // one i32 result: next pc
         ]));
 
@@ -128,7 +128,7 @@ class RiscVBlockJit {
         }
 
         // Fall through: return startPc + 4 * instruction count.
-        out.push(Buffer.from([0x20, 0x01])); // local.get 1 (start pc)
+        out.push(Buffer.from([0x20, 0x02])); // local.get 2 (start pc)
         out.push(Buffer.from([0x41]));
         out.push(s32leb(pc));
         out.push(Buffer.from([0x6a])); // i32.add
@@ -198,6 +198,29 @@ class RiscVBlockJit {
         out.push(Buffer.from([0x0b])); // end if
     }
 
+    _emitAddress(out, rs1, imm) {
+        // (memBase + (rs1 + imm)) as i32, truncated to 32 bits.
+        out.push(Buffer.from([0x20, 0x01])); // local.get 1 (mem base)
+        this._loadReg(out, rs1);
+        this._const64(out, imm);
+        out.push(Buffer.from([0x7c])); // i64.add
+        out.push(Buffer.from([0xa7])); // i32.wrap_i64
+        out.push(Buffer.from([0x6a])); // i32.add
+    }
+
+    _emitLoad(out, rd, rs1, imm, opcode) {
+        this._beginStore(out, rd);
+        this._emitAddress(out, rs1, imm);
+        out.push(Buffer.from([opcode, 0x00, 0x00])); // load, align=0 offset=0
+        this._endStore(out, rd);
+    }
+
+    _emitStore(out, rs1, rs2, imm, opcode) {
+        this._emitAddress(out, rs1, imm);
+        this._loadReg(out, rs2);
+        out.push(Buffer.from([opcode, 0x00, 0x00])); // store, align=0 offset=0
+    }
+
     _emitInstruction(out, insn, pc) {
         const opcode = insn & 0x7f;
         const rd = (insn >>> 7) & 0x1f;
@@ -206,6 +229,7 @@ class RiscVBlockJit {
         const funct3 = (insn >>> 12) & 7;
         const funct7 = (insn >>> 25) & 0x7f;
         const immI = sext((insn >>> 20) & 0xfff, 12);
+        const immS = sext(((insn >>> 25) << 5) | ((insn >>> 7) & 0x1f), 12);
 
         switch (opcode) {
             case 0x13: { // OP-IMM
@@ -290,6 +314,33 @@ class RiscVBlockJit {
                 out.push(Buffer.from([0x83])); // i64.and (mask ~1)
                 out.push(Buffer.from([0xa7])); // i32.wrap_i64
                 out.push(Buffer.from([0x0f])); // return
+                break;
+            }
+            case 0x03: { // LOAD
+                const loads = {
+                    0: 0x30, // lb  (i64.load8_s)
+                    1: 0x32, // lh  (i64.load16_s)
+                    2: 0x34, // lw  (i64.load32_s)
+                    3: 0x29, // ld  (i64.load)
+                    4: 0x31, // lbu (i64.load8_u)
+                    5: 0x33, // lhu (i64.load16_u)
+                    6: 0x35, // lwu (i64.load32_u)
+                };
+                const loadOpcode = loads[funct3];
+                if (loadOpcode === undefined) throw new Error(`unsupported LOAD funct3=${funct3}`);
+                this._emitLoad(out, rd, rs1, immI, loadOpcode);
+                break;
+            }
+            case 0x23: { // STORE
+                const stores = {
+                    0: 0x3c, // sb (i64.store8)
+                    1: 0x3d, // sh (i64.store16)
+                    2: 0x3e, // sw (i64.store32)
+                    3: 0x37, // sd (i64.store)
+                };
+                const storeOpcode = stores[funct3];
+                if (storeOpcode === undefined) throw new Error(`unsupported STORE funct3=${funct3}`);
+                this._emitStore(out, rs1, rs2, immS, storeOpcode);
                 break;
             }
             case 0x63: { // BRANCH
