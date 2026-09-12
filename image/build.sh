@@ -42,6 +42,7 @@ git -C "$WORK/tinyemu" checkout -q "$TINYEMU_REV"
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-fence-tso.patch"
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-low-risk-performance.patch"
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-rv64-only.patch"
+git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-jit-exports.patch"
 # Generated without context to avoid preserving upstream trailing whitespace.
 git -C "$WORK/tinyemu" apply --unidiff-zero "$HERE/patches/tinyemu-fast-branch.patch"
 rm -rf "$WORK/tinyemu/.git"
@@ -84,7 +85,7 @@ new_objects = "riscv_machine.o softfp.o riscv_cpu64.o fs_disk.o"
 assert s.count(old_objects) == 1, "unexpected TinyEMU object list"
 s = s.replace(old_objects, new_objects)
 old_cc = "-D_WASI_EMULATED_SIGNAL -DWASI -I/tools/wizer/include/"
-new_cc = "-D_WASI_EMULATED_SIGNAL -DWASI -DCONFIG_RISCV_ONLY_64 -I/tools/wizer/include/"
+new_cc = "-D_WASI_EMULATED_SIGNAL -DWASI -DCONFIG_RISCV_ONLY_64 -DCONFIG_JIT -I/tools/wizer/include/"
 assert s.count(old_cc) == 1, "unexpected TinyEMU compiler command"
 s = s.replace(old_cc, new_cc)
 

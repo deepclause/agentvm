@@ -1,0 +1,68 @@
+diff --git a/riscv_cpu.c b/riscv_cpu.c
+index 4499cb9..6871539 100644
+--- a/riscv_cpu.c
++++ b/riscv_cpu.c
+@@ -50,6 +50,63 @@
+ 
+ #include "riscv_cpu_priv.h"
+ 
++#ifdef CONFIG_JIT
++/* Host-side JIT accessors. The host JavaScript decoder/translator uses these
++   exported functions to read guest memory and registers through TinyEMU's own
++   MMU/TLB, so translated blocks stay correct without duplicating translation. */
++#define JIT_ACCESSOR_LOAD(sz)                                                 \
++__attribute__((export_name("jit_read_" #sz)))                                  \
++uint64_t jit_read_##sz(uint32_t state_ptr, uint64_t addr)                       \
++{                                                                              \
++    RISCVCPUState *s = (RISCVCPUState *)(uintptr_t)state_ptr;                   \
++    uint64_t val = 0;                                                          \
++    if (target_read_##sz(s, &val, addr)) return 0;                             \
++    return val;                                                                \
++}
++#define JIT_ACCESSOR_STORE(sz)                                                 \
++__attribute__((export_name("jit_write_" #sz)))                                 \
++int32_t jit_write_##sz(uint32_t state_ptr, uint64_t addr, uint64_t val)         \
++{                                                                              \
++    RISCVCPUState *s = (RISCVCPUState *)(uintptr_t)state_ptr;                   \
++    return target_write_##sz(s, addr, val);                                    \
++}
++JIT_ACCESSOR_LOAD(u8)
++JIT_ACCESSOR_LOAD(u16)
++JIT_ACCESSOR_LOAD(u32)
++JIT_ACCESSOR_LOAD(u64)
++JIT_ACCESSOR_STORE(u8)
++JIT_ACCESSOR_STORE(u16)
++JIT_ACCESSOR_STORE(u32)
++JIT_ACCESSOR_STORE(u64)
++#undef JIT_ACCESSOR_LOAD
++#undef JIT_ACCESSOR_STORE
++
++__attribute__((export_name("jit_get_pc")))
++uint64_t jit_get_pc(uint32_t state_ptr)
++{
++    return ((RISCVCPUState *)(uintptr_t)state_ptr)->pc;
++}
++
++__attribute__((export_name("jit_set_pc")))
++void jit_set_pc(uint32_t state_ptr, uint64_t pc)
++{
++    ((RISCVCPUState *)(uintptr_t)state_ptr)->pc = pc;
++}
++
++__attribute__((export_name("jit_get_reg")))
++uint64_t jit_get_reg(uint32_t state_ptr, uint32_t idx)
++{
++    return ((RISCVCPUState *)(uintptr_t)state_ptr)->reg[idx & 31];
++}
++
++__attribute__((export_name("jit_set_reg")))
++void jit_set_reg(uint32_t state_ptr, uint32_t idx, uint64_t val)
++{
++    if ((idx & 31) != 0)
++        ((RISCVCPUState *)(uintptr_t)state_ptr)->reg[idx & 31] = val;
++}
++#endif
++
+ #if FLEN > 0
+ #include "softfp.h"
+ #endif
