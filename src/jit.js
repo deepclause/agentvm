@@ -82,8 +82,8 @@ class RiscVBlockJit {
         const typeSection = section(1, Buffer.concat([
             u32leb(1),               // one type
             Buffer.from([0x60]),     // func
-            u32leb(1), Buffer.from([0x7f]), // one i32 param (register base)
-            u32leb(1), Buffer.from([0x7f]), // one i32 result (always 0)
+            u32leb(2), Buffer.from([0x7f, 0x7f]), // two i32 params: regs base, start pc
+            u32leb(1), Buffer.from([0x7f]), // one i32 result: next pc
         ]));
 
         const importSection = section(2, Buffer.concat([
@@ -121,12 +121,19 @@ class RiscVBlockJit {
         const out = [];
         out.push(Buffer.from([0x00])); // zero locals
 
+        let pc = 0;
         for (const insn of this.instructions) {
-            this._emitInstruction(out, insn);
+            this._emitInstruction(out, insn, pc);
+            pc += 4;
         }
 
-        out.push(Buffer.from([0x41, 0x00])); // i32.const 0
-        out.push(Buffer.from([0x0b]));       // end
+        // Fall through: return startPc + 4 * instruction count.
+        out.push(Buffer.from([0x20, 0x01])); // local.get 1 (start pc)
+        out.push(Buffer.from([0x41]));
+        out.push(s32leb(pc));
+        out.push(Buffer.from([0x6a])); // i32.add
+        out.push(Buffer.from([0x0f])); // return
+        out.push(Buffer.from([0x0b])); // end
         return Buffer.concat(out);
     }
 
@@ -146,8 +153,13 @@ class RiscVBlockJit {
         this._regAddr(out, reg);
     }
 
-    _endStore(out) {
-        out.push(Buffer.from([0x37, 0x03, 0x00])); // i64.store align=3 offset=0
+    _endStore(out, reg) {
+        if (reg === 0) {
+            // Writes to x0 are discarded; drop both address and value.
+            out.push(Buffer.from([0x1a, 0x1a]));
+        } else {
+            out.push(Buffer.from([0x37, 0x03, 0x00])); // i64.store align=3 offset=0
+        }
     }
 
     _const64(out, value) {
@@ -160,7 +172,7 @@ class RiscVBlockJit {
         this._loadReg(out, rs1);
         this._loadReg(out, rs2);
         out.push(Buffer.from([opcode]));
-        this._endStore(out);
+        this._endStore(out, rd);
     }
 
     _emitBinaryImm(out, opcode, rd, rs1, imm) {
@@ -168,10 +180,25 @@ class RiscVBlockJit {
         this._loadReg(out, rs1);
         this._const64(out, imm);
         out.push(Buffer.from([opcode]));
-        this._endStore(out);
+        this._endStore(out, rd);
     }
 
-    _emitInstruction(out, insn) {
+    _emitReturn(out, target) {
+        out.push(Buffer.from([0x41])); // i32.const
+        out.push(s32leb(target));
+        out.push(Buffer.from([0x0f])); // return
+    }
+
+    _emitConditionalBranch(out, opcode, rs1, rs2, target) {
+        this._loadReg(out, rs1);
+        this._loadReg(out, rs2);
+        out.push(Buffer.from([opcode])); // i64 comparison -> i32
+        out.push(Buffer.from([0x04, 0x40])); // if (empty block type)
+        this._emitReturn(out, target);
+        out.push(Buffer.from([0x0b])); // end if
+    }
+
+    _emitInstruction(out, insn, pc) {
         const opcode = insn & 0x7f;
         const rd = (insn >>> 7) & 0x1f;
         const rs1 = (insn >>> 15) & 0x1f;
@@ -194,7 +221,7 @@ class RiscVBlockJit {
                         this._loadReg(out, rs1);
                         this._const64(out, immI & 0x3f);
                         out.push(Buffer.from([0x86])); // i64.shl
-                        this._endStore(out);
+                        this._endStore(out, rd);
                         break;
                     }
                     case 5: {
@@ -203,7 +230,7 @@ class RiscVBlockJit {
                         this._loadReg(out, rs1);
                         this._const64(out, immI & 0x3f);
                         out.push(Buffer.from([isArithmetic ? 0x87 : 0x88])); // i64.shr_s / shr_u
-                        this._endStore(out);
+                        this._endStore(out, rd);
                         break;
                     }
                     default:
@@ -229,13 +256,61 @@ class RiscVBlockJit {
             case 0x37: { // LUI
                 this._beginStore(out, rd);
                 this._const64(out, sext(insn & 0xfffff000, 32));
-                this._endStore(out);
+                this._endStore(out, rd);
                 break;
             }
-            case 0x17: { // AUIPC (no PC tracking yet; treated as imm)
+            case 0x17: { // AUIPC
                 this._beginStore(out, rd);
-                this._const64(out, sext(insn & 0xfffff000, 32));
-                this._endStore(out);
+                this._const64(out, (pc + sext(insn & 0xfffff000, 32)));
+                this._endStore(out, rd);
+                break;
+            }
+            case 0x6f: { // JAL
+                const imm = sext(
+                    (((insn >>> 31) & 1) << 20) |
+                    (((insn >>> 12) & 0xff) << 12) |
+                    (((insn >>> 20) & 1) << 11) |
+                    (((insn >>> 21) & 0x3ff) << 1),
+                    21,
+                );
+                this._beginStore(out, rd);
+                this._const64(out, pc + 4);
+                this._endStore(out, rd);
+                this._emitReturn(out, pc + imm);
+                break;
+            }
+            case 0x67: { // JALR
+                this._beginStore(out, rd);
+                this._const64(out, pc + 4);
+                this._endStore(out, rd);
+                this._loadReg(out, rs1);
+                this._const64(out, immI);
+                out.push(Buffer.from([0x7c])); // i64.add
+                this._const64(out, -2n);
+                out.push(Buffer.from([0x83])); // i64.and (mask ~1)
+                out.push(Buffer.from([0xa7])); // i32.wrap_i64
+                out.push(Buffer.from([0x0f])); // return
+                break;
+            }
+            case 0x63: { // BRANCH
+                const imm = sext(
+                    (((insn >>> 31) & 1) << 12) |
+                    (((insn >>> 7) & 1) << 11) |
+                    (((insn >>> 25) & 0x3f) << 5) |
+                    (((insn >>> 8) & 0xf) << 1),
+                    13,
+                );
+                const target = pc + imm;
+                switch (funct3) {
+                    case 0: this._emitConditionalBranch(out, 0x51, rs1, rs2, target); break; // beq
+                    case 1: this._emitConditionalBranch(out, 0x52, rs1, rs2, target); break; // bne
+                    case 4: this._emitConditionalBranch(out, 0x53, rs1, rs2, target); break; // blt
+                    case 5: this._emitConditionalBranch(out, 0x59, rs1, rs2, target); break; // bge
+                    case 6: this._emitConditionalBranch(out, 0x54, rs1, rs2, target); break; // bltu
+                    case 7: this._emitConditionalBranch(out, 0x5a, rs1, rs2, target); break; // bgeu
+                    default:
+                        throw new Error(`unsupported BRANCH funct3=${funct3}`);
+                }
                 break;
             }
             default:
