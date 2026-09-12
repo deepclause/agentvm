@@ -173,12 +173,12 @@ class RiscVBlockJit {
     }
 
     // Compile many blocks into one module with exports run_0, run_1, ...
-    static compileMany(blocks) {
-        return new WebAssembly.Module(RiscVBlockJit.compileManyBytes(blocks));
+    static compileMany(blocks, options = {}) {
+        return new WebAssembly.Module(RiscVBlockJit.compileManyBytes(blocks, options));
     }
 
-    static compileManyBytes(blocks) {
-        const instance = new RiscVBlockJit([], []);
+    static compileManyBytes(blocks, options = {}) {
+        const instance = new RiscVBlockJit([], [], options);
         const bodies = blocks.map((block) => instance._emitBody(block.instructions, block.sizes));
         return instance._buildModule(bodies, blocks.map((_, i) => `run_${i}`));
     }
