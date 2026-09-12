@@ -1,5 +1,5 @@
 diff --git a/riscv_cpu.c b/riscv_cpu.c
-index 10f25cf..1834582 100644
+index b0bd964..4386ce4 100644
 --- a/riscv_cpu.c
 +++ b/riscv_cpu.c
 @@ -50,6 +50,12 @@
@@ -13,8 +13,8 @@ index 10f25cf..1834582 100644
 +#endif
 +
  #ifdef CONFIG_JIT
- #define JIT_ACCESSOR_LOAD(sz)                                                 \
- __attribute__((export_name("jit_read_" #sz)))                                  \
+ static int csr_read(RISCVCPUState *s, target_ulong *pval, uint32_t csr, BOOL will_write);
+ static int csr_write(RISCVCPUState *s, uint32_t csr, target_ulong val);
 diff --git a/riscv_cpu_template.h b/riscv_cpu_template.h
 index 3613fa5..3f7fa29 100644
 --- a/riscv_cpu_template.h
