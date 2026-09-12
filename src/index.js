@@ -12,7 +12,7 @@ class AgentVM {
      * @param {Object.<string, string>} [options.mounts] - Mount points mapping VM path to host path (e.g., {'/mnt/data': '/host/path'}).
      * @param {boolean} [options.network] - Enable networking (default: true).
      * @param {string} [options.mac] - MAC address for the VM (default: 02:00:00:00:00:01).
-     * @param {number} [options.networkRateLimit] - VM-wide network rate limit in bytes/sec (default: 1MiB/s). Set to 0 for unlimited.
+     * @param {number} [options.networkRateLimit] - VM-wide network rate limit in bytes/sec (default: 2MiB/s). Set to 0 for unlimited.
      * @param {boolean} [options.debug] - Enable debug logging.
      * @param {boolean} [options.interactive] - Interactive/raw mode - skip shell setup for direct terminal access.
      */
@@ -24,11 +24,12 @@ class AgentVM {
         this.debug = options.debug || false;
         this.interactive = options.interactive || false;
         // TinyEMU's virtio NIC can stop making progress when dozens of flows
-        // deliver at native-host speed. Keep a conservative VM-wide default;
-        // callers running light/single-flow workloads may explicitly use 0.
+        // deliver at native-host speed. A 2 MiB/s VM-wide default is high
+        // enough for single downloads while still safe for npm's concurrent
+        // fetches; it was validated at 30x1MiB and 50x512KiB with DNS after.
         this.networkRateLimit = options.networkRateLimit !== undefined
             ? options.networkRateLimit
-            : 1024 * 1024;
+            : 2 * 1024 * 1024;
         
         // Use the new ring buffer layout
         this.sharedBuffer = new SharedArrayBuffer(TOTAL_BUFFER_SIZE);
