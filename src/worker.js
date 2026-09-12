@@ -1132,9 +1132,6 @@ async function start() {
 
     const { instance: inst } = await WebAssembly.instantiate(wasmBuffer, {
         env: {
-            // JIT call bridge placeholder. Returning 0 keeps the interpreter
-            // path active; the host translator will take over this hook once
-            // the block translator is wired to the exported jit_* accessors.
             jit_try_block: () => 0,
         },
         wasi_snapshot_preview1: {
