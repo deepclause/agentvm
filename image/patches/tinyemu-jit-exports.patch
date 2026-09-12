@@ -1,15 +1,12 @@
 diff --git a/riscv_cpu.c b/riscv_cpu.c
-index 4499cb9..c75bc54 100644
+index 4499cb9..4e61f45 100644
 --- a/riscv_cpu.c
 +++ b/riscv_cpu.c
-@@ -50,6 +50,75 @@
+@@ -50,6 +50,65 @@
  
  #include "riscv_cpu_priv.h"
  
 +#ifdef CONFIG_JIT
-+/* Host-side JIT accessors. The host JavaScript decoder/translator uses these
-+   exported functions to read guest memory and registers through TinyEMU's own
-+   MMU/TLB, so translated blocks stay correct without duplicating translation. */
 +#define JIT_ACCESSOR_LOAD(sz)                                                 \
 +__attribute__((export_name("jit_read_" #sz)))                                  \
 +uint64_t jit_read_##sz(uint32_t state_ptr, uint64_t addr)                       \
@@ -49,23 +46,16 @@ index 4499cb9..c75bc54 100644
 +    ((RISCVCPUState *)(uintptr_t)state_ptr)->pc = pc;
 +}
 +
-+__attribute__((export_name("jit_get_reg")))
-+uint64_t jit_get_reg(uint32_t state_ptr, uint32_t idx)
-+{
-+    return ((RISCVCPUState *)(uintptr_t)state_ptr)->reg[idx & 31];
-+}
-+
-+__attribute__((export_name("jit_set_reg")))
-+void jit_set_reg(uint32_t state_ptr, uint32_t idx, uint64_t val)
-+{
-+    if ((idx & 31) != 0)
-+        ((RISCVCPUState *)(uintptr_t)state_ptr)->reg[idx & 31] = val;
-+}
-+
 +__attribute__((export_name("jit_regs_ptr")))
 +uint32_t jit_regs_ptr(uint32_t state_ptr)
 +{
 +    return (uint32_t)(uintptr_t)((RISCVCPUState *)(uintptr_t)state_ptr)->reg;
++}
++
++__attribute__((export_name("jit_get_cycles")))
++int32_t jit_get_cycles(uint32_t state_ptr)
++{
++    return ((RISCVCPUState *)(uintptr_t)state_ptr)->n_cycles;
 +}
 +
 +__attribute__((export_name("jit_sub_cycles")))

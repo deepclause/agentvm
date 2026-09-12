@@ -1,5 +1,5 @@
 diff --git a/riscv_cpu.c b/riscv_cpu.c
-index 4ed0396..203a408 100644
+index 10f25cf..1834582 100644
 --- a/riscv_cpu.c
 +++ b/riscv_cpu.c
 @@ -50,6 +50,12 @@
@@ -13,20 +13,18 @@ index 4ed0396..203a408 100644
 +#endif
 +
  #ifdef CONFIG_JIT
- /* Host-side JIT accessors. The host JavaScript decoder/translator uses these
-    exported functions to read guest memory and registers through TinyEMU's own
+ #define JIT_ACCESSOR_LOAD(sz)                                                 \
+ __attribute__((export_name("jit_read_" #sz)))                                  \
 diff --git a/riscv_cpu_template.h b/riscv_cpu_template.h
-index 3613fa5..0d7ddab 100644
+index 3613fa5..3f7fa29 100644
 --- a/riscv_cpu_template.h
 +++ b/riscv_cpu_template.h
-@@ -256,6 +256,16 @@ static void no_inline glue(riscv_cpu_interp_x, XLEN)(RISCVCPUState *s,
+@@ -256,6 +256,14 @@ static void no_inline glue(riscv_cpu_interp_x, XLEN)(RISCVCPUState *s,
                  }
              }
      
 +#ifdef CONFIG_JIT
 +            if (initialized && jit_try_block((uint32_t)(uintptr_t)s)) {
-+                /* The host executed a translated block and updated s->pc,
-+                   s->n_cycles and registers. Restart the block boundary. */
 +                code_to_pc_addend = s->pc;
 +                code_ptr = NULL;
 +                code_end = NULL;
