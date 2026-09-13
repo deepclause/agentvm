@@ -249,32 +249,30 @@ async function start() {
                     return 44; // WASI_ERRNO_NOENT
                 }
                 
-                // Determine open flags
-                let fsFlags = 'r'; // Default read-only
-                
-                if (oflags & O_CREAT) {
-                    if (oflags & O_TRUNC) {
-                        fsFlags = 'w+'; // Create/truncate, read/write
-                    } else if (fileExists) {
-                        fsFlags = 'r+'; // Existing file, read/write
-                    } else {
-                        fsFlags = 'w+'; // Create new, read/write
-                    }
-                } else if (oflags & O_TRUNC) {
-                    fsFlags = 'r+'; // Truncate existing (we'll truncate separately)
+                // Determine open flags. WASI oflags carry no read/write bits;
+                // access is expressed via fs_rights_base, so we must consult it
+                // (otherwise write-only opens degrade to read-only).
+                const FD_READ = 2;   // 1 << 1
+                const FD_WRITE = 64; // 1 << 6
+                const rightsBase = typeof fs_rights_base === 'bigint' ? Number(fs_rights_base) : fs_rights_base;
+                const canRead = (rightsBase & FD_READ) !== 0;
+                const canWrite = (rightsBase & FD_WRITE) !== 0;
+
+                let openFlags;
+                if (canRead && canWrite) {
+                    openFlags = fs.constants.O_RDWR;
+                } else if (canWrite) {
+                    openFlags = fs.constants.O_WRONLY;
+                } else {
+                    openFlags = fs.constants.O_RDONLY;
                 }
-                
-                if (fdflags & FDFLAG_APPEND) {
-                    fsFlags = fileExists ? 'a+' : 'a+'; // Append mode
-                }
-                
-                // Open the file synchronously
-                const nodeFd = fs.openSync(hostFilePath, fsFlags);
-                
-                // Handle O_TRUNC separately to ensure truncation
-                if ((oflags & O_TRUNC) && fileExists) {
-                    fs.ftruncateSync(nodeFd, 0);
-                }
+
+                if (oflags & O_CREAT) openFlags |= fs.constants.O_CREAT;
+                if (oflags & O_TRUNC) openFlags |= fs.constants.O_TRUNC;
+                if (fdflags & FDFLAG_APPEND) openFlags |= fs.constants.O_APPEND;
+
+                // Open the file synchronously (mode only matters with O_CREAT).
+                const nodeFd = fs.openSync(hostFilePath, openFlags, 0o666);
                 
                 // Get stat if we didn't already
                 if (!stat) {
@@ -741,7 +739,78 @@ async function start() {
         return result;
     };
     
-    wasiImport.fd_filestat_get = wrapFdOp('fd_filestat_get', wasiImport.fd_filestat_get);
+    // Custom fd_filestat_get (fstat) for our custom file handles. Node's WASI
+    // doesn't know about the fds we synthesize in path_open.
+    const origFdFilestatGet = wasiImport.fd_filestat_get;
+    wasiImport.fd_filestat_get = (fd, filestat_ptr) => {
+        if (customFdHandles.has(fd)) {
+            const handle = customFdHandles.get(fd);
+            if (!instance) return 8; // WASI_ERRNO_BADF
+
+            try {
+                const stat = handle.type === 'file' && handle.nodeFd !== undefined
+                    ? fs.fstatSync(handle.nodeFd)
+                    : fs.statSync(handle.hostPath);
+                const view = new DataView(instance.exports.memory.buffer);
+
+                // WASI filestat structure (64 bytes):
+                // 0: dev (u64), 8: ino (u64), 16: filetype (u8), 24: nlink (u64),
+                // 32: size (u64), 40: atim (u64), 48: mtim (u64), 56: ctim (u64)
+                view.setBigUint64(filestat_ptr, BigInt(0), true); // dev
+                view.setBigUint64(filestat_ptr + 8, BigInt(stat.ino || 0), true); // ino
+
+                let filetype = 0;
+                if (stat.isFile()) filetype = 4;
+                else if (stat.isDirectory()) filetype = 3;
+                else if (stat.isSymbolicLink()) filetype = 7;
+                view.setUint8(filestat_ptr + 16, filetype);
+
+                view.setBigUint64(filestat_ptr + 24, BigInt(stat.nlink || 1), true); // nlink
+                view.setBigUint64(filestat_ptr + 32, BigInt(stat.size), true); // size
+                view.setBigUint64(filestat_ptr + 40, BigInt(Math.floor(stat.atimeMs * 1000000)), true); // atim (ns)
+                view.setBigUint64(filestat_ptr + 48, BigInt(Math.floor(stat.mtimeMs * 1000000)), true); // mtim (ns)
+                view.setBigUint64(filestat_ptr + 56, BigInt(Math.floor(stat.ctimeMs * 1000000)), true); // ctim (ns)
+
+                return 0;
+            } catch (err) {
+                if (err.code === 'ENOENT') return 44; // WASI_ERRNO_NOENT
+                return 29; // WASI_ERRNO_IO
+            }
+        }
+
+        if (fakeFdMap.has(fd)) {
+            return origFdFilestatGet(fakeFdMap.get(fd), filestat_ptr);
+        }
+        return origFdFilestatGet(fd, filestat_ptr);
+    };
+
+    // Custom fd_filestat_set_size (truncate) for our custom file handles.
+    // TinyEMU's 9p server calls this after path_open with O_TRUNC and the guest
+    // uses it for ftruncate(); Node's WASI doesn't know about our fds.
+    const origFdFilestatSetSize = wasiImport.fd_filestat_set_size;
+    wasiImport.fd_filestat_set_size = (fd, size) => {
+        if (customFdHandles.has(fd)) {
+            const handle = customFdHandles.get(fd);
+            if (!instance) return 8; // WASI_ERRNO_BADF
+            if (handle.type !== 'file' || handle.nodeFd === undefined) return 8;
+            try {
+                fs.ftruncateSync(handle.nodeFd, typeof size === 'bigint' ? Number(size) : size);
+                return 0;
+            } catch (err) {
+                if (process.env.DEBUG_WASI_PATH === '1') {
+                    parentPort.postMessage({
+                        type: 'debug',
+                        msg: `WASI fd_filestat_set_size CUSTOM ERROR: fd=${fd}, err=${err.message}`
+                    });
+                }
+                return 29; // WASI_ERRNO_IO
+            }
+        }
+        if (fakeFdMap.has(fd)) {
+            return origFdFilestatSetSize(fakeFdMap.get(fd), size);
+        }
+        return origFdFilestatSetSize(fd, size);
+    };
     
     // Custom path_filestat_get for our directory handles
     const origPathFilestatGet = wasiImport.path_filestat_get;
