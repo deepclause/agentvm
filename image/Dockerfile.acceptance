@@ -12,7 +12,8 @@ RUN apk add --no-cache \
         python3 py3-pip \
         nodejs npm \
         bash curl git \
-        coreutils
+        coreutils \
+        tmux
 
 # A shell is the entrypoint AgentVM exec() talks to.
 CMD ["/bin/sh"]
