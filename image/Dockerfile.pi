@@ -10,7 +10,8 @@ RUN apk add --no-cache \
         python3 py3-pip \
         nodejs npm \
         bash curl git \
-        coreutils
+        coreutils \
+        tmux
 
 COPY --link preinstalled/usrlocal /usr/local
 

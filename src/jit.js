@@ -69,46 +69,95 @@ function sext(value, bits) {
 }
 
 class RiscVBlockJit {
-    constructor(instructions, sizes = null) {
+    constructor(instructions, sizes = null, options = {}) {
         this.instructions = instructions;
         this.sizes = sizes || instructions.map(() => 4);
+        this.externalMemory = !!options.externalMemory;
     }
 
-    compile() {
-        const body = this._emitBody();
-        const codeSection = section(10, Buffer.concat([
-            u32leb(1),               // one function body
-            u32leb(body.length),
-            body,
+    _typeSection() {
+        const parts = [];
+        const runParams = this.externalMemory
+            ? [0x7f, 0x7f, 0x7e, 0x7f] // regs, mem, pc (i64), statePtr
+            : [0x7f, 0x7f, 0x7e];
+        parts.push(Buffer.concat([
+            Buffer.from([0x60]), u32leb(runParams.length), Buffer.from(runParams),
+            u32leb(1), Buffer.from([0x7e]),
         ]));
+        if (this.externalMemory) {
+            parts.push(Buffer.concat([
+                Buffer.from([0x60]),
+                u32leb(3), Buffer.from([0x7f, 0x7e, 0x7f]), // load(statePtr, addr, size)
+                u32leb(1), Buffer.from([0x7e]),
+            ]));
+            parts.push(Buffer.concat([
+                Buffer.from([0x60]),
+                u32leb(4), Buffer.from([0x7f, 0x7e, 0x7f, 0x7e]), // store(statePtr, addr, size, val)
+                u32leb(1), Buffer.from([0x7f]),
+            ]));
+        }
+        return section(1, Buffer.concat([u32leb(parts.length), ...parts]));
+    }
 
-        const typeSection = section(1, Buffer.concat([
-            u32leb(1),               // one type
-            Buffer.from([0x60]),     // func
-            u32leb(3), Buffer.from([0x7f, 0x7f, 0x7e]), // regs base, mem base, start pc (i64)
-            u32leb(1), Buffer.from([0x7e]), // one i64 result: next pc
-        ]));
-
-        const importSection = section(2, Buffer.concat([
-            u32leb(1),
+    _importSection() {
+        if (!this.externalMemory) {
+            return section(2, Buffer.concat([
+                u32leb(1),
+                stringBytes('env'),
+                stringBytes('memory'),
+                Buffer.from([0x02, 0x00, 0x01]), // memory, min 1 page
+            ]));
+        }
+        const envMemory = Buffer.concat([
             stringBytes('env'),
             stringBytes('memory'),
-            Buffer.from([0x02, 0x00, 0x01]), // memory, min 1 page
+            Buffer.from([0x02, 0x00, 0x01]),
+        ]);
+        const envLoad = Buffer.concat([
+            stringBytes('env'),
+            stringBytes('load'),
+            Buffer.from([0x00]), u32leb(1),
+        ]);
+        const envStore = Buffer.concat([
+            stringBytes('env'),
+            stringBytes('store'),
+            Buffer.from([0x00]), u32leb(2),
+        ]);
+        return section(2, Buffer.concat([
+            u32leb(3),
+            envMemory,
+            envLoad,
+            envStore,
         ]));
+    }
+
+    _buildModule(functions, exportNames) {
+        const typeSection = this._typeSection();
+        const importSection = this._importSection();
 
         const functionSection = section(3, Buffer.concat([
-            u32leb(1),
-            u32leb(0),
+            u32leb(functions.length),
+            ...functions.map(() => u32leb(0)),
         ]));
 
-        const exportSection = section(7, Buffer.concat([
-            u32leb(1),
-            stringBytes('run'),
-            Buffer.from([0x00]),     // function
-            u32leb(0),
-        ]));
+        // Imported functions occupy indices before defined functions.
+        const functionIndexBase = this.externalMemory ? 2 : 0;
+        const exportParts = [u32leb(functions.length)];
+        functions.forEach((_, i) => {
+            exportParts.push(stringBytes(exportNames[i] || `run_${i}`));
+            exportParts.push(Buffer.from([0x00])); // function
+            exportParts.push(u32leb(functionIndexBase + i));
+        });
+        const exportSection = section(7, Buffer.concat(exportParts));
 
-        const binary = Buffer.concat([
+        const codeParts = [u32leb(functions.length)];
+        for (const body of functions) {
+            codeParts.push(u32leb(body.length));
+            codeParts.push(body);
+        }
+        const codeSection = section(10, Buffer.concat(codeParts));
+
+        return Buffer.concat([
             Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]),
             typeSection,
             importSection,
@@ -116,18 +165,32 @@ class RiscVBlockJit {
             exportSection,
             codeSection,
         ]);
-
-        return new WebAssembly.Module(binary);
     }
 
-    _emitBody() {
+    compile() {
+        const body = this._emitBody(this.instructions, this.sizes);
+        return new WebAssembly.Module(this._buildModule([body], ['run']));
+    }
+
+    // Compile many blocks into one module with exports run_0, run_1, ...
+    static compileMany(blocks, options = {}) {
+        return new WebAssembly.Module(RiscVBlockJit.compileManyBytes(blocks, options));
+    }
+
+    static compileManyBytes(blocks, options = {}) {
+        const instance = new RiscVBlockJit([], [], options);
+        const bodies = blocks.map((block) => instance._emitBody(block.instructions, block.sizes));
+        return instance._buildModule(bodies, blocks.map((_, i) => `run_${i}`));
+    }
+
+    _emitBody(instructions, sizes) {
         const out = [];
         out.push(Buffer.from([0x00])); // zero locals
 
         let pc = 0;
-        for (let i = 0; i < this.instructions.length; i++) {
-            this._emitInstruction(out, this.instructions[i], pc);
-            pc += this.sizes[i];
+        for (let i = 0; i < instructions.length; i++) {
+            this._emitInstruction(out, instructions[i], pc);
+            pc += sizes[i];
         }
 
         // Fall through: return startPc + 4 * instruction count.
@@ -169,19 +232,21 @@ class RiscVBlockJit {
         out.push(s64leb(value));
     }
 
-    _emitBinary(out, opcode, rd, rs1, rs2) {
+    _emitBinary(out, opcode, rd, rs1, rs2, extendU32 = false) {
         this._beginStore(out, rd);
         this._loadReg(out, rs1);
         this._loadReg(out, rs2);
         out.push(Buffer.from([opcode]));
+        if (extendU32) out.push(Buffer.from([0xad])); // i64.extend_i32_u
         this._endStore(out, rd);
     }
 
-    _emitBinaryImm(out, opcode, rd, rs1, imm) {
+    _emitBinaryImm(out, opcode, rd, rs1, imm, extendU32 = false) {
         this._beginStore(out, rd);
         this._loadReg(out, rs1);
         this._const64(out, imm);
         out.push(Buffer.from([opcode]));
+        if (extendU32) out.push(Buffer.from([0xad])); // i64.extend_i32_u
         this._endStore(out, rd);
     }
 
@@ -225,14 +290,38 @@ class RiscVBlockJit {
         out.push(Buffer.from([0x6a])); // i32.add
     }
 
-    _emitLoad(out, rd, rs1, imm, opcode) {
+    _emitLoad(out, rd, rs1, imm, opcode, size) {
+        if (this.externalMemory) {
+            this._beginStore(out, rd);
+            out.push(Buffer.from([0x20, 0x03])); // local.get 3 (statePtr)
+            this._loadReg(out, rs1);
+            this._const64(out, imm);
+            out.push(Buffer.from([0x7c])); // i64.add
+            out.push(Buffer.from([0x41])); // i32.const size
+            out.push(s32leb(size));
+            out.push(Buffer.from([0x10, 0x00])); // call 0 (env.load)
+            this._endStore(out, rd);
+            return;
+        }
         this._beginStore(out, rd);
         this._emitAddress(out, rs1, imm);
         out.push(Buffer.from([opcode, 0x00, 0x00])); // load, align=0 offset=0
         this._endStore(out, rd);
     }
 
-    _emitStore(out, rs1, rs2, imm, opcode) {
+    _emitStore(out, rs1, rs2, imm, opcode, size) {
+        if (this.externalMemory) {
+            out.push(Buffer.from([0x20, 0x03])); // local.get 3 (statePtr)
+            this._loadReg(out, rs1);
+            this._const64(out, imm);
+            out.push(Buffer.from([0x7c])); // i64.add
+            out.push(Buffer.from([0x41])); // i32.const size
+            out.push(s32leb(size));
+            this._loadReg(out, rs2);
+            out.push(Buffer.from([0x10, 0x01])); // call 1 (env.store)
+            out.push(Buffer.from([0x1a]));       // drop result
+            return;
+        }
         this._emitAddress(out, rs1, imm);
         this._loadReg(out, rs2);
         out.push(Buffer.from([opcode, 0x00, 0x00])); // store, align=0 offset=0
@@ -255,8 +344,8 @@ class RiscVBlockJit {
                     case 4: this._emitBinaryImm(out, 0x85, rd, rs1, immI); break; // xori
                     case 6: this._emitBinaryImm(out, 0x84, rd, rs1, immI); break; // ori
                     case 7: this._emitBinaryImm(out, 0x83, rd, rs1, immI); break; // andi
-                    case 2: this._emitBinaryImm(out, 0x53, rd, rs1, immI); break; // slti (i64.lt_s)
-                    case 3: this._emitBinaryImm(out, 0x54, rd, rs1, immI); break; // sltiu (i64.lt_u)
+                    case 2: this._emitBinaryImm(out, 0x53, rd, rs1, immI, true); break; // slti (i64.lt_s)
+                    case 3: this._emitBinaryImm(out, 0x54, rd, rs1, immI, true); break; // sltiu (i64.lt_u)
                     case 1: { // slli
                         this._beginStore(out, rd);
                         this._loadReg(out, rs1);
@@ -357,8 +446,8 @@ class RiscVBlockJit {
                 switch (funct3) {
                     case 0: this._emitBinary(out, funct7 === 0x20 ? 0x7d : 0x7c, rd, rs1, rs2); break; // add/sub
                     case 1: this._emitBinary(out, 0x86, rd, rs1, rs2); break; // sll
-                    case 2: this._emitBinary(out, 0x53, rd, rs1, rs2); break; // slt
-                    case 3: this._emitBinary(out, 0x54, rd, rs1, rs2); break; // sltu
+                    case 2: this._emitBinary(out, 0x53, rd, rs1, rs2, true); break; // slt
+                    case 3: this._emitBinary(out, 0x54, rd, rs1, rs2, true); break; // sltu
                     case 4: this._emitBinary(out, 0x85, rd, rs1, rs2); break; // xor
                     case 5: this._emitBinary(out, funct7 === 0x20 ? 0x87 : 0x88, rd, rs1, rs2); break; // srl/sra
                     case 6: this._emitBinary(out, 0x84, rd, rs1, rs2); break; // or
@@ -419,7 +508,8 @@ class RiscVBlockJit {
                 };
                 const loadOpcode = loads[funct3];
                 if (loadOpcode === undefined) throw new Error(`unsupported LOAD funct3=${funct3}`);
-                this._emitLoad(out, rd, rs1, immI, loadOpcode);
+                const loadSize = [1, 2, 4, 8, 1, 2, 4][funct3];
+                this._emitLoad(out, rd, rs1, immI, loadOpcode, loadSize);
                 break;
             }
             case 0x23: { // STORE
@@ -431,7 +521,8 @@ class RiscVBlockJit {
                 };
                 const storeOpcode = stores[funct3];
                 if (storeOpcode === undefined) throw new Error(`unsupported STORE funct3=${funct3}`);
-                this._emitStore(out, rs1, rs2, immS, storeOpcode);
+                const storeSize = [1, 2, 4, 8][funct3];
+                this._emitStore(out, rs1, rs2, immS, storeOpcode, storeSize);
                 break;
             }
             case 0x63: { // BRANCH
