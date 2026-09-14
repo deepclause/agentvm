@@ -984,7 +984,11 @@ async function start() {
         }
     };
 
-    // path_unlink_file (unlink) — same routing as above.
+    // path_unlink_file (unlink) — same routing as above. On macOS
+    // fs.unlinkSync() on a directory returns EPERM instead of EISDIR, which
+    // makes the guest's rmdir() abort with "Operation not permitted" instead
+    // of falling back to the rmdir syscall. Detect that case and report EISDIR
+    // so the guest behaves the same as it does on Linux.
     const origPathUnlinkFile = wasiImport.path_unlink_file;
     wasiImport.path_unlink_file = (fd, path_ptr, path_len) => {
         const pathStr = readWasiPath(path_ptr, path_len);
@@ -996,6 +1000,17 @@ async function start() {
             fs.unlinkSync(resolved.fullPath);
             return 0;
         } catch (err) {
+            // macOS reports EPERM (not EISDIR) when unlinking a directory.
+            // Translate it so guest rmdir() can fall back to path_remove_directory.
+            if (err.code === 'EPERM') {
+                try {
+                    if (fs.statSync(resolved.fullPath).isDirectory()) {
+                        return 31; // WASI_ERRNO_ISDIR
+                    }
+                } catch {
+                    // fall through to the normal errno mapping below
+                }
+            }
             if (process.env.DEBUG_WASI_PATH === '1') {
                 parentPort.postMessage({ type: 'debug', msg: `WASI path_unlink_file CUSTOM FAIL: fd=${fd}, path="${pathStr}" => ${err.code} ${err.message}` });
             }
