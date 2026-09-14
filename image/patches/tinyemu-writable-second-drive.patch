@@ -1,5 +1,5 @@
 diff --git a/temu.c b/temu.c
-index 92cb196..c70ea4b 100644
+index 92cb196..eb07df8 100644
 --- a/temu.c
 +++ b/temu.c
 @@ -303,8 +303,9 @@ static int bf_read_async(BlockDevice *bs,
@@ -24,7 +24,7 @@ index 92cb196..c70ea4b 100644
      }
      /* synchronous read */
      return 0;
-@@ -336,11 +337,13 @@ static int bf_write_async(BlockDevice *bs,
+@@ -336,11 +337,18 @@ static int bf_write_async(BlockDevice *bs,
      case BF_MODE_RO:
          ret = -1; /* error */
          break;
@@ -33,7 +33,12 @@ index 92cb196..c70ea4b 100644
 -        fwrite(buf, 1, n * SECTOR_SIZE, bf->f);
 +    case BF_MODE_RW: {
 +        ssize_t wr;
-+        int fd = fileno(bf->f);
++        int fd;
++        if (!bf->f) {
++            ret = -1;
++            break;
++        }
++        fd = fileno(bf->f);
 +        wr = pwrite(fd, buf, n * SECTOR_SIZE, (off_t)sector_num * SECTOR_SIZE);
          ret = 0;
          break;
@@ -41,7 +46,7 @@ index 92cb196..c70ea4b 100644
      case BF_MODE_SNAPSHOT:
          {
              int i;
-@@ -1039,8 +1042,12 @@ void init_func_args(char *net)
+@@ -1039,8 +1047,12 @@ void init_func_args(char *net)
      /* open the files & devices */
      for(i = 0; i < p->drive_count; i++) {
          BlockDevice *drive;
@@ -54,7 +59,7 @@ index 92cb196..c70ea4b 100644
  #ifdef CONFIG_FS_NET
          if (is_url(fname)) {
              net_completed = FALSE;
-@@ -1051,7 +1058,7 @@ void init_func_args(char *net)
+@@ -1051,7 +1063,7 @@ void init_func_args(char *net)
          } else
  #endif
          {
@@ -63,12 +68,22 @@ index 92cb196..c70ea4b 100644
          }
          free(fname);
          p->tab_drive[i].block_dev = drive;
-@@ -1451,7 +1458,7 @@ int main(int argc, char **argv)
+@@ -1451,10 +1463,15 @@ int main(int argc, char **argv)
          BlockDeviceFile *bf = p->tab_drive[i].block_dev->opaque;
          char *fname;
          fname = get_file_path(p->cfg_filename, p->tab_drive[i].filename);
 -        f = fopen(fname, "rb");
 +        f = fopen(fname, (i == 0) ? "rb" : "r+b");
          if (!f) {
-           fprintf(stderr, "failed to open %s: %s\n", fname, strerror(errno));
-           exit(1);
+-          fprintf(stderr, "failed to open %s: %s\n", fname, strerror(errno));
+-          exit(1);
++          if (i == 0) {
++            fprintf(stderr, "failed to open %s: %s\n", fname, strerror(errno));
++            exit(1);
++          }
++          fprintf(stderr, "optional drive %d unavailable: %s\n", i, strerror(errno));
++          bf->f = NULL;
++          continue;
+         }
+         bf->f = f;
+         p->tab_drive[i].block_dev->opaque = bf;

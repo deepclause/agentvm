@@ -95,9 +95,8 @@ main();
 - `options.mounts`: Object mapping VM paths to host paths (e.g., `{ '/mnt/data': './data' }`). Supports reading and writing files from the VM to the host filesystem.
 - `options.network`: Enable networking (default: `true`). Provides full TCP/UDP NAT for internet access.
 - `options.mac`: MAC address for the VM (default: `02:00:00:00:00:01`).
-- `options.persistentRoot`: Persist the guest root filesystem per workspace via snapshots (default: `false`). Requires a `/workspace` mount.
-- `options.persistentRootDir`: Guest directory under `/workspace` where persistence state lives (default: `.agentvm`). May be relative to `/workspace` or an absolute path under `/workspace` (for example `/workspace/.pi-box/overlay`).
-- `options.persistentRootSnapshotOnStop`: Automatically snapshot the root in `stop()` (default: `false`). Snapshots can be slow, so explicit `snapshotRoot()` is often preferable.
+- `options.persistentRoot`: Persist the guest root filesystem per workspace via an ext4 overlay upperdir on a second virtio block device (default: `false`). Requires a `/workspace` mount.
+- `options.persistentRootDir`: Guest directory under `/workspace` where the overlay image lives (default: `.agentvm`). May be relative to `/workspace` or an absolute path under `/workspace`.
 
 ### `vm.start()`
 Starts the VM worker. Returns a Promise.
@@ -107,7 +106,7 @@ Executes a shell command.
 - Returns: `Promise<{ stdout: string, stderr: string, exitCode: number }>`
 
 ### `vm.stop(options?)`
-Terminates the VM. Pass `{ snapshot: true }` to snapshot the persistent root first (or set `persistentRootSnapshotOnStop` to do it on every stop).
+Terminates the VM. When `persistentRoot` is enabled, runs `sync` first so ext4/overlay writes are flushed to the backing image.
 
 ### `vm.setNetworkEnabled(boolean)`
 Enable or disable guest networking at runtime without a VM restart. Disabling drops all live TCP/UDP host sockets immediately.
@@ -122,7 +121,7 @@ Expose a guest TCP server on a host port at runtime. `guestHost` defaults to `19
 Remove or list live port forwards.
 
 ### `vm.snapshotRoot()`
-Writes the guest root (minus `/workspace`, `/proc`, `/sys`, `/dev`, `/run`) to `<persistentRootDir>/root.tar`. The next `start()` restores it automatically. Works in both exec and interactive modes.
+Optional tar backup of the guest root (minus `/workspace`, `/proc`, `/sys`, `/dev`, `/run`) to `<persistentRootDir>/root.tar`. Not used by the default ext4-overlay persistence path.
 
 ## Features
 

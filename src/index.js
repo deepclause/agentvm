@@ -21,9 +21,8 @@ class AgentVM {
      * @param {number} [options.networkRateLimit] - VM-wide network rate limit in bytes/sec (default: 2MiB/s). Set to 0 for unlimited.
      * @param {boolean} [options.debug] - Enable debug logging.
      * @param {boolean} [options.interactive] - Interactive/raw mode - skip shell setup for direct terminal access.
-     * @param {boolean} [options.persistentRoot] - Persist the guest root filesystem per workspace via snapshots (default: false). Requires a `/workspace` mount.
-     * @param {string} [options.persistentRootDir] - Guest directory under `/workspace` where persistence state lives (default: `.agentvm`). Can be relative to `/workspace` or an absolute path under `/workspace`.
-     * @param {boolean} [options.persistentRootSnapshotOnStop] - Automatically snapshot the root in `stop()` (default: false). Snapshots can be slow; call `snapshotRoot()` explicitly when needed.
+     * @param {boolean} [options.persistentRoot] - Persist the guest root filesystem per workspace via a non-9p ext4 overlay upperdir (default: false). Requires a `/workspace` mount and an image with a second virtio block device.
+     * @param {string} [options.persistentRootDir] - Guest directory under `/workspace` where the overlay image lives (default: `.agentvm`). Can be relative to `/workspace` or an absolute path under `/workspace`.
      */
     constructor(options = {}) {
         this.wasmPath = options.wasmPath || path.resolve(__dirname, '../agentvm-alpine-python.wasm');
@@ -35,10 +34,11 @@ class AgentVM {
         this.interactive = options.interactive || false;
         this.persistentRoot = options.persistentRoot || false;
         this.persistentRootDir = options.persistentRootDir || null;
-        this.persistentRootSnapshotOnStop = options.persistentRootSnapshotOnStop === true;
         this.persistentRootGuestDir = null;
         this.persistentRootHostDir = null;
-        this.rootPersistenceMode = this.persistentRoot ? 'snapshot' : 'none';
+        this.persistentRootUpperImgHost = null;
+        this.persistentRootUpperImgGuest = null;
+        this.rootPersistenceMode = this.persistentRoot ? 'overlay' : 'none';
         this.firewall = { default: 'allow', rules: [] };
         this.portForwards = new Map(); // hostPort -> { hostPort, guestPort, guestHost, protocol, bind, server }
         this.pendingTcpConnects = new Set();
@@ -61,6 +61,7 @@ class AgentVM {
         this.worker = null;
         this.pendingCommand = null; // { resolve, reject, marker, outputStr, stderrStr }
         this.pendingInternal = null; // internal shell command output capture (both modes)
+        this.pendingBootstrap = null; // pivot/chroot bootstrap output capture
         this.isReady = false;
         this.destroyed = false;
         
@@ -246,6 +247,7 @@ class AgentVM {
             this.worker.on('error', (err) => {
                 if (this.pendingCommand) this.pendingCommand.reject(err);
                 if (this.pendingInternal) this.pendingInternal.reject(err);
+                if (this.pendingBootstrap) this.pendingBootstrap.reject(err);
                 reject(err);
             });
             
@@ -257,6 +259,9 @@ class AgentVM {
                 }
                 if (this.pendingInternal) {
                     this.pendingInternal.reject(new Error(`VM exited with code ${code} during internal command`));
+                }
+                if (this.pendingBootstrap) {
+                    this.pendingBootstrap.reject(new Error(`VM exited with code ${code} during bootstrap`));
                 }
                 if (code !== 0 && !this.destroyed) {
                      console.error(`VM Worker exited with code ${code}`);
@@ -274,9 +279,9 @@ class AgentVM {
     async _handleReady() {
         if (this.persistentRoot) {
             try {
-                await this._restorePersistentRoot();
+                await this._mountPersistentRoot();
             } catch (err) {
-                console.warn('[AgentVM] persistent root restore failed:', err.message);
+                console.warn('[AgentVM] persistent root mount failed:', err.message);
             }
         }
 
@@ -328,8 +333,20 @@ class AgentVM {
 
         const hostBase = path.join(path.resolve(workspaceHost), ...rel.split('/'));
         fs.mkdirSync(hostBase, { recursive: true });
+
+        // The second virtio block device is backed by a sparse host file. Keep
+        // a fixed 512 MiB for now; the guest formats it ext4 on first boot.
+        const upperHost = path.join(hostBase, 'upper.img');
+        if (!fs.existsSync(upperHost)) {
+            const fd = fs.openSync(upperHost, 'w');
+            fs.ftruncateSync(fd, 512 * 1024 * 1024);
+            fs.closeSync(fd);
+        }
+
         this.persistentRootGuestDir = guestDir;
         this.persistentRootHostDir = hostBase;
+        this.persistentRootUpperImgHost = upperHost;
+        this.persistentRootUpperImgGuest = `${guestDir}/upper.img`;
     }
 
     /**
@@ -375,44 +392,103 @@ class AgentVM {
     }
 
     /**
-     * Guest command that snapshots the whole root to the workspace persistence
-     * directory. Uncompressed tar is used because gzip in the emulated RISC-V
-     * guest is far slower than the 9p write itself.
+     * Build the guest-side ext4-overlay bootstrap. The second virtio block
+     * device (`/dev/vdb`) is formatted ext4 on first boot and then used as the
+     * overlay upperdir/workdir. The marker is emitted by the post-pivot/chroot
+     * shell because `exec` replaces the shell before the normal marker runs.
+     * @param {string} marker
      * @private
      */
-    _snapshotCommand() {
-        const dir = this.persistentRootGuestDir;
-        return `mkdir -p ${dir}; tar cf ${dir}/root.tar / --exclude=workspace --exclude=proc --exclude=sys --exclude=dev --exclude=run --exclude=newroot 2>/dev/null`;
+    _overlayBootstrapScript(marker) {
+        return [
+            'vdb=$(awk \'$4=="vdb"{print $1":"$2}\' /proc/partitions)',
+            'if [ -n "$vdb" ]; then',
+            '  major=${vdb%%:*}; minor=${vdb##*:}',
+            '  mknod /dev/vdb b "$major" "$minor" 2>/dev/null',
+            'fi',
+            'mkdir -p /mnt/persist /newroot/workspace /newroot/dev /newroot/proc /newroot/sys /newroot/run',
+            'magic=$(dd if=/dev/vdb bs=1 skip=1080 count=2 2>/dev/null | od -An -tx1 | tr -d " \\n")',
+            'if [ "$magic" != "53ef" ]; then',
+            '  mkfs.ext4 -q /dev/vdb',
+            'fi',
+            'mount -t ext4 /dev/vdb /mnt/persist',
+            'mkdir -p /mnt/persist/upper /mnt/persist/work',
+            'mount -t overlay overlay -o lowerdir=/,upperdir=/mnt/persist/upper,workdir=/mnt/persist/work /newroot',
+            'mount --bind /workspace /newroot/workspace 2>/dev/null || true',
+            'mount --bind /dev /newroot/dev 2>/dev/null || true',
+            'mount --bind /proc /newroot/proc 2>/dev/null || true',
+            'mount --bind /sys /newroot/sys 2>/dev/null || true',
+            'mount --bind /run /newroot/run 2>/dev/null || true',
+            'cd /newroot',
+            'mkdir -p .oldroot',
+            'if pivot_root . .oldroot 2>/dev/null; then',
+            `  exec /bin/sh -c 'printf "${marker}\\n"; cd /; exec /bin/sh'`,
+            'else',
+            `  exec chroot . /bin/sh -c 'printf "${marker}\\n"; cd /; exec /bin/sh'`,
+            'fi',
+        ].join('\n');
     }
 
     /**
-     * Guest command that restores a previously saved root snapshot.
+     * Run a shell bootstrap that replaces the shell via exec. Resolves when the
+     * marker is printed by the new shell.
+     * @param {string} script
+     * @param {string} marker
+     * @param {number} timeoutMs
      * @private
      */
-    _restoreCommand() {
-        const dir = this.persistentRootGuestDir;
-        return `if [ -f ${dir}/root.tar ]; then tar xf ${dir}/root.tar -C / 2>/dev/null; fi`;
+    _execBootstrap(script, marker, timeoutMs = 120000) {
+        return new Promise((resolve, reject) => {
+            const bootstrap = {
+                marker,
+                stdoutStr: '',
+                stderrStr: '',
+                resolve: null,
+                reject: null,
+            };
+            const timer = setTimeout(() => {
+                if (this.pendingBootstrap === bootstrap) {
+                    this.pendingBootstrap = null;
+                    reject(new Error('persistent root bootstrap timed out'));
+                }
+            }, timeoutMs);
+            bootstrap.resolve = (result) => {
+                clearTimeout(timer);
+                this.pendingBootstrap = null;
+                resolve(result);
+            };
+            bootstrap.reject = (err) => {
+                clearTimeout(timer);
+                this.pendingBootstrap = null;
+                reject(err);
+            };
+            this.pendingBootstrap = bootstrap;
+            this.writeToStdin(`${script}\n`).catch(bootstrap.reject);
+        });
     }
 
     /**
-     * Save the guest root to the workspace. Used automatically by `stop()` and
-     * also available directly.
+     * Mount the persistent ext4 overlay upperdir and switch the shell root.
+     * @private
+     */
+    async _mountPersistentRoot() {
+        if (!this.isReady) throw new Error('VM not ready');
+        if (!this.persistentRootGuestDir) throw new Error('persistentRoot is not enabled');
+        const marker = `__AGENTVM_OVERLAY_DONE:${randomUUID()}`;
+        return this._execBootstrap(this._overlayBootstrapScript(marker), marker, 120000);
+    }
+
+    /**
+     * Fallback: snapshot the guest root to the workspace as a tar archive. Not
+     * used by the default ext4-overlay path; kept for callers that want a
+     * portable backup.
      * @returns {Promise<{stdout: string, stderr: string, exitCode: number}>}
      */
     async snapshotRoot() {
         if (!this.isReady) throw new Error('VM not ready');
         if (!this.persistentRootGuestDir) throw new Error('persistentRoot is not enabled');
-        return this._execInternal(this._snapshotCommand(), 300000);
-    }
-
-    /**
-     * Restore the guest root from a saved workspace snapshot.
-     * @private
-     */
-    async _restorePersistentRoot() {
-        if (!this.isReady) throw new Error('VM not ready');
-        if (!this.persistentRootGuestDir) throw new Error('persistentRoot is not enabled');
-        return this._execInternal(this._restoreCommand(), 300000);
+        const dir = this.persistentRootGuestDir;
+        return this._execInternal(`mkdir -p ${dir}; tar cf ${dir}/root.tar / --exclude=workspace --exclude=proc --exclude=sys --exclude=dev --exclude=run --exclude=newroot 2>/dev/null`, 300000);
     }
 
     /**
@@ -444,16 +520,13 @@ class AgentVM {
     }
 
     async stop(options = {}) {
-        // Persist the root before tearing the VM down. Snapshotting is opt-in
-        // (or requested per call) because a whole-root tar can be slow.
-        const shouldSnapshot = options.snapshot !== undefined
-            ? options.snapshot
-            : this.persistentRootSnapshotOnStop;
-        if (shouldSnapshot && this.persistentRoot && this.isReady && this.worker && !this.destroyed) {
+        // Flush the ext4/overlay page cache before terminating the worker so
+        // writes reach the backing block device.
+        if (this.persistentRoot && this.isReady && this.worker && !this.destroyed) {
             try {
-                await this.snapshotRoot();
+                await this._execInternal('sync', 30000);
             } catch (err) {
-                console.warn('[AgentVM] persistent root snapshot failed:', err.message);
+                console.warn('[AgentVM] persistent root sync failed:', err.message);
             }
         }
 
@@ -1253,9 +1326,23 @@ class AgentVM {
         // Debug
         // console.log(`[VM ${type}]`, JSON.stringify(text));
 
-        // Internal commands (persistent-root restore/snapshot) run in both
-        // exec and interactive modes, so capture them before interactive
-        // output routing.
+        // A pivot/chroot bootstrap replaces the shell, so its marker is
+        // emitted by the new shell rather than by an appended printf.
+        if (this.pendingBootstrap) {
+            const bootstrap = this.pendingBootstrap;
+            if (type === 'stdout') {
+                bootstrap.stdoutStr += text;
+                if (bootstrap.stdoutStr.includes(bootstrap.marker)) {
+                    bootstrap.resolve(true);
+                }
+            } else {
+                bootstrap.stderrStr += text;
+            }
+            return;
+        }
+
+        // Internal commands run in both exec and interactive modes, so
+        // capture them before interactive output routing.
         if (this.pendingInternal) {
             const internal = this.pendingInternal;
             if (type === 'stdout') {
