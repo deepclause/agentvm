@@ -168,3 +168,51 @@ exchange.
 - Decide formatting strategy (guest `e2fsprogs` vs host pre-formatted template).
 - Port the `_handleReady`/`stop()` logic in `src/index.js` from snapshot mode
   to the ext4-overlay bootstrap when this image is in use.
+
+## Verification performed
+
+Using the shipped `agentvm-alpine-python.wasm` (no rebuild):
+
+1. **Kernel/device capabilities**
+   - `/proc/filesystems` lists `ext4`, `overlay`, and `9p`.
+   - `/proc/devices` shows `254 virtblk` and `/proc/partitions` shows `vda`
+     (the existing virtio-blk root disk), confirming the guest has a working
+     virtio block driver.
+   - Creating `/dev/loop0` and running `losetup` fails with
+     `Operation not permitted`, confirming loop is not available in this
+     kernel.
+
+2. **9p limitations on a mounted `/workspace`**
+   - `mkdir`, `touch`, `mv` (rename), and `ln -s` (symlink) succeed.
+   - `chmod` fails with `Protocol error` (TinyEMU `fs_setattr` returns
+     `P9_ENOTSUP` for mode changes).
+   - `mknod` fails with `Protocol error` (TinyEMU `fs_mknod` returns
+     `P9_ENOTSUP`), so overlay whiteouts cannot be created.
+   - No xattr tools exist in the image; TinyEMU's 9p server has no
+     xattr operations at all.
+
+   These are exactly the operations overlayfs needs from an `upperdir`, which
+   confirms why overlay-on-9p cannot work without significant 9p/WASI work.
+
+3. **Source-level confirmation**
+   - `ktock/tinyemu-c2w` `fs_disk.c` confirms `fs_mknod` is stubbed out with
+     `P9_ENOTSUP` and `fs_setattr` rejects mode changes; there are no
+     get/set/list xattr handlers.
+   - `temu.c` in WASI mode opens every drive via `fopen(..., "rb")` and
+     hardcodes `BF_MODE_SNAPSHOT`, which is why the patch in this branch is
+     needed for a writable `drive1`.
+   - c2w's `linux_rv64_config` confirms `CONFIG_VIRTIO_BLK=y`,
+     `CONFIG_EXT4_FS=y`, and `# CONFIG_BLK_DEV_LOOP is not set`.
+
+## Still unverified (requires an image rebuild)
+
+- That `drive1: { file: "/workspace/.agentvm/upper.img" }` resolves through
+  Node's WASI preopens from TinyEMU's `fopen` (strongly expected, but only a
+  rebuild can confirm).
+- That the guest sees `/dev/vdb` and `mkfs.ext4 /dev/vdb` works.
+- That overlayfs accepts the ext4 upperdir and that real workloads
+  (`apk add`, `pip install`, `npm install -g`) survive a reboot.
+
+Next step to close these gaps: apply the config change + the included TinyEMU
+patch in `image/build.sh`, add `e2fsprogs` (or a pre-formatted template image),
+and run a two-boot persistence test.
