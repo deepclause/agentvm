@@ -722,7 +722,14 @@ class NetworkStack extends EventEmitter {
     }
 
     _maybeSend(flow) {
-        if (flow.state === 'SYN_SENT' || flow.state === 'SYN_RECEIVED') return;
+        if (flow.state === 'SYN_SENT' || flow.state === 'SYN_RECEIVED') {
+            // No data can be transmitted until the handshake completes, but the
+            // host socket may still be pushing bytes (especially for inbound
+            // port-forwarded flows). Keep backpressure active so `pending`
+            // cannot grow without bound while we wait for the guest.
+            this._updateBackpressure(flow);
+            return;
+        }
         const sendWindow = Math.min(flow.guestWindow, TCP_MAX_IN_FLIGHT);
         let available = Math.max(0, sendWindow - seqDistance(flow.sendUna, flow.sendNext));
 
