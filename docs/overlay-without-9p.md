@@ -216,3 +216,37 @@ Using the shipped `agentvm-alpine-python.wasm` (no rebuild):
 Next step to close these gaps: apply the config change + the included TinyEMU
 patch in `image/build.sh`, add `e2fsprogs` (or a pre-formatted template image),
 and run a two-boot persistence test.
+
+## Full build verification (performed on this branch)
+
+Built a 66 MB test image (`image/Dockerfile.blocktest`, Alpine + `e2fsprogs`)
+with the following changes:
+
+- `drive1` added to the embedded TinyEMU config, backed by
+  `/workspace/.agentvm/upper.img`
+- `image/patches/tinyemu-writable-second-drive.patch` applied
+- Wizer maps `/workspace::/workspace` and a 512 MB dummy drive file is created
+  at build time
+- c2w spec patched to allow block devices and grant `CAP_SYS_ADMIN`
+
+Results:
+
+1. **Second drive is visible to the guest.** `/proc/partitions` shows `vdb`
+   (254:16) with the expected 512 MB size, and `/sys/block/vdb` is present.
+2. **Device cgroup was blocking block devices.** `open("/dev/vdb")` initially
+   returned `EPERM` for `dd`/`blockdev`/`mkfs`. After patching the c2w spec to
+   allow block devices, `mkfs.ext4 /dev/vdb` succeeds.
+3. **Mounting requires CAP_SYS_ADMIN.** After adding it to the spec, `mount`
+   stops returning `EPERM` and reaches the filesystem driver.
+4. **Block writes do not persist (remaining blocker).** After
+   `dd if=/dev/urandom of=/dev/vdb`, reading back `/dev/vdb` returns zeros and
+   the host `upper.img` remains all zeros. `mkfs.ext4` reports success but the
+   ext4 superblock is not visible on readback, so `mount -t ext4 /dev/vdb`
+   fails with `EINVAL`.
+
+Conclusion: the architecture (a second virtio-blk drive used as an ext4
+overlay upperdir) is fundamentally sound and the guest kernel already supports
+it, but TinyEMU's WASI runtime currently does not persist writes through the
+writable block-device path. The next step is to fix `bf_write_async`/the
+WASI update-mode (`r+b`) write-through, or to verify the write path with
+TinyEMU's non-WASI `-rw` mode.

@@ -46,6 +46,7 @@ git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-jit-exports.patch"
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-jit-hook.patch"
 # Generated without context to avoid preserving upstream trailing whitespace.
 git -C "$WORK/tinyemu" apply --unidiff-zero "$HERE/patches/tinyemu-fast-branch.patch"
+git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-writable-second-drive.patch"
 rm -rf "$WORK/tinyemu/.git"
 
 echo "==> Generating patched c2w Dockerfile"
@@ -70,6 +71,21 @@ COPY --from=tinyemu-patched / /
 assert s.count(old) == 1, "unexpected embedded Dockerfile shape"
 s = s.replace(old, new)
 
+# Allow block devices in the container spec so a second virtio drive can be
+# used as a non-9p overlay upperdir (device cgroup otherwise returns EPERM).
+old_assets_clone = "RUN git clone -b ${SOURCE_REPO_VERSION} ${SOURCE_REPO} /assets"
+new_assets_clone = old_assets_clone + (
+    "\nRUN sed -i 's/ctdoci.WithNewPrivileges, \\/\\/ TODO: make it configurable/ctdoci.WithNewPrivileges, \\/\\/ TODO: make it configurable\\n\\t\\tctdoci.WithAllDevicesAllowed,/' /assets/cmd/create-spec/main.go"
+    "\nRUN sed -i '/s.Linux.Seccomp = nil/ a\\\\tif s.Process.Capabilities != nil {\\n"
+    "\\t\\ts.Process.Capabilities.Bounding = append(s.Process.Capabilities.Bounding, \"CAP_SYS_ADMIN\")\\n"
+    "\\t\\ts.Process.Capabilities.Effective = append(s.Process.Capabilities.Effective, \"CAP_SYS_ADMIN\")\\n"
+    "\\t\\ts.Process.Capabilities.Permitted = append(s.Process.Capabilities.Permitted, \"CAP_SYS_ADMIN\")\\n"
+    "\\t\\ts.Process.Capabilities.Ambient = append(s.Process.Capabilities.Ambient, \"CAP_SYS_ADMIN\")\\n"
+    "\\t}' /assets/cmd/create-spec/main.go"
+)
+assert s.count(old_assets_clone) == 1, "unexpected assets clone step"
+s = s.replace(old_assets_clone, new_assets_clone)
+
 # The stock c2w kernel is optimized for size (-Os). npm and Node spend a lot
 # of time in guest syscalls and filesystem/network paths, so use the kernel's
 # normal performance profile (-O2). Apply this to both riscv64 kernel stages.
@@ -92,8 +108,14 @@ s = s.replace(old_cc, new_cc)
 
 # Run Binaryen's optimizer over the linked TinyEMU module before Wizer
 # snapshots it. This shrinks the emulator and can improve V8 tiering.
+old_config_step = "RUN cat /tinyemu.config.template | LOGLEVEL=$LINUX_LOGLEVEL MEMORY_SIZE=$VM_MEMORY_SIZE_MB envsubst > /out/tinyemu.config"
+new_config_step = old_config_step + " && sed -i '$i\\    drive1: { file: \"/workspace/.agentvm/upper.img\" },' /out/tinyemu.config"
+assert s.count(old_config_step) == 1, "unexpected tinyemu config step"
+s = s.replace(old_config_step, new_config_step)
+
 old_wizer = "RUN mv temu temu-org && /tools/wizer/wizer --allow-wasi --wasm-bulk-memory=true -r _start=wizer.resume --mapdir /pack::/pack -o temu temu-org"
 new_wizer = (
+    "RUN mkdir -p /workspace/.agentvm && truncate -s 512M /workspace/.agentvm/upper.img\n"
     "ARG BINARYEN_VERSION\n"
     "RUN wget -O /tmp/binaryen.tar.gz "
     "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/"
@@ -104,7 +126,7 @@ new_wizer = (
     "/binaryen/binaryen-version_${BINARYEN_VERSION}/bin/wasm-opt temu-org -O3 --enable-bulk-memory -o temu-opt && "
     "mv temu-opt temu-org && "
     "/tools/wizer/wizer --allow-wasi --wasm-bulk-memory=true -r _start=wizer.resume "
-    "--mapdir /pack::/pack -o temu temu-org"
+    "--mapdir /pack::/pack --mapdir /workspace::/workspace -o temu temu-org"
 )
 assert s.count(old_wizer) == 1, "unexpected TinyEMU wizer stage"
 s = s.replace(old_wizer, new_wizer)
