@@ -1,0 +1,35 @@
+diff --git a/temu.c b/temu.c
+index 92cb196..0cf0b31 100644
+--- a/temu.c
++++ b/temu.c
+@@ -1039,8 +1039,12 @@ void init_func_args(char *net)
+     /* open the files & devices */
+     for(i = 0; i < p->drive_count; i++) {
+         BlockDevice *drive;
++        BlockDeviceModeEnum mode;
+         char *fname;
+         fname = get_file_path(p->cfg_filename, p->tab_drive[i].filename);
++        /* drive0 is the read-only rootfs ISO. Additional drives are exposed
++         * read-write so they can host a persistent ext4 overlay upperdir. */
++        mode = (i == 0) ? drive_mode : BF_MODE_RW;
+ #ifdef CONFIG_FS_NET
+         if (is_url(fname)) {
+             net_completed = FALSE;
+@@ -1051,7 +1055,7 @@ void init_func_args(char *net)
+         } else
+ #endif
+         {
+-            drive = block_device_init(fname, drive_mode);
++            drive = block_device_init(fname, mode);
+         }
+         free(fname);
+         p->tab_drive[i].block_dev = drive;
+@@ -1451,7 +1455,7 @@ int main(int argc, char **argv)
+         BlockDeviceFile *bf = p->tab_drive[i].block_dev->opaque;
+         char *fname;
+         fname = get_file_path(p->cfg_filename, p->tab_drive[i].filename);
+-        f = fopen(fname, "rb");
++        f = fopen(fname, (i == 0) ? "rb" : "r+b");
+         if (!f) {
+           fprintf(stderr, "failed to open %s: %s\n", fname, strerror(errno));
+           exit(1);
