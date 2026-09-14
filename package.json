@@ -1,12 +1,13 @@
 {
   "name": "deepclause-agentvm",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "main": "src/index.js",
   "bin": {
     "agentvm": "./bin/cli.js"
   },
   "scripts": {
-    "test": "node test/network/stack.test.js && node --test test/network/flows.test.js && node test/basic.test.js && node test/mount.test.js && node test/rmdir-macos.test.js && node test/network/http.test.js"
+    "test": "node test/network/stack.test.js && node --test test/network/flows.test.js && node --test test/network/portforward.test.js && node --test test/firewall.test.js && node --test test/portforward-api.test.js && node --test test/persistent-root.test.js && node --test test/rmdir-macos.test.js && node test/basic.test.js && node test/mount.test.js && node test/network/http.test.js",
+    "test:persistent": "node --test test/persistent-root-integration.test.js"
   },
   "keywords": [
     "vm",

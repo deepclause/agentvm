@@ -1,0 +1,102 @@
+diff --git a/fs_disk.c b/fs_disk.c
+index e2d9dc8..21bbe77 100644
+--- a/fs_disk.c
++++ b/fs_disk.c
+@@ -543,6 +543,8 @@ static int fs_stat(FSDevice *fs, FSFile *f, FSStat *st)
+         st->qid.version = 0;
+         st->qid.path = 0;
+         st->st_mode = P9_S_IFDIR;
++        st->st_uid = 0;
++        st->st_gid = 0;
+         return 0;
+     }
+     if (lstat(f->path, &st1) != 0) {
+diff --git a/temu.c b/temu.c
+index 92cb196..eb07df8 100644
+--- a/temu.c
++++ b/temu.c
+@@ -303,8 +303,9 @@ static int bf_read_async(BlockDevice *bs,
+         fprintf(f, "%" PRId64 " %d\n", sector_num, n);
+     }
+ #endif
+-    if (!bf->f)
++    if (!bf->f) {
+         return -1;
++    }
+     if (bf->mode == BF_MODE_SNAPSHOT) {
+         int i;
+         for(i = 0; i < n; i++) {
+@@ -318,8 +319,8 @@ static int bf_read_async(BlockDevice *bs,
+             buf += SECTOR_SIZE;
+         }
+     } else {
+-        fseek(bf->f, sector_num * SECTOR_SIZE, SEEK_SET);
+-        fread(buf, 1, n * SECTOR_SIZE, bf->f);
++        int fd = fileno(bf->f);
++        pread(fd, buf, n * SECTOR_SIZE, (off_t)sector_num * SECTOR_SIZE);
+     }
+     /* synchronous read */
+     return 0;
+@@ -336,11 +337,18 @@ static int bf_write_async(BlockDevice *bs,
+     case BF_MODE_RO:
+         ret = -1; /* error */
+         break;
+-    case BF_MODE_RW:
+-        fseek(bf->f, sector_num * SECTOR_SIZE, SEEK_SET);
+-        fwrite(buf, 1, n * SECTOR_SIZE, bf->f);
++    case BF_MODE_RW: {
++        ssize_t wr;
++        int fd;
++        if (!bf->f) {
++            ret = -1;
++            break;
++        }
++        fd = fileno(bf->f);
++        wr = pwrite(fd, buf, n * SECTOR_SIZE, (off_t)sector_num * SECTOR_SIZE);
+         ret = 0;
+         break;
++    }
+     case BF_MODE_SNAPSHOT:
+         {
+             int i;
+@@ -1039,8 +1047,12 @@ void init_func_args(char *net)
+     /* open the files & devices */
+     for(i = 0; i < p->drive_count; i++) {
+         BlockDevice *drive;
++        BlockDeviceModeEnum mode;
+         char *fname;
+         fname = get_file_path(p->cfg_filename, p->tab_drive[i].filename);
++        /* drive0 is the read-only rootfs ISO. Additional drives are exposed
++         * read-write so they can host a persistent ext4 overlay upperdir. */
++        mode = (i == 0) ? drive_mode : BF_MODE_RW;
+ #ifdef CONFIG_FS_NET
+         if (is_url(fname)) {
+             net_completed = FALSE;
+@@ -1051,7 +1063,7 @@ void init_func_args(char *net)
+         } else
+ #endif
+         {
+-            drive = block_device_init(fname, drive_mode);
++            drive = block_device_init(fname, mode);
+         }
+         free(fname);
+         p->tab_drive[i].block_dev = drive;
+@@ -1451,10 +1463,15 @@ int main(int argc, char **argv)
+         BlockDeviceFile *bf = p->tab_drive[i].block_dev->opaque;
+         char *fname;
+         fname = get_file_path(p->cfg_filename, p->tab_drive[i].filename);
+-        f = fopen(fname, "rb");
++        f = fopen(fname, (i == 0) ? "rb" : "r+b");
+         if (!f) {
+-          fprintf(stderr, "failed to open %s: %s\n", fname, strerror(errno));
+-          exit(1);
++          if (i == 0) {
++            fprintf(stderr, "failed to open %s: %s\n", fname, strerror(errno));
++            exit(1);
++          }
++          fprintf(stderr, "optional drive %d unavailable: %s\n", i, strerror(errno));
++          bf->f = NULL;
++          continue;
+         }
+         bf->f = f;
+         p->tab_drive[i].block_dev->opaque = bf;

@@ -13,7 +13,7 @@ The entire project, including network stack and hacks for making host directory 
 
 > ⚠️ **DISCLAIMER**: This library is highly experimental and should be used at your own risk. It is not recommended for production use. The underlying WASI implementation may have security vulnerabilities and the API may change without notice.
 
-Latest version on npm: 0.0.5
+Latest version on npm: 0.3.0
 
 ## Installation
 
@@ -95,6 +95,8 @@ main();
 - `options.mounts`: Object mapping VM paths to host paths (e.g., `{ '/mnt/data': './data' }`). Supports reading and writing files from the VM to the host filesystem.
 - `options.network`: Enable networking (default: `true`). Provides full TCP/UDP NAT for internet access.
 - `options.mac`: MAC address for the VM (default: `02:00:00:00:00:01`).
+- `options.persistentRoot`: Persist the guest root filesystem per workspace via an ext4 overlay upperdir on a second virtio block device (default: `false`). Requires a `/workspace` mount.
+- `options.persistentRootDir`: HOST directory where the overlay image (`upper.img`) lives. Defaults to `<workspaceHost>/.agentvm` when a `/workspace` mount is present; otherwise this option is required.
 
 ### `vm.start()`
 Starts the VM worker. Returns a Promise.
@@ -103,8 +105,23 @@ Starts the VM worker. Returns a Promise.
 Executes a shell command.
 - Returns: `Promise<{ stdout: string, stderr: string, exitCode: number }>`
 
-### `vm.stop()`
-Terminates the VM.
+### `vm.stop(options?)`
+Terminates the VM. When `persistentRoot` is enabled, runs `sync` first so ext4/overlay writes are flushed to the backing image.
+
+### `vm.setNetworkEnabled(boolean)`
+Enable or disable guest networking at runtime without a VM restart. Disabling drops all live TCP/UDP host sockets immediately.
+
+### `vm.setFirewall({ default, rules })` / `vm.clearFirewall()`
+Install or clear ordered firewall rules. Rules are `{ id, direction: 'in'|'out', protocol: 'tcp'|'udp', remote: hostname|IP|CIDR|'*', port: number|range|'*', action: 'allow'|'deny' }`. First match wins.
+
+### `vm.addPortForward({ hostPort, guestPort, guestHost?, bind? })`
+Expose a guest TCP server on a host port at runtime. `guestHost` defaults to `192.168.127.3`; `bind` defaults to `127.0.0.1` (use `0.0.0.0` for LAN exposure). Returns a Promise.
+
+### `vm.removePortForward(hostPort)` / `vm.listPortForwards()`
+Remove or list live port forwards.
+
+### `vm.snapshotRoot()`
+Optional tar backup of the guest root (minus `/workspace`, `/proc`, `/sys`, `/dev`, `/run`) to `<persistentRootDir>/root.tar`. Not used by the default ext4-overlay persistence path.
 
 ## Features
 

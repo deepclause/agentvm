@@ -13,7 +13,8 @@ RUN apk add --no-cache \
         nodejs npm \
         bash curl git \
         coreutils \
-        tmux
+        tmux \
+        e2fsprogs
 
 # A shell is the entrypoint AgentVM exec() talks to.
 CMD ["/bin/sh"]
