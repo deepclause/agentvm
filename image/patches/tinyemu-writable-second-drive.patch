@@ -1,8 +1,47 @@
 diff --git a/temu.c b/temu.c
-index 92cb196..0cf0b31 100644
+index 92cb196..c70ea4b 100644
 --- a/temu.c
 +++ b/temu.c
-@@ -1039,8 +1039,12 @@ void init_func_args(char *net)
+@@ -303,8 +303,9 @@ static int bf_read_async(BlockDevice *bs,
+         fprintf(f, "%" PRId64 " %d\n", sector_num, n);
+     }
+ #endif
+-    if (!bf->f)
++    if (!bf->f) {
+         return -1;
++    }
+     if (bf->mode == BF_MODE_SNAPSHOT) {
+         int i;
+         for(i = 0; i < n; i++) {
+@@ -318,8 +319,8 @@ static int bf_read_async(BlockDevice *bs,
+             buf += SECTOR_SIZE;
+         }
+     } else {
+-        fseek(bf->f, sector_num * SECTOR_SIZE, SEEK_SET);
+-        fread(buf, 1, n * SECTOR_SIZE, bf->f);
++        int fd = fileno(bf->f);
++        pread(fd, buf, n * SECTOR_SIZE, (off_t)sector_num * SECTOR_SIZE);
+     }
+     /* synchronous read */
+     return 0;
+@@ -336,11 +337,13 @@ static int bf_write_async(BlockDevice *bs,
+     case BF_MODE_RO:
+         ret = -1; /* error */
+         break;
+-    case BF_MODE_RW:
+-        fseek(bf->f, sector_num * SECTOR_SIZE, SEEK_SET);
+-        fwrite(buf, 1, n * SECTOR_SIZE, bf->f);
++    case BF_MODE_RW: {
++        ssize_t wr;
++        int fd = fileno(bf->f);
++        wr = pwrite(fd, buf, n * SECTOR_SIZE, (off_t)sector_num * SECTOR_SIZE);
+         ret = 0;
+         break;
++    }
+     case BF_MODE_SNAPSHOT:
+         {
+             int i;
+@@ -1039,8 +1042,12 @@ void init_func_args(char *net)
      /* open the files & devices */
      for(i = 0; i < p->drive_count; i++) {
          BlockDevice *drive;
@@ -15,7 +54,7 @@ index 92cb196..0cf0b31 100644
  #ifdef CONFIG_FS_NET
          if (is_url(fname)) {
              net_completed = FALSE;
-@@ -1051,7 +1055,7 @@ void init_func_args(char *net)
+@@ -1051,7 +1058,7 @@ void init_func_args(char *net)
          } else
  #endif
          {
@@ -24,7 +63,7 @@ index 92cb196..0cf0b31 100644
          }
          free(fname);
          p->tab_drive[i].block_dev = drive;
-@@ -1451,7 +1455,7 @@ int main(int argc, char **argv)
+@@ -1451,7 +1458,7 @@ int main(int argc, char **argv)
          BlockDeviceFile *bf = p->tab_drive[i].block_dev->opaque;
          char *fname;
          fname = get_file_path(p->cfg_filename, p->tab_drive[i].filename);

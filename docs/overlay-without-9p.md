@@ -238,15 +238,20 @@ Results:
    allow block devices, `mkfs.ext4 /dev/vdb` succeeds.
 3. **Mounting requires CAP_SYS_ADMIN.** After adding it to the spec, `mount`
    stops returning `EPERM` and reaches the filesystem driver.
-4. **Block writes do not persist (remaining blocker).** After
-   `dd if=/dev/urandom of=/dev/vdb`, reading back `/dev/vdb` returns zeros and
-   the host `upper.img` remains all zeros. `mkfs.ext4` reports success but the
-   ext4 superblock is not visible on readback, so `mount -t ext4 /dev/vdb`
-   fails with `EINVAL`.
+4. **Block writes initially did not persist.** After
+   `dd if=/dev/urandom of=/dev/vdb`, reading back `/dev/vdb` returned zeros and
+   the host `upper.img` stayed all zeros. Debugging showed TinyEMU's stdio
+   `fwrite`/`fflush` reported success but the data never reached the WASI file.
+5. **Fixed by switching block I/O to `pread`/`pwrite`.** The included TinyEMU
+   patch now uses `pread`/`pwrite` on `fileno(bf->f)` instead of
+   `fseek`+`fread`/`fwrite` for read-write drives. After this change the
+   guest reads/writes reach the host `upper.img` correctly.
+6. **Two-boot persistence test passes.** Boot 1: format `/dev/vdb` ext4, mount
+   it, mount overlay with `upperdir`/`workdir` on the ext4 mount, write
+   `/root/test.txt` and `/etc/mymarker/f`, run `sync`, stop. Boot 2: remount
+   `/dev/vdb` + overlay, and both files read back correctly.
 
-Conclusion: the architecture (a second virtio-blk drive used as an ext4
-overlay upperdir) is fundamentally sound and the guest kernel already supports
-it, but TinyEMU's WASI runtime currently does not persist writes through the
-writable block-device path. The next step is to fix `bf_write_async`/the
-WASI update-mode (`r+b`) write-through, or to verify the write path with
-TinyEMU's non-WASI `-rw` mode.
+Conclusion: the non-9p approach works. A second virtio-blk drive formatted
+as ext4 is a valid overlay `upperdir`, and the only remaining integration
+requirement is to run `sync` (or cleanly unmount) before `stop()` so ext4/
+overlay page-cache writes are flushed before the worker is terminated.
