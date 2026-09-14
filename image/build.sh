@@ -109,13 +109,13 @@ s = s.replace(old_cc, new_cc)
 # Run Binaryen's optimizer over the linked TinyEMU module before Wizer
 # snapshots it. This shrinks the emulator and can improve V8 tiering.
 old_config_step = "RUN cat /tinyemu.config.template | LOGLEVEL=$LINUX_LOGLEVEL MEMORY_SIZE=$VM_MEMORY_SIZE_MB envsubst > /out/tinyemu.config"
-new_config_step = old_config_step + " && sed -i '$i\\    drive1: { file: \"/workspace/.agentvm/upper.img\" },' /out/tinyemu.config"
+new_config_step = old_config_step + " && sed -i '$i\\    drive1: { file: \"/agentvm-persist/upper.img\" },' /out/tinyemu.config"
 assert s.count(old_config_step) == 1, "unexpected tinyemu config step"
 s = s.replace(old_config_step, new_config_step)
 
 old_wizer = "RUN mv temu temu-org && /tools/wizer/wizer --allow-wasi --wasm-bulk-memory=true -r _start=wizer.resume --mapdir /pack::/pack -o temu temu-org"
 new_wizer = (
-    "RUN mkdir -p /workspace/.agentvm && truncate -s 512M /workspace/.agentvm/upper.img\n"
+    "RUN mkdir -p /agentvm-persist && truncate -s 512M /agentvm-persist/upper.img\n"
     "ARG BINARYEN_VERSION\n"
     "RUN wget -O /tmp/binaryen.tar.gz "
     "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/"
@@ -126,7 +126,7 @@ new_wizer = (
     "/binaryen/binaryen-version_${BINARYEN_VERSION}/bin/wasm-opt temu-org -O3 --enable-bulk-memory -o temu-opt && "
     "mv temu-opt temu-org && "
     "/tools/wizer/wizer --allow-wasi --wasm-bulk-memory=true -r _start=wizer.resume "
-    "--mapdir /pack::/pack --mapdir /workspace::/workspace -o temu temu-org"
+    "--mapdir /pack::/pack --mapdir /agentvm-persist::/agentvm-persist -o temu temu-org"
 )
 assert s.count(old_wizer) == 1, "unexpected TinyEMU wizer stage"
 s = s.replace(old_wizer, new_wizer)

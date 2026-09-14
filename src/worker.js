@@ -6,7 +6,7 @@ const { RiscVBlockJit } = require('./jit');
 const { expandCompressed } = require('./riscv-c');
 const { RingBufferReader } = require('./ringbuffer');
 
-const { wasmPath, sharedBuffer, mounts, network, mac, netPort } = workerData;
+const { wasmPath, sharedBuffer, mounts, network, mac, netPort, persistentRootHostDir } = workerData;
 
 // Initialize ring buffer reader for shared memory IPC (main → worker data)
 const ringReader = new RingBufferReader(sharedBuffer);
@@ -100,6 +100,12 @@ async function start() {
     
     // Store preopens for our custom path_open implementation
     const preopenPaths = mounts || {};
+    if (persistentRootHostDir) {
+        // A dedicated preopen for the persistent overlay image, kept separate
+        // from the live /workspace 9p share. TinyEMU's drive1 file opens
+        // through this path.
+        preopenPaths['/agentvm-persist'] = persistentRootHostDir;
+    }
     // Map wasi fd to host path (fd 3 onwards)
     const fdToHostPath = new Map();
     let preopen_fd = 3;

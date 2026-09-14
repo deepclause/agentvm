@@ -22,7 +22,7 @@ class AgentVM {
      * @param {boolean} [options.debug] - Enable debug logging.
      * @param {boolean} [options.interactive] - Interactive/raw mode - skip shell setup for direct terminal access.
      * @param {boolean} [options.persistentRoot] - Persist the guest root filesystem per workspace via a non-9p ext4 overlay upperdir (default: false). Requires a `/workspace` mount and an image with a second virtio block device.
-     * @param {string} [options.persistentRootDir] - Guest directory under `/workspace` where the overlay image lives (default: `.agentvm`). Can be relative to `/workspace` or an absolute path under `/workspace`.
+     * @param {string} [options.persistentRootDir] - HOST directory where the overlay image (`upper.img`) lives. Defaults to `<workspaceHost>/.agentvm` when a `/workspace` mount is present, otherwise it must be supplied.
      */
     constructor(options = {}) {
         this.wasmPath = options.wasmPath || path.resolve(__dirname, '../agentvm-alpine-python.wasm');
@@ -213,7 +213,8 @@ class AgentVM {
                     sharedBuffer: this.sharedBuffer,
                     network: this.network,
                     mac: this.mac,
-                    netPort: this.netChannel.port1  // Still needed for worker → main control messages
+                    netPort: this.netChannel.port1,  // Still needed for worker → main control messages
+                    persistentRootHostDir: this.persistentRoot ? this.persistentRootHostDir : null,
                 },
                 transferList: [this.netChannel.port1],
                 env: SHARE_ENV  // Share environment variables with worker thread
@@ -306,47 +307,36 @@ class AgentVM {
      * @private
      */
     _preparePersistentRoot() {
-        const workspaceMount = '/workspace';
-        const workspaceHost = this.mounts[workspaceMount];
-        if (!workspaceHost) {
-            throw new Error('persistentRoot requires a "/workspace" mount');
-        }
-
-        // The persistence directory is stored under the existing workspace 9p
-        // mount so it is automatically per-workspace. Consumers (pi-box or
-        // anything else) can override the subdirectory; agentvm itself has no
-        // opinion about the application name.
-        let guestDir = this.persistentRootDir || '.agentvm';
-        if (guestDir.startsWith('/')) {
-            if (guestDir !== workspaceMount && !guestDir.startsWith(`${workspaceMount}/`)) {
-                throw new Error(`persistentRootDir must be under the "${workspaceMount}" mount`);
-            }
+        // Persistence is a first-class HOST path, independent of the live
+        // /workspace 9p share. When no explicit host path is supplied, default
+        // to a sibling of the workspace mount so it remains per-workspace.
+        let hostDir;
+        if (this.persistentRootDir) {
+            hostDir = path.resolve(this.persistentRootDir);
         } else {
-            guestDir = `${workspaceMount}/${guestDir}`;
+            const workspaceHost = this.mounts['/workspace'];
+            if (!workspaceHost) {
+                throw new Error('persistentRoot requires persistentRootDir (a host path) when no "/workspace" mount is configured');
+            }
+            hostDir = path.join(path.resolve(workspaceHost), '.agentvm');
         }
-        guestDir = path.posix.normalize(guestDir);
-
-        const rel = path.posix.relative(workspaceMount, guestDir);
-        if (rel === '..' || rel.startsWith('../') || path.posix.isAbsolute(rel)) {
-            throw new Error(`persistentRootDir must be under the "${workspaceMount}" mount`);
-        }
-
-        const hostBase = path.join(path.resolve(workspaceHost), ...rel.split('/'));
-        fs.mkdirSync(hostBase, { recursive: true });
+        fs.mkdirSync(hostDir, { recursive: true });
 
         // The second virtio block device is backed by a sparse host file. Keep
         // a fixed 512 MiB for now; the guest formats it ext4 on first boot.
-        const upperHost = path.join(hostBase, 'upper.img');
+        const upperHost = path.join(hostDir, 'upper.img');
         if (!fs.existsSync(upperHost)) {
             const fd = fs.openSync(upperHost, 'w');
             fs.ftruncateSync(fd, 512 * 1024 * 1024);
             fs.closeSync(fd);
         }
 
-        this.persistentRootGuestDir = guestDir;
-        this.persistentRootHostDir = hostBase;
+        // A dedicated WASI preopen path for the persistence image, so it never
+        // collides with the workspace 9p mount.
+        this.persistentRootGuestDir = '/agentvm-persist';
+        this.persistentRootHostDir = hostDir;
         this.persistentRootUpperImgHost = upperHost;
-        this.persistentRootUpperImgGuest = `${guestDir}/upper.img`;
+        this.persistentRootUpperImgGuest = `${this.persistentRootGuestDir}/upper.img`;
     }
 
     /**
@@ -400,13 +390,13 @@ class AgentVM {
      * @private
      */
     _overlayBootstrapScript(marker) {
-        return [
+        const lines = [
             'vdb=$(awk \'$4=="vdb"{print $1":"$2}\' /proc/partitions)',
             'if [ -n "$vdb" ]; then',
             '  major=${vdb%%:*}; minor=${vdb##*:}',
             '  mknod /dev/vdb b "$major" "$minor" 2>/dev/null',
             'fi',
-            'mkdir -p /mnt/persist /newroot/workspace /newroot/dev /newroot/proc /newroot/sys /newroot/run',
+            'mkdir -p /mnt/persist /newroot/dev /newroot/proc /newroot/sys /newroot/run',
             'magic=$(dd if=/dev/vdb bs=1 skip=1080 count=2 2>/dev/null | od -An -tx1 | tr -d " \\n")',
             'if [ "$magic" != "53ef" ]; then',
             '  mkfs.ext4 -q /dev/vdb',
@@ -414,7 +404,12 @@ class AgentVM {
             'mount -t ext4 /dev/vdb /mnt/persist',
             'mkdir -p /mnt/persist/upper /mnt/persist/work',
             'mount -t overlay overlay -o lowerdir=/,upperdir=/mnt/persist/upper,workdir=/mnt/persist/work /newroot',
-            'mount --bind /workspace /newroot/workspace 2>/dev/null || true',
+        ];
+        if (this.mounts['/workspace']) {
+            lines.push('mkdir -p /newroot/workspace');
+            lines.push('mount --bind /workspace /newroot/workspace 2>/dev/null || true');
+        }
+        lines.push(
             'mount --bind /dev /newroot/dev 2>/dev/null || true',
             'mount --bind /proc /newroot/proc 2>/dev/null || true',
             'mount --bind /sys /newroot/sys 2>/dev/null || true',
@@ -426,7 +421,8 @@ class AgentVM {
             'else',
             `  exec chroot . /bin/sh -c 'printf "${marker}\\n"; cd /; exec /bin/sh'`,
             'fi',
-        ].join('\n');
+        );
+        return lines.join('\n');
     }
 
     /**

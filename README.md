@@ -96,7 +96,7 @@ main();
 - `options.network`: Enable networking (default: `true`). Provides full TCP/UDP NAT for internet access.
 - `options.mac`: MAC address for the VM (default: `02:00:00:00:00:01`).
 - `options.persistentRoot`: Persist the guest root filesystem per workspace via an ext4 overlay upperdir on a second virtio block device (default: `false`). Requires a `/workspace` mount.
-- `options.persistentRootDir`: Guest directory under `/workspace` where the overlay image lives (default: `.agentvm`). May be relative to `/workspace` or an absolute path under `/workspace`.
+- `options.persistentRootDir`: HOST directory where the overlay image (`upper.img`) lives. Defaults to `<workspaceHost>/.agentvm` when a `/workspace` mount is present; otherwise this option is required.
 
 ### `vm.start()`
 Starts the VM worker. Returns a Promise.
