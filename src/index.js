@@ -21,8 +21,9 @@ class AgentVM {
      * @param {number} [options.networkRateLimit] - VM-wide network rate limit in bytes/sec (default: 2MiB/s). Set to 0 for unlimited.
      * @param {boolean} [options.debug] - Enable debug logging.
      * @param {boolean} [options.interactive] - Interactive/raw mode - skip shell setup for direct terminal access.
-     * @param {boolean} [options.persistentRoot] - Persist the guest root filesystem per workspace via an overlay (default: false). Requires a `/workspace` mount.
-     * @param {string} [options.persistentRootDir] - Guest directory under `/workspace` where overlay state lives (default: `.agentvm`). Can be relative to `/workspace` or an absolute path under `/workspace`.
+     * @param {boolean} [options.persistentRoot] - Persist the guest root filesystem per workspace via snapshots (default: false). Requires a `/workspace` mount.
+     * @param {string} [options.persistentRootDir] - Guest directory under `/workspace` where persistence state lives (default: `.agentvm`). Can be relative to `/workspace` or an absolute path under `/workspace`.
+     * @param {boolean} [options.persistentRootSnapshotOnStop] - Automatically snapshot the root in `stop()` (default: false). Snapshots can be slow; call `snapshotRoot()` explicitly when needed.
      */
     constructor(options = {}) {
         this.wasmPath = options.wasmPath || path.resolve(__dirname, '../agentvm-alpine-python.wasm');
@@ -34,9 +35,10 @@ class AgentVM {
         this.interactive = options.interactive || false;
         this.persistentRoot = options.persistentRoot || false;
         this.persistentRootDir = options.persistentRootDir || null;
+        this.persistentRootSnapshotOnStop = options.persistentRootSnapshotOnStop === true;
         this.persistentRootGuestDir = null;
         this.persistentRootHostDir = null;
-        this.rootPersistenceMode = 'none'; // 'overlay' when the overlay pivot succeeds
+        this.rootPersistenceMode = this.persistentRoot ? 'snapshot' : 'none';
         this.firewall = { default: 'allow', rules: [] };
         this.portForwards = new Map(); // hostPort -> { hostPort, guestPort, guestHost, protocol, bind, server }
         this.pendingTcpConnects = new Set();
@@ -58,7 +60,7 @@ class AgentVM {
         
         this.worker = null;
         this.pendingCommand = null; // { resolve, reject, marker, outputStr, stderrStr }
-        this.pendingBootstrap = null; // persistent-root bootstrap output capture
+        this.pendingInternal = null; // internal shell command output capture (both modes)
         this.isReady = false;
         this.destroyed = false;
         
@@ -219,29 +221,9 @@ class AgentVM {
             this.worker.on('message', (msg) => {
                 if (msg.type === 'ready') {
                     this.isReady = true;
-                    
-                    // In interactive mode, skip shell setup and resolve immediately
-                    if (this.interactive) {
+                    this._handleReady().then(resolve).catch((err) => {
+                        console.warn('Failed to configure VM:', err.message);
                         resolve();
-                        return;
-                    }
-                    
-                    // Run setup commands for exec() mode. When persistentRoot is
-                    // enabled this also performs the overlay mount + pivot_root.
-                    this._runStartupSetup().then(async () => {
-                         // Auto-setup network if the VM has a NIC and the
-                         // runtime network toggle is currently enabled.
-                         if (this.network && this.networkEnabled) {
-                             try {
-                                 await this.setupNetwork();
-                             } catch (err) {
-                                 console.warn("Failed to setup network:", err.message);
-                             }
-                         }
-                         resolve();
-                    }).catch(err => {
-                         console.warn("Failed to configure shell:", err);
-                         resolve();
                     });
                 } else if (msg.type === 'stdout') {
                     this.handleOutput('stdout', msg.data);
@@ -263,7 +245,7 @@ class AgentVM {
 
             this.worker.on('error', (err) => {
                 if (this.pendingCommand) this.pendingCommand.reject(err);
-                if (this.pendingBootstrap) this.pendingBootstrap.reject(err);
+                if (this.pendingInternal) this.pendingInternal.reject(err);
                 reject(err);
             });
             
@@ -273,8 +255,8 @@ class AgentVM {
                     this.pendingCommand.reject(new Error(`VM exited with code ${code} before command completion`));
                     this.pendingCommand = null;
                 }
-                if (this.pendingBootstrap) {
-                    this.pendingBootstrap.reject(new Error(`VM exited with code ${code} during bootstrap`));
+                if (this.pendingInternal) {
+                    this.pendingInternal.reject(new Error(`VM exited with code ${code} during internal command`));
                 }
                 if (code !== 0 && !this.destroyed) {
                      console.error(`VM Worker exited with code ${code}`);
@@ -284,9 +266,38 @@ class AgentVM {
     }
 
     /**
-     * Create the per-workspace overlay upper/work directories on the host.
-     * The guest sees them through the existing `/workspace` 9p mount, which
-     * makes the overlay automatically per-workspace.
+     * Called once the guest shell is ready. Restores a persisted snapshot when
+     * enabled, then performs the exec-mode shell setup (interactive mode
+     * resolves immediately after restore).
+     * @private
+     */
+    async _handleReady() {
+        if (this.persistentRoot) {
+            try {
+                await this._restorePersistentRoot();
+            } catch (err) {
+                console.warn('[AgentVM] persistent root restore failed:', err.message);
+            }
+        }
+
+        if (this.interactive) return;
+        await this.exec("stty -echo; export PS1=''");
+
+        // Auto-setup network if the VM has a NIC and the runtime network
+        // toggle is currently enabled.
+        if (this.network && this.networkEnabled) {
+            try {
+                await this.setupNetwork();
+            } catch (err) {
+                console.warn('Failed to setup network:', err.message);
+            }
+        }
+    }
+
+    /**
+     * Create the per-workspace persistence directory on the host. The guest
+     * sees it through the existing `/workspace` 9p mount, which makes it
+     * automatically per-workspace.
      * @private
      */
     _preparePersistentRoot() {
@@ -316,57 +327,26 @@ class AgentVM {
         }
 
         const hostBase = path.join(path.resolve(workspaceHost), ...rel.split('/'));
-        fs.mkdirSync(path.join(hostBase, 'upper'), { recursive: true });
-        fs.mkdirSync(path.join(hostBase, 'work'), { recursive: true });
+        fs.mkdirSync(hostBase, { recursive: true });
         this.persistentRootGuestDir = guestDir;
         this.persistentRootHostDir = hostBase;
     }
 
     /**
-     * Build the guest-side overlay mount + pivot_root preamble. If overlayfs is
-     * unavailable the script falls back to restoring a tar snapshot. The marker
-     * is emitted by the post-switch shell (or by the fallback path) so the host
-     * knows the bootstrap has completed even though `exec` replaces the shell.
-     * @param {string} marker
+     * Run an internal shell command in either exec or interactive mode. Output
+     * is captured with a unique marker so the caller knows when it finishes.
+     * @param {string} command
+     * @param {number} [timeoutMs]
+     * @returns {Promise<{stdout: string, stderr: string, exitCode: number}>}
      * @private
      */
-    _buildOverlayPreamble(marker) {
-        const dir = this.persistentRootGuestDir;
-        return [
-            `mkdir -p ${dir}/upper ${dir}/work /newroot`,
-            `if mount -t overlay overlay -o lowerdir=/,upperdir=${dir}/upper,workdir=${dir}/work /newroot 2>/dev/null; then`,
-            '  mkdir -p /newroot/workspace',
-            '  mount --move /workspace /newroot/workspace 2>/dev/null || mount --bind /workspace /newroot/workspace',
-            '  cd /newroot',
-            '  mkdir -p .oldroot',
-            '  if pivot_root . .oldroot 2>/dev/null; then',
-            `    exec /bin/sh -c 'printf "${marker}\\n"; cd /; exec /bin/sh'`,
-            '  else',
-            `    exec chroot . /bin/sh -c 'printf "${marker}\\n"; cd /; exec /bin/sh'`,
-            '  fi',
-            'else',
-            '  echo AGENTVM_OVERLAY_UNSUPPORTED',
-            `  echo ${marker}`,
-            `  if [ -f ${dir}/root.tar.gz ]; then`,
-            `    tar xzf ${dir}/root.tar.gz -C / 2>/dev/null`,
-            '  fi',
-            'fi',
-        ].join('\n');
-    }
-
-    /**
-     * Run the persistent-root bootstrap directly on stdin and resolve when the
-     * new (post-pivot/chroot) shell reports its marker. This avoids losing the
-     * normal `exec` marker to the shell's read-ahead buffer across `exec`.
-     * @private
-     */
-    _execPersistentRootBootstrap() {
+    _execInternal(command, timeoutMs = 30000) {
         const id = randomUUID();
-        const marker = `__AGENTVM_BOOTSTRAP_DONE:${id}`;
-        const script = this._buildOverlayPreamble(marker) + '\n';
+        const marker = `__AGENTVM_INTERNAL:${id}`;
+        const shellCmd = `${command}\nprintf "\\137_AGENTVM_INTERNAL:${id}:$?\\n"\n`;
 
         return new Promise((resolve, reject) => {
-            const bootstrap = {
+            const internal = {
                 marker,
                 stdoutStr: '',
                 stderrStr: '',
@@ -374,55 +354,65 @@ class AgentVM {
                 reject: null,
             };
             const timer = setTimeout(() => {
-                if (this.pendingBootstrap === bootstrap) {
-                    this.pendingBootstrap = null;
-                    reject(new Error('persistent root bootstrap timed out'));
+                if (this.pendingInternal === internal) {
+                    this.pendingInternal = null;
+                    reject(new Error('internal command timed out'));
                 }
-            }, 30000);
-            bootstrap.resolve = (overlay) => {
+            }, timeoutMs);
+            internal.resolve = (result) => {
                 clearTimeout(timer);
-                this.pendingBootstrap = null;
-                resolve({ overlay });
+                this.pendingInternal = null;
+                resolve(result);
             };
-            bootstrap.reject = (err) => {
+            internal.reject = (err) => {
                 clearTimeout(timer);
-                this.pendingBootstrap = null;
+                this.pendingInternal = null;
                 reject(err);
             };
-            this.pendingBootstrap = bootstrap;
-            this.writeToStdin(script).catch(bootstrap.reject);
+            this.pendingInternal = internal;
+            this.writeToStdin(shellCmd).catch(internal.reject);
         });
     }
 
     /**
-     * Run the shell setup commands, including the overlay preamble when
-     * `persistentRoot` is enabled.
+     * Guest command that snapshots the whole root to the workspace persistence
+     * directory. Uncompressed tar is used because gzip in the emulated RISC-V
+     * guest is far slower than the 9p write itself.
      * @private
      */
-    async _runStartupSetup() {
-        if (this.persistentRoot) {
-            const { overlay } = await this._execPersistentRootBootstrap();
-            if (!overlay) {
-                this.rootPersistenceMode = 'none';
-                console.warn('[AgentVM] overlayfs unavailable; persistent root disabled. Use snapshotRoot() before stop() as a fallback.');
-            } else {
-                this.rootPersistenceMode = 'overlay';
-            }
-        }
-        await this.exec("stty -echo; export PS1=''");
+    _snapshotCommand() {
+        const dir = this.persistentRootGuestDir;
+        return `mkdir -p ${dir}; tar cf ${dir}/root.tar / --exclude=workspace --exclude=proc --exclude=sys --exclude=dev --exclude=run --exclude=newroot 2>/dev/null`;
     }
 
     /**
-     * Fallback persistence when overlayfs is unavailable: snapshot the guest
-     * root to `<persistentRootDir>/root.tar.gz`. Call before `stop()`; the next
-     * start restores it automatically.
+     * Guest command that restores a previously saved root snapshot.
+     * @private
+     */
+    _restoreCommand() {
+        const dir = this.persistentRootGuestDir;
+        return `if [ -f ${dir}/root.tar ]; then tar xf ${dir}/root.tar -C / 2>/dev/null; fi`;
+    }
+
+    /**
+     * Save the guest root to the workspace. Used automatically by `stop()` and
+     * also available directly.
      * @returns {Promise<{stdout: string, stderr: string, exitCode: number}>}
      */
     async snapshotRoot() {
         if (!this.isReady) throw new Error('VM not ready');
         if (!this.persistentRootGuestDir) throw new Error('persistentRoot is not enabled');
-        const dir = this.persistentRootGuestDir;
-        return this.exec(`tar czf ${dir}/root.tar.gz / --exclude=/workspace --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run --exclude=/newroot 2>/dev/null; echo snapshot-ok`);
+        return this._execInternal(this._snapshotCommand(), 300000);
+    }
+
+    /**
+     * Restore the guest root from a saved workspace snapshot.
+     * @private
+     */
+    async _restorePersistentRoot() {
+        if (!this.isReady) throw new Error('VM not ready');
+        if (!this.persistentRootGuestDir) throw new Error('persistentRoot is not enabled');
+        return this._execInternal(this._restoreCommand(), 300000);
     }
 
     /**
@@ -453,7 +443,20 @@ class AgentVM {
         return { ip, gateway };
     }
 
-    async stop() {
+    async stop(options = {}) {
+        // Persist the root before tearing the VM down. Snapshotting is opt-in
+        // (or requested per call) because a whole-root tar can be slow.
+        const shouldSnapshot = options.snapshot !== undefined
+            ? options.snapshot
+            : this.persistentRootSnapshotOnStop;
+        if (shouldSnapshot && this.persistentRoot && this.isReady && this.worker && !this.destroyed) {
+            try {
+                await this.snapshotRoot();
+            } catch (err) {
+                console.warn('[AgentVM] persistent root snapshot failed:', err.message);
+            }
+        }
+
         this.destroyed = true;
         
         // Close all port-forward listeners
@@ -1250,28 +1253,36 @@ class AgentVM {
         // Debug
         // console.log(`[VM ${type}]`, JSON.stringify(text));
 
+        // Internal commands (persistent-root restore/snapshot) run in both
+        // exec and interactive modes, so capture them before interactive
+        // output routing.
+        if (this.pendingInternal) {
+            const internal = this.pendingInternal;
+            if (type === 'stdout') {
+                internal.stdoutStr += text;
+                const markerIdx = internal.stdoutStr.indexOf(internal.marker);
+                if (markerIdx !== -1) {
+                    const rest = internal.stdoutStr.substring(markerIdx);
+                    const parts = rest.trim().split(':');
+                    const exitCode = parseInt(parts[parts.length - 1], 10);
+                    internal.resolve({
+                        stdout: internal.stdoutStr.substring(0, markerIdx).trim(),
+                        stderr: internal.stderrStr,
+                        exitCode: isNaN(exitCode) ? 0 : exitCode,
+                    });
+                }
+            } else {
+                internal.stderrStr += text;
+            }
+            return;
+        }
+
         // In interactive mode, call callbacks directly
         if (this.interactive) {
             if (type === 'stdout' && this.onStdout) {
                 this.onStdout(dataUint8);
             } else if (type === 'stderr' && this.onStderr) {
                 this.onStderr(dataUint8);
-            }
-            return;
-        }
-
-        // Persistent-root bootstrap uses its own marker protocol because
-        // `exec` replaces the shell before the normal command marker runs.
-        if (this.pendingBootstrap) {
-            const bootstrap = this.pendingBootstrap;
-            if (type === 'stdout') {
-                bootstrap.stdoutStr += text;
-                if (bootstrap.stdoutStr.includes(bootstrap.marker)) {
-                    const overlay = !bootstrap.stdoutStr.includes('AGENTVM_OVERLAY_UNSUPPORTED');
-                    bootstrap.resolve(overlay);
-                }
-            } else {
-                bootstrap.stderrStr += text;
             }
             return;
         }

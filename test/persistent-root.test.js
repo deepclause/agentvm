@@ -17,8 +17,7 @@ test('persistentRootDir defaults to .agentvm under /workspace', () => {
         const vm = new AgentVM({ mounts: { '/workspace': ws }, persistentRoot: true });
         vm._preparePersistentRoot();
         assert.equal(vm.persistentRootGuestDir, '/workspace/.agentvm');
-        assert.equal(fs.existsSync(path.join(ws, '.agentvm', 'upper')), true);
-        assert.equal(fs.existsSync(path.join(ws, '.agentvm', 'work')), true);
+        assert.equal(fs.existsSync(path.join(ws, '.agentvm')), true);
     } finally {
         fs.rmSync(ws, { recursive: true, force: true });
     }
@@ -30,12 +29,12 @@ test('persistentRootDir accepts relative and absolute guest paths under /workspa
         const relative = new AgentVM({ mounts: { '/workspace': ws }, persistentRoot: true, persistentRootDir: 'state/root' });
         relative._preparePersistentRoot();
         assert.equal(relative.persistentRootGuestDir, '/workspace/state/root');
-        assert.equal(fs.existsSync(path.join(ws, 'state', 'root', 'upper')), true);
+        assert.equal(fs.existsSync(path.join(ws, 'state', 'root')), true);
 
         const absolute = new AgentVM({ mounts: { '/workspace': ws }, persistentRoot: true, persistentRootDir: '/workspace/.pi-box/overlay' });
         absolute._preparePersistentRoot();
         assert.equal(absolute.persistentRootGuestDir, '/workspace/.pi-box/overlay');
-        assert.equal(fs.existsSync(path.join(ws, '.pi-box', 'overlay', 'upper')), true);
+        assert.equal(fs.existsSync(path.join(ws, '.pi-box', 'overlay')), true);
     } finally {
         fs.rmSync(ws, { recursive: true, force: true });
     }
