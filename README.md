@@ -95,6 +95,9 @@ main();
 - `options.mounts`: Object mapping VM paths to host paths (e.g., `{ '/mnt/data': './data' }`). Supports reading and writing files from the VM to the host filesystem.
 - `options.network`: Enable networking (default: `true`). Provides full TCP/UDP NAT for internet access.
 - `options.mac`: MAC address for the VM (default: `02:00:00:00:00:01`).
+- `options.networkRateLimit`: VM-wide network rate limit in bytes/sec (default: 2 MiB/s). Set to `0` for unlimited.
+- `options.debug`: Enable debug logging.
+- `options.interactive`: Interactive/raw mode — skip shell setup for direct terminal access.
 - `options.persistentRoot`: Persist the guest root filesystem per workspace via an ext4 overlay upperdir on a second virtio block device (default: `false`). Requires a `/workspace` mount.
 - `options.persistentRootDir`: HOST directory where the overlay image (`upper.img`) lives. Defaults to `<workspaceHost>/.agentvm` when a `/workspace` mount is present; otherwise this option is required.
 
@@ -104,6 +107,15 @@ Starts the VM worker. Returns a Promise.
 ### `vm.exec(command)`
 Executes a shell command.
 - Returns: `Promise<{ stdout: string, stderr: string, exitCode: number }>`
+
+### `vm.writeToStdin(data)`
+Write raw bytes/strings to the VM console (interactive mode).
+
+### `vm.setupNetwork()`
+Manually bring up `eth0` and run DHCP. Called automatically by `start()` in exec mode. Returns `Promise<{ ip, gateway }>`.
+
+### Interactive-mode callbacks
+Set `vm.onStdout`, `vm.onStderr`, and `vm.onExit` to receive raw console output and exit events when `interactive: true`.
 
 ### `vm.stop(options?)`
 Terminates the VM. When `persistentRoot` is enabled, runs `sync` first so ext4/overlay writes are flushed to the backing image.
@@ -127,6 +139,8 @@ Optional tar backup of the guest root (minus `/workspace`, `/proc`, `/sys`, `/de
 
 - **Full Linux VM**: Runs Alpine Linux with Python in a WASM-based emulator
 - **Networking**: Built-in DHCP, DNS, and TCP/UDP NAT for internet access
+- **Network control**: runtime network on/off, ordered firewall rules, and TCP port forwarding
+- **Persistent root**: optional per-workspace ext4 overlay so guest-root changes survive restarts
 - **Host Filesystem Mounts**: Mount host directories into the VM for file sharing
 - **Command Execution**: Execute shell commands and capture stdout/stderr
 - **Worker Thread**: Runs in a separate thread to avoid blocking the main event loop
