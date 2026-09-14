@@ -382,6 +382,56 @@ class AgentVM {
     }
 
     /**
+     * Run an internal shell command through tmux's `run-shell`, so it executes
+     * in a detached shell even when pi (or another full-screen program) owns
+     * the active pane. The run-shell output is shown in tmux's status line,
+     * which is part of the console stream, so the same marker capture works.
+     * @param {string} command
+     * @param {number} [timeoutMs]
+     * @returns {Promise<{stdout: string, stderr: string, exitCode: number}>}
+     * @private
+     */
+    _execInternalViaTmux(command, timeoutMs = 8000) {
+        const id = randomUUID();
+        const marker = `__AGENTVM_INTERNAL:${id}`;
+        const shellCmd = `run-shell "${command} && echo ${marker}"`;
+
+        return new Promise((resolve, reject) => {
+            const internal = {
+                marker,
+                stdoutStr: '',
+                stderrStr: '',
+                resolve: null,
+                reject: null,
+            };
+            const timer = setTimeout(() => {
+                if (this.pendingInternal === internal) {
+                    this.pendingInternal = null;
+                    reject(new Error('tmux run-shell timed out'));
+                }
+            }, timeoutMs);
+            internal.resolve = (result) => {
+                clearTimeout(timer);
+                this.pendingInternal = null;
+                resolve(result);
+            };
+            internal.reject = (err) => {
+                clearTimeout(timer);
+                this.pendingInternal = null;
+                reject(err);
+            };
+            this.pendingInternal = internal;
+
+            // prefix + colon opens the tmux command prompt; the command then
+            // runs in a detached shell.
+            this.writeToStdin('\x02:')
+                .then(() => new Promise((r) => setTimeout(r, 250)))
+                .then(() => this.writeToStdin(shellCmd + '\r'))
+                .catch(internal.reject);
+        });
+    }
+
+    /**
      * Build the guest-side ext4-overlay bootstrap. The second virtio block
      * device (`/dev/vdb`) is formatted ext4 on first boot and then used as the
      * overlay upperdir/workdir. The marker is emitted by the post-pivot/chroot
@@ -396,7 +446,7 @@ class AgentVM {
             '  major=${vdb%%:*}; minor=${vdb##*:}',
             '  mknod /dev/vdb b "$major" "$minor" 2>/dev/null',
             'fi',
-            'mkdir -p /mnt/persist /newroot/dev /newroot/proc /newroot/sys /newroot/run',
+            'mkdir -p /mnt/persist /newroot/dev/pts /newroot/dev/shm /newroot/dev/mqueue /newroot/proc /newroot/sys /newroot/run',
             'magic=$(dd if=/dev/vdb bs=1 skip=1080 count=2 2>/dev/null | od -An -tx1 | tr -d " \\n")',
             'if [ "$magic" != "53ef" ]; then',
             '  mkfs.ext4 -q /dev/vdb',
@@ -411,6 +461,14 @@ class AgentVM {
         }
         lines.push(
             'mount --bind /dev /newroot/dev 2>/dev/null || true',
+            // devpts is a separate mount under /dev; bind-mount it explicitly
+            // or tmux cannot fork PTYs after the pivot ("fork failed").
+            'mount --bind /dev/pts /newroot/dev/pts 2>/dev/null || mount -t devpts devpts /newroot/dev/pts 2>/dev/null || true',
+            // /dev/console is also a devpts submount; without it the guest
+            // resize daemon's TIOCSWINSZ ioctl targets a plain file.
+            'mount --bind /dev/console /newroot/dev/console 2>/dev/null || true',
+            'mount --bind /dev/shm /newroot/dev/shm 2>/dev/null || true',
+            'mount --bind /dev/mqueue /newroot/dev/mqueue 2>/dev/null || true',
             'mount --bind /proc /newroot/proc 2>/dev/null || true',
             'mount --bind /sys /newroot/sys 2>/dev/null || true',
             'mount --bind /run /newroot/run 2>/dev/null || true',
@@ -515,12 +573,40 @@ class AgentVM {
         return { ip, gateway };
     }
 
+    /**
+     * Flush the ext4/overlay page cache before the worker is terminated, so
+     * writes reach the backing block device. Interactive mode runs `sync`
+     * through tmux's `run-shell` (the active pane is occupied by pi), but
+     * tmux may have exited, in which case we fall back to the plain shell.
+     * @private
+     */
+    async _syncPersistentRoot() {
+        if (!this.isReady || !this.worker || this.destroyed) return;
+
+        if (!this.interactive) {
+            await this._execInternal('sync', 30000);
+            return;
+        }
+
+        try {
+            await this._execInternalViaTmux('sync', 8000);
+        } catch (err) {
+            // tmux is likely not running anymore; the console should be a
+            // plain shell again.
+            try {
+                await this._execInternal('sync', 8000);
+            } catch (err2) {
+                console.warn('[AgentVM] persistent root sync failed:', err2.message);
+            }
+        }
+    }
+
     async stop(options = {}) {
         // Flush the ext4/overlay page cache before terminating the worker so
         // writes reach the backing block device.
         if (this.persistentRoot && this.isReady && this.worker && !this.destroyed) {
             try {
-                await this._execInternal('sync', 30000);
+                await this._syncPersistentRoot();
             } catch (err) {
                 console.warn('[AgentVM] persistent root sync failed:', err.message);
             }
