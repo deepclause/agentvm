@@ -1,7 +1,9 @@
-node_modules/**/*
+node_modules/
 image/*.wasm
 image/*.data
 image/*.js
 image/preinstalled/
 logs/
 *.log
+test-mount/
+*.tar.gz
