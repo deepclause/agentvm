@@ -9,7 +9,7 @@ The virtual machine was created using the [container2wasm (c2w)](https://github.
 In order to keep dependencies minimal, this project currently uses node:wasi, which is known to have some quirks and possibly security flaws.
 
 
-The entire project, including network stack and hacks for making host directory mounts possible, was coded using Opus 4.5.
+The entire project, including network stack and hacks for making host directory mounts possible, was coded using various coding agents and models.
 
 > ⚠️ **DISCLAIMER**: This library is highly experimental and should be used at your own risk. It is not recommended for production use. The underlying WASI implementation may have security vulnerabilities and the API may change without notice.
 
@@ -153,34 +153,39 @@ See `example/vercel-agent.js` for an example of how to use AgentVM as a tool for
 
 ## Building the WASM Image
 
-The WASM image is built from a Docker container using container2wasm:
+The image is built from Docker + [container2wasm (c2w)](https://github.com/container2wasm/container2wasm), but it is **not** a plain `c2w` invocation — `image/build.sh` applies several required patches to the TinyEMU/c2w source before building.
 
-### 1. Install container2wasm
+### Prerequisites (build machine only)
 
-```bash
-git clone https://github.com/nicolo-ribaudo/container2wasm.git
-cd container2wasm
-go build -o c2w ./cmd/c2w
-```
+- Docker with buildx
+- riscv64 binfmt: `docker run --privileged --rm tonistiigi/binfmt --install riscv64`
+- `c2w` on `PATH` (or set `C2W=/path/to/c2w`)
 
-### 2. Create the Dockerfile
-
-```dockerfile
-FROM alpine:latest
-RUN apk add --no-cache python3
-CMD ["/bin/sh"]
-```
-
-### 3. Build the Docker image
+### Build
 
 ```bash
-docker build -t agentvm-alpine-python .
+cd image
+C2W=/path/to/c2w ./build.sh [out.wasm]
 ```
 
-### 4. Convert to WASM
+`build.sh` performs the patching the image depends on:
+
+- applies `patches/tinyemu-*.patch` — `fence.tso` support (required for Node),
+  JIT hooks/exports, a same-page branch fast path, and the writable second
+  drive (`drive1` opened read-write via `pread`/`pwrite`)
+- patches the embedded c2w spec to allow block devices and add `CAP_SYS_ADMIN`
+- adds `drive1: { file: "/agentvm-persist/upper.img" }` to the TinyEMU config
+  (the non-9p ext4 overlay upperdir used by `persistentRoot`)
+- runs Binaryen `wasm-opt` and snapshots the result with Wizer
+
+### Preinstalled pi variant
 
 ```bash
-./c2w agentvm-alpine-python agentvm-alpine-python.wasm
+cd image
+./preinstall-pi.sh            # generates preinstalled/usrlocal (runs npm install in a VM)
+./build-pi.sh agentvm-alpine-python.wasm
 ```
 
-This creates the `agentvm-alpine-python.wasm` file used by AgentVM.
+This produces the `pi`-preinstalled image that `AgentVM` ships by default.
+
+See `image/README.md` for details on the patches and optimizations.
