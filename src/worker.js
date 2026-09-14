@@ -870,7 +870,163 @@ async function start() {
         }
         return origPathFilestatGet(fd, flags, path_ptr, path_len, filestat_ptr);
     };
-    
+
+    // Map Node.js errno codes to WASI preview1 errno values. Used by the
+    // custom path_* handlers below so the guest sees meaningful errors.
+    const nodeErrnoToWasi = (code) => {
+        switch (code) {
+            case 'EACCES': return 2;
+            case 'EAGAIN': return 6;
+            case 'EBADF': return 8;
+            case 'EBUSY': return 16;
+            case 'EEXIST': return 20;
+            case 'EINVAL': return 28;
+            case 'EIO': return 29;
+            case 'EISDIR': return 31;
+            case 'ELOOP': return 32;
+            case 'ENAMETOOLONG': return 37;
+            case 'ENOENT': return 44;
+            case 'ENOMEM': return 48;
+            case 'ENOSPC': return 51;
+            case 'ENOTDIR': return 54;
+            case 'ENOTEMPTY': return 55;
+            case 'ENOTSUP': return 58;
+            case 'EPERM': return 63;
+            case 'EROFS': return 69;
+            case 'EXDEV': return 75;
+            default: return 29; // WASI_ERRNO_IO
+        }
+    };
+
+    // Read a WASI path string out of guest memory. Returns null when the
+    // instance isn't ready, so callers can fall back to the native handler.
+    const readWasiPath = (path_ptr, path_len) => {
+        if (!instance) return null;
+        const mem = new Uint8Array(instance.exports.memory.buffer);
+        return new TextDecoder().decode(mem.slice(path_ptr, path_ptr + path_len));
+    };
+
+    // Resolve a (directory fd, relative path) pair to a host path, mirroring
+    // the resolution path_open already does. Returns:
+    //   { fullPath }   - resolved host path inside a mounted root
+    //   { fallback: true } - fd is not a mount/custom dir fd (call native)
+    //   { errno: 76 }  - resolved path escapes the mounted roots (NOTCAPABLE)
+    const resolveMountHostPath = (fd, pathStr) => {
+        let hostDir = null;
+
+        if (customFdHandles.has(fd)) {
+            const handle = customFdHandles.get(fd);
+            if (handle.type === 'directory') hostDir = handle.hostPath;
+        }
+
+        if (hostDir == null) {
+            const actualFd = fakeFdMap.has(fd) ? fakeFdMap.get(fd) : fd;
+            const preopenInfo = fdToHostPath.get(actualFd);
+            if (preopenInfo) hostDir = preopenInfo.hostPath;
+        }
+
+        if (hostDir == null) return { fallback: true };
+
+        const p = require('path');
+        const rel = (pathStr || '').replace(/^\/+/, '');
+        const fullPath = rel === '' || rel === '.' ? hostDir : p.resolve(hostDir, rel);
+
+        // Keep destructive operations inside the mounted host roots. uvwasi
+        // applies the same sandbox check natively; mirror it so a `..` in the
+        // relative path cannot escape the mount.
+        for (const info of fdToHostPath.values()) {
+            const rel2 = p.relative(info.hostPath, fullPath);
+            if (rel2 === '' ||
+                (rel2 !== '..' && !rel2.startsWith('..' + p.sep) && !p.isAbsolute(rel2))) {
+                return { fullPath };
+            }
+        }
+        return { errno: 76 }; // WASI_ERRNO_NOTCAPABLE
+    };
+
+    // path_create_directory (mkdir) — Node's WASI cannot create directories
+    // through our synthesized directory fds, so route it to fs directly.
+    const origPathCreateDirectory = wasiImport.path_create_directory;
+    wasiImport.path_create_directory = (fd, path_ptr, path_len) => {
+        const pathStr = readWasiPath(path_ptr, path_len);
+        if (pathStr === null) return origPathCreateDirectory(fd, path_ptr, path_len);
+        const resolved = resolveMountHostPath(fd, pathStr);
+        if (resolved.fallback) return origPathCreateDirectory(fd, path_ptr, path_len);
+        if (resolved.errno) return resolved.errno;
+        try {
+            fs.mkdirSync(resolved.fullPath);
+            return 0;
+        } catch (err) {
+            if (process.env.DEBUG_WASI_PATH === '1') {
+                parentPort.postMessage({ type: 'debug', msg: `WASI path_create_directory CUSTOM FAIL: fd=${fd}, path="${pathStr}" => ${err.code} ${err.message}` });
+            }
+            return nodeErrnoToWasi(err.code);
+        }
+    };
+
+    // path_remove_directory (rmdir) — same routing as above. On macOS the
+    // native uvwasi path can fail with EPERM for mounted directories.
+    const origPathRemoveDirectory = wasiImport.path_remove_directory;
+    wasiImport.path_remove_directory = (fd, path_ptr, path_len) => {
+        const pathStr = readWasiPath(path_ptr, path_len);
+        if (pathStr === null) return origPathRemoveDirectory(fd, path_ptr, path_len);
+        const resolved = resolveMountHostPath(fd, pathStr);
+        if (resolved.fallback) return origPathRemoveDirectory(fd, path_ptr, path_len);
+        if (resolved.errno) return resolved.errno;
+        try {
+            fs.rmdirSync(resolved.fullPath);
+            return 0;
+        } catch (err) {
+            if (process.env.DEBUG_WASI_PATH === '1') {
+                parentPort.postMessage({ type: 'debug', msg: `WASI path_remove_directory CUSTOM FAIL: fd=${fd}, path="${pathStr}" => ${err.code} ${err.message}` });
+            }
+            return nodeErrnoToWasi(err.code);
+        }
+    };
+
+    // path_unlink_file (unlink) — same routing as above.
+    const origPathUnlinkFile = wasiImport.path_unlink_file;
+    wasiImport.path_unlink_file = (fd, path_ptr, path_len) => {
+        const pathStr = readWasiPath(path_ptr, path_len);
+        if (pathStr === null) return origPathUnlinkFile(fd, path_ptr, path_len);
+        const resolved = resolveMountHostPath(fd, pathStr);
+        if (resolved.fallback) return origPathUnlinkFile(fd, path_ptr, path_len);
+        if (resolved.errno) return resolved.errno;
+        try {
+            fs.unlinkSync(resolved.fullPath);
+            return 0;
+        } catch (err) {
+            if (process.env.DEBUG_WASI_PATH === '1') {
+                parentPort.postMessage({ type: 'debug', msg: `WASI path_unlink_file CUSTOM FAIL: fd=${fd}, path="${pathStr}" => ${err.code} ${err.message}` });
+            }
+            return nodeErrnoToWasi(err.code);
+        }
+    };
+
+    // path_rename (rename) — same routing as above.
+    const origPathRename = wasiImport.path_rename;
+    wasiImport.path_rename = (old_fd, old_path_ptr, old_path_len, new_fd, new_path_ptr, new_path_len) => {
+        const oldPathStr = readWasiPath(old_path_ptr, old_path_len);
+        if (oldPathStr === null) return origPathRename(old_fd, old_path_ptr, old_path_len, new_fd, new_path_ptr, new_path_len);
+        const newPathStr = readWasiPath(new_path_ptr, new_path_len);
+        if (newPathStr === null) return origPathRename(old_fd, old_path_ptr, old_path_len, new_fd, new_path_ptr, new_path_len);
+        const oldResolved = resolveMountHostPath(old_fd, oldPathStr);
+        if (oldResolved.fallback) return origPathRename(old_fd, old_path_ptr, old_path_len, new_fd, new_path_ptr, new_path_len);
+        if (oldResolved.errno) return oldResolved.errno;
+        const newResolved = resolveMountHostPath(new_fd, newPathStr);
+        if (newResolved.fallback) return origPathRename(old_fd, old_path_ptr, old_path_len, new_fd, new_path_ptr, new_path_len);
+        if (newResolved.errno) return newResolved.errno;
+        try {
+            fs.renameSync(oldResolved.fullPath, newResolved.fullPath);
+            return 0;
+        } catch (err) {
+            if (process.env.DEBUG_WASI_PATH === '1') {
+                parentPort.postMessage({ type: 'debug', msg: `WASI path_rename CUSTOM FAIL: old="${oldPathStr}", new="${newPathStr}" => ${err.code} ${err.message}` });
+            }
+            return nodeErrnoToWasi(err.code);
+        }
+    };
+
     // Debug: trace path operations for mount debugging
     const DEBUG_WASI_PATH = process.env.DEBUG_WASI_PATH === '1';
     if (DEBUG_WASI_PATH) {
