@@ -3,7 +3,13 @@ const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const dgram = require('node:dgram');
 const dns = require('node:dns');
+const net = require('node:net');
+const fs = require('node:fs');
 const { RingBufferWriter, TOTAL_BUFFER_SIZE, IO_READY_INDEX, STDIN_FLAG_INDEX, STDIN_AREA_SIZE } = require('./ringbuffer');
+const { normalizeFirewall, matchFirewall, remoteMatches, isHostname, portMatches } = require('./firewall');
+
+const GATEWAY_IP = '192.168.127.1';
+const GUEST_IP = '192.168.127.3';
 
 class AgentVM {
     /**
@@ -15,14 +21,24 @@ class AgentVM {
      * @param {number} [options.networkRateLimit] - VM-wide network rate limit in bytes/sec (default: 2MiB/s). Set to 0 for unlimited.
      * @param {boolean} [options.debug] - Enable debug logging.
      * @param {boolean} [options.interactive] - Interactive/raw mode - skip shell setup for direct terminal access.
+     * @param {boolean} [options.persistentRoot] - Persist the guest root filesystem per workspace via an overlay (default: false). Requires a `/workspace` mount.
      */
     constructor(options = {}) {
         this.wasmPath = options.wasmPath || path.resolve(__dirname, '../agentvm-alpine-python.wasm');
         this.mounts = options.mounts || {};
         this.network = options.network !== false; // Default to true
+        this.networkEnabled = this.network;
         this.mac = options.mac || '02:00:00:00:00:01';
         this.debug = options.debug || false;
         this.interactive = options.interactive || false;
+        this.persistentRoot = options.persistentRoot || false;
+        this.rootPersistenceMode = 'none'; // 'overlay' when the overlay pivot succeeds
+        this.firewall = { default: 'allow', rules: [] };
+        this.portForwards = new Map(); // hostPort -> { hostPort, guestPort, guestHost, protocol, bind, server }
+        this.pendingTcpConnects = new Set();
+        this.nextIncomingPort = 40000;
+        this.usedIncomingPorts = new Set();
+        this._hostnameRuleCache = new Map(); // hostname -> { ips, expiresAt }
         // TinyEMU's virtio NIC can stop making progress when dozens of flows
         // deliver at native-host speed. A 2 MiB/s VM-wide default is high
         // enough for single downloads while still safe for npm's concurrent
@@ -38,6 +54,7 @@ class AgentVM {
         
         this.worker = null;
         this.pendingCommand = null; // { resolve, reject, marker, outputStr, stderrStr }
+        this.pendingBootstrap = null; // persistent-root bootstrap output capture
         this.isReady = false;
         this.destroyed = false;
         
@@ -58,8 +75,104 @@ class AgentVM {
         this.networkRateTimer = null;
     }
 
+    /**
+     * Enable or disable all guest networking at runtime.
+     * Disabling drops every live TCP/UDP host socket immediately; the guest
+     * keeps its DHCP lease and interface, so new connections simply stall or
+     * (for port-forwarded services) stop accepting.
+     * @param {boolean} enabled
+     */
+    setNetworkEnabled(enabled) {
+        this.networkEnabled = !!enabled;
+        if (enabled) return;
+
+        for (const [key, session] of this.tcpSessions) {
+            try { session.socket.destroy(); } catch (e) {}
+            this._releaseTcpSession(session);
+            this._enqueueRingEvent(() => this.ringWriter.writeTcpError(key, 'network disabled'));
+        }
+        this.tcpSessions.clear();
+        for (const [, session] of this.udpSessions) {
+            try { session.socket.close(); } catch (e) {}
+        }
+        this.udpSessions.clear();
+        this.pendingTcpConnects.clear();
+    }
+
+    /**
+     * Install a firewall configuration. Rules are ordered, first match wins.
+     * @param {{default?: 'allow'|'deny', rules: Array<Object>}} config
+     */
+    setFirewall(config) {
+        this.firewall = normalizeFirewall(config);
+        this._hostnameRuleCache.clear();
+    }
+
+    /**
+     * Remove all firewall rules and restore the default action to allow.
+     */
+    clearFirewall() {
+        this.firewall = { default: 'allow', rules: [] };
+        this._hostnameRuleCache.clear();
+    }
+
+    /**
+     * Resolve a non-wildcard hostname firewall remote to its current IPs,
+     * caching briefly so per-connection DNS lookups do not become a bottleneck.
+     * @param {string} hostname
+     * @returns {Promise<string[]>}
+     */
+    async _resolveHostnameRule(hostname) {
+        const cached = this._hostnameRuleCache.get(hostname);
+        if (cached && cached.expiresAt > Date.now()) return cached.ips;
+        const results = await dns.promises.lookup(hostname, { all: true, verbatim: true });
+        const ips = results.map((r) => r.address);
+        this._hostnameRuleCache.set(hostname, { ips, expiresAt: Date.now() + 60000 });
+        return ips;
+    }
+
+    /**
+     * Evaluate the firewall for a flow. Hostname rules are matched against the
+     * optional hostname first and, when a remote IP is available, resolved and
+     * compared against IP-based rules.
+     * @returns {Promise<'allow'|'deny'>}
+     */
+    async _evaluateFirewall(direction, protocol, remoteIP, port, hostname) {
+        // Iterate the rules in order so first-match-wins is preserved even when
+        // a non-wildcard hostname rule has to be resolved to an IP.
+        for (const rule of this.firewall.rules) {
+            if (rule.direction !== direction || rule.protocol !== protocol) continue;
+            if (!portMatches(rule.port, port)) continue;
+            if (remoteMatches(rule.remote, remoteIP || null, hostname || null)) {
+                return rule.action;
+            }
+            // A non-wildcard hostname rule can also match a resolved IP. This is
+            // what makes `remote: "example.com"` block a direct connection to the
+            // same host after the guest has already resolved it.
+            if (remoteIP && isHostname(rule.remote) && !rule.remote.includes('*')) {
+                try {
+                    const ips = await this._resolveHostnameRule(rule.remote);
+                    if (ips.includes(remoteIP)) return rule.action;
+                } catch (err) {
+                    // Resolution failure should not change the firewall result.
+                }
+            }
+        }
+        return this.firewall.default;
+    }
+
+    /**
+     * Synchronous firewall evaluation for IP/CIDR/port rules only. Hostname
+     * rules that cannot be resolved are not applied here (DNS lookups and the
+     * async TCP path handle those).
+     */
+    _matchFirewallSync(direction, protocol, remoteIP, port, hostname) {
+        return matchFirewall(this.firewall, { direction, protocol, remoteIP, port, hostname });
+    }
+
     async start() {
         if (this.worker) return;
+        if (this.persistentRoot) this._preparePersistentRoot();
         
         // Create MessageChannel for network communication (UDP + TCP)
         this.netChannel = new MessageChannel();
@@ -109,10 +222,12 @@ class AgentVM {
                         return;
                     }
                     
-                    // Run setup commands for exec() mode
-                    this.exec("stty -echo; export PS1=''").then(async () => {
-                         // Auto-setup network if enabled
-                         if (this.network) {
+                    // Run setup commands for exec() mode. When persistentRoot is
+                    // enabled this also performs the overlay mount + pivot_root.
+                    this._runStartupSetup().then(async () => {
+                         // Auto-setup network if the VM has a NIC and the
+                         // runtime network toggle is currently enabled.
+                         if (this.network && this.networkEnabled) {
                              try {
                                  await this.setupNetwork();
                              } catch (err) {
@@ -144,6 +259,7 @@ class AgentVM {
 
             this.worker.on('error', (err) => {
                 if (this.pendingCommand) this.pendingCommand.reject(err);
+                if (this.pendingBootstrap) this.pendingBootstrap.reject(err);
                 reject(err);
             });
             
@@ -153,11 +269,131 @@ class AgentVM {
                     this.pendingCommand.reject(new Error(`VM exited with code ${code} before command completion`));
                     this.pendingCommand = null;
                 }
+                if (this.pendingBootstrap) {
+                    this.pendingBootstrap.reject(new Error(`VM exited with code ${code} during bootstrap`));
+                }
                 if (code !== 0 && !this.destroyed) {
                      console.error(`VM Worker exited with code ${code}`);
                 }
             });
         });
+    }
+
+    /**
+     * Create the per-workspace overlay upper/work directories on the host.
+     * The guest sees them through the existing `/workspace` 9p mount, which
+     * makes the overlay automatically per-workspace.
+     * @private
+     */
+    _preparePersistentRoot() {
+        const workspaceHost = this.mounts['/workspace'];
+        if (!workspaceHost) {
+            throw new Error('persistentRoot requires a "/workspace" mount');
+        }
+        const base = path.join(path.resolve(workspaceHost), '.pi-box', 'overlay');
+        fs.mkdirSync(path.join(base, 'upper'), { recursive: true });
+        fs.mkdirSync(path.join(base, 'work'), { recursive: true });
+        this.persistentRootBaseGuest = '/workspace/.pi-box/overlay';
+    }
+
+    /**
+     * Build the guest-side overlay mount + pivot_root preamble. If overlayfs is
+     * unavailable the script falls back to restoring a tar snapshot. The marker
+     * is emitted by the post-switch shell (or by the fallback path) so the host
+     * knows the bootstrap has completed even though `exec` replaces the shell.
+     * @param {string} marker
+     * @private
+     */
+    _buildOverlayPreamble(marker) {
+        return [
+            'mkdir -p /workspace/.pi-box/overlay/upper /workspace/.pi-box/overlay/work /newroot',
+            'if mount -t overlay overlay -o lowerdir=/,upperdir=/workspace/.pi-box/overlay/upper,workdir=/workspace/.pi-box/overlay/work /newroot 2>/dev/null; then',
+            '  mkdir -p /newroot/workspace',
+            '  mount --move /workspace /newroot/workspace 2>/dev/null || mount --bind /workspace /newroot/workspace',
+            '  cd /newroot',
+            '  mkdir -p .oldroot',
+            '  if pivot_root . .oldroot 2>/dev/null; then',
+            `    exec /bin/sh -c 'printf "${marker}\\n"; cd /; exec /bin/sh'`,
+            '  else',
+            `    exec chroot . /bin/sh -c 'printf "${marker}\\n"; cd /; exec /bin/sh'`,
+            '  fi',
+            'else',
+            '  echo AGENTVM_OVERLAY_UNSUPPORTED',
+            `  echo ${marker}`,
+            '  if [ -f /workspace/.pi-box/root.tar.gz ]; then',
+            '    tar xzf /workspace/.pi-box/root.tar.gz -C / 2>/dev/null',
+            '  fi',
+            'fi',
+        ].join('\n');
+    }
+
+    /**
+     * Run the persistent-root bootstrap directly on stdin and resolve when the
+     * new (post-pivot/chroot) shell reports its marker. This avoids losing the
+     * normal `exec` marker to the shell's read-ahead buffer across `exec`.
+     * @private
+     */
+    _execPersistentRootBootstrap() {
+        const id = randomUUID();
+        const marker = `__AGENTVM_BOOTSTRAP_DONE:${id}`;
+        const script = this._buildOverlayPreamble(marker) + '\n';
+
+        return new Promise((resolve, reject) => {
+            const bootstrap = {
+                marker,
+                stdoutStr: '',
+                stderrStr: '',
+                resolve: null,
+                reject: null,
+            };
+            const timer = setTimeout(() => {
+                if (this.pendingBootstrap === bootstrap) {
+                    this.pendingBootstrap = null;
+                    reject(new Error('persistent root bootstrap timed out'));
+                }
+            }, 30000);
+            bootstrap.resolve = (overlay) => {
+                clearTimeout(timer);
+                this.pendingBootstrap = null;
+                resolve({ overlay });
+            };
+            bootstrap.reject = (err) => {
+                clearTimeout(timer);
+                this.pendingBootstrap = null;
+                reject(err);
+            };
+            this.pendingBootstrap = bootstrap;
+            this.writeToStdin(script).catch(bootstrap.reject);
+        });
+    }
+
+    /**
+     * Run the shell setup commands, including the overlay preamble when
+     * `persistentRoot` is enabled.
+     * @private
+     */
+    async _runStartupSetup() {
+        if (this.persistentRoot) {
+            const { overlay } = await this._execPersistentRootBootstrap();
+            if (!overlay) {
+                this.rootPersistenceMode = 'none';
+                console.warn('[AgentVM] overlayfs unavailable; persistent root disabled. Use snapshotRoot() before stop() as a fallback.');
+            } else {
+                this.rootPersistenceMode = 'overlay';
+            }
+        }
+        await this.exec("stty -echo; export PS1=''");
+    }
+
+    /**
+     * Fallback persistence when overlayfs is unavailable: snapshot the guest
+     * root to `/workspace/.pi-box/root.tar.gz`. Call before `stop()`; the next
+     * start restores it automatically.
+     * @returns {Promise<{stdout: string, stderr: string, exitCode: number}>}
+     */
+    async snapshotRoot() {
+        if (!this.isReady) throw new Error('VM not ready');
+        return this.exec('tar czf /workspace/.pi-box/root.tar.gz / --exclude=/workspace --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run --exclude=/newroot 2>/dev/null; echo snapshot-ok');
     }
 
     /**
@@ -191,6 +427,14 @@ class AgentVM {
     async stop() {
         this.destroyed = true;
         
+        // Close all port-forward listeners
+        for (const forward of this.portForwards.values()) {
+            if (forward.server) {
+                try { forward.server.close(); } catch (e) {}
+            }
+        }
+        this.portForwards.clear();
+
         // Close all UDP sockets
         for (const [key, session] of this.udpSessions) {
             try {
@@ -204,6 +448,7 @@ class AgentVM {
             try {
                 session.socket.destroy();
             } catch (e) {}
+            this._releaseTcpSession(session);
         }
         this.tcpSessions.clear();
         
@@ -308,13 +553,26 @@ class AgentVM {
      */
     async _handleDnsLookup(msg) {
         const { key, name, qtype } = msg;
+        if (!this.networkEnabled) return;
+
+        // DNS is an outbound UDP flow to port 53. Matching by hostname here is
+        // nearly free because the query name is already parsed by the worker.
+        const action = await this._evaluateFirewall('out', 'udp', null, 53, name);
+        if (action === 'deny') {
+            this._enqueueRingEvent(() => this.ringWriter.writeDnsResult({ key, name, qtype, error: 'blocked by firewall' }));
+            return;
+        }
+
         try {
             const family = qtype === 28 ? 6 : (qtype === 1 ? 4 : 0);
             const options = family === 0 ? { all: true, verbatim: true } : { all: true, family, verbatim: true };
             const results = await dns.promises.lookup(name, options);
             const ips = results.map((r) => r.address);
+            // Lookups already in flight when networking is disabled are ignored.
+            if (!this.networkEnabled) return;
             this._enqueueRingEvent(() => this.ringWriter.writeDnsResult({ key, name, qtype, ips }));
         } catch (err) {
+            if (!this.networkEnabled) return;
             this._enqueueRingEvent(() => this.ringWriter.writeDnsResult({ key, name, qtype, error: err.message }));
         }
     }
@@ -337,6 +595,8 @@ class AgentVM {
      */
     _handleUdpSend(msg) {
         const { key, dstIP, dstPort, payload, srcIP, srcPort } = msg;
+        if (!this.networkEnabled) return;
+        if (this._matchFirewallSync('out', 'udp', dstIP, dstPort, null) === 'deny') return;
         
         if (this.debug) {
             console.log(`[UDP] Send request: ${srcIP}:${srcPort} -> ${dstIP}:${dstPort}, ${payload.length} bytes`);
@@ -376,20 +636,43 @@ class AgentVM {
      * Handle TCP connect request from worker
      * @private
      */
-    _handleTcpConnect(msg) {
+    async _handleTcpConnect(msg) {
         const { key, dstIP, dstPort, srcIP, srcPort } = msg;
-        const net = require('net');
-        
-        // Translate gateway IP to localhost for local server access
-        const connectIP = (dstIP === '192.168.127.1') ? '127.0.0.1' : dstIP;
-        
+        if (!this.networkEnabled) return;
+
         // A duplicate SYN must never create a second host socket for the same
-        // guest flow.
+        // guest flow, including while a firewall hostname rule is resolving.
+        if (this.pendingTcpConnects.has(key)) return;
         const existing = this.tcpSessions.get(key);
         if (existing) {
             if (!existing.socket.destroyed) return;
+            this._releaseTcpSession(existing);
             this.tcpSessions.delete(key);
         }
+
+        this.pendingTcpConnects.add(key);
+        try {
+            const action = await this._evaluateFirewall('out', 'tcp', dstIP, dstPort, null);
+            if (action === 'deny') {
+                this._enqueueRingEvent(() => this.ringWriter.writeTcpError(key, 'blocked by firewall'));
+                return;
+            }
+            if (!this.networkEnabled) return;
+            this._openTcpConnect(key, dstIP, dstPort, srcIP, srcPort);
+        } catch (err) {
+            this._enqueueRingEvent(() => this.ringWriter.writeTcpError(key, err.message));
+        } finally {
+            this.pendingTcpConnects.delete(key);
+        }
+    }
+
+    /**
+     * Open the host socket for an outbound guest TCP flow.
+     * @private
+     */
+    _openTcpConnect(key, dstIP, dstPort, srcIP, srcPort) {
+        // Translate gateway IP to localhost for local server access
+        const connectIP = (dstIP === GATEWAY_IP) ? '127.0.0.1' : dstIP;
 
         const socket = new net.Socket();
         
@@ -408,6 +691,7 @@ class AgentVM {
             pendingResume: null
         };
         this.tcpSessions.set(key, session);
+        this._wireTcpSocket(key, socket, session);
         
         if (this.debug) {
             console.log(`[TCP] Connecting to ${connectIP}:${dstPort}, key=${key}`);
@@ -425,7 +709,15 @@ class AgentVM {
                 }
             );
         });
-        
+    }
+
+    /**
+     * Attach the shared host-socket -> worker-ring pipeline for a TCP session.
+     * Both outbound and port-forwarded (inbound) flows reuse this; only the
+     * initiation direction differs.
+     * @private
+     */
+    _wireTcpSocket(key, socket, session) {
         socket.on('data', (data) => {
             if (this.debug) {
                 console.log(`[TCP] Received ${data.length} bytes from server for ${key}`);
@@ -497,6 +789,7 @@ class AgentVM {
                         session.endSent = true;
                         this._enqueueRingEvent(() => this.ringWriter.writeTcpEnd(key));
                     }
+                    this._releaseTcpSession(session);
                     this.tcpSessions.delete(key);
                 }
                 return;
@@ -507,6 +800,7 @@ class AgentVM {
                 session.ringBufferFlushTimer = null;
             }
             this._enqueueRingEvent(() => this.ringWriter.writeTcpClose(key));
+            this._releaseTcpSession(session);
             this.tcpSessions.delete(key);
         });
         
@@ -521,6 +815,7 @@ class AgentVM {
                 session.ringBufferFlushTimer = null;
             }
             this._enqueueRingEvent(() => this.ringWriter.writeTcpError(key, err.message));
+            this._releaseTcpSession(session);
             this.tcpSessions.delete(key);
         });
         
@@ -535,6 +830,17 @@ class AgentVM {
         });
     }
     
+    /**
+     * Release resources tied to a TCP session's key (currently just inbound
+     * ephemeral ports). Call before removing a session from `tcpSessions`.
+     * @private
+     */
+    _releaseTcpSession(session) {
+        if (session && session.incoming) {
+            this.usedIncomingPorts.delete(session.incomingPort);
+        }
+    }
+
     /**
      * Handle TCP send request from worker
      * @private
@@ -566,6 +872,208 @@ class AgentVM {
         }
     }
     
+    /**
+     * Validate and normalize a port-forward configuration.
+     * @private
+     */
+    _validatePortForward(config) {
+        if (!config || typeof config !== 'object') {
+            throw new Error('Port forward config must be an object');
+        }
+        const hostPort = Number(config.hostPort);
+        const guestPort = Number(config.guestPort);
+        if (!Number.isInteger(hostPort) || hostPort < 1 || hostPort > 65535) {
+            throw new Error(`Invalid hostPort: ${config.hostPort}`);
+        }
+        if (!Number.isInteger(guestPort) || guestPort < 1 || guestPort > 65535) {
+            throw new Error(`Invalid guestPort: ${config.guestPort}`);
+        }
+        const protocol = config.protocol || 'tcp';
+        if (protocol !== 'tcp') {
+            throw new Error('Only TCP port forwarding is supported in v1');
+        }
+        const rawGuestHost = config.guestHost || GUEST_IP;
+        const guestOctets = String(rawGuestHost).split('.');
+        if (guestOctets.length !== 4 || guestOctets.some((n) => !/^\d{1,3}$/.test(n) || Number(n) > 255)) {
+            throw new Error(`Invalid guestHost: ${config.guestHost}`);
+        }
+        const guestHost = guestOctets.map(Number).join('.');
+        const bind = config.bind || '127.0.0.1';
+        if (bind !== '127.0.0.1' && bind !== '0.0.0.0') {
+            throw new Error(`Invalid bind address: ${config.bind}`);
+        }
+        return { hostPort, guestPort, guestHost, protocol, bind };
+    }
+
+    /**
+     * Add a live TCP port forward from a host loopback port to a guest port.
+     * No VM restart is required; the listener is bound immediately.
+     * @param {{hostPort: number, guestPort: number, guestHost?: string, protocol?: 'tcp', bind?: '127.0.0.1'|'0.0.0.0'}} config
+     * @returns {Promise<Object>} the normalized forward
+     */
+    async addPortForward(config) {
+        const forward = this._validatePortForward(config);
+        if (this.portForwards.has(forward.hostPort)) {
+            throw new Error(`Port forward already exists for host port ${forward.hostPort}`);
+        }
+
+        const server = net.createServer((socket) => this._handleIncomingTcp(socket, forward));
+        server.on('error', (err) => {
+            if (this.debug) {
+                console.error(`[PortForward] ${forward.hostPort}: ${err.message}`);
+            }
+        });
+
+        await new Promise((resolve, reject) => {
+            const onError = (err) => {
+                server.removeListener('listening', onListening);
+                reject(err);
+            };
+            const onListening = () => {
+                server.removeListener('error', onError);
+                resolve();
+            };
+            server.once('error', onError);
+            server.once('listening', onListening);
+            server.listen(forward.hostPort, forward.bind);
+        });
+
+        forward.server = server;
+        this.portForwards.set(forward.hostPort, forward);
+        return forward;
+    }
+
+    /**
+     * Remove a port forward and tear down its active flows.
+     * @param {number} hostPort
+     * @returns {boolean} true when a forward was removed
+     */
+    removePortForward(hostPort) {
+        const forward = this.portForwards.get(hostPort);
+        if (!forward) return false;
+
+        if (forward.server) {
+            try { forward.server.close(); } catch (e) {}
+        }
+        this.portForwards.delete(hostPort);
+
+        for (const [key, session] of [...this.tcpSessions]) {
+            if (session.forward !== forward) continue;
+            try { session.socket.destroy(); } catch (e) {}
+            this._enqueueRingEvent(() => this.ringWriter.writeTcpError(key, 'port forward removed'));
+            this._releaseTcpSession(session);
+            this.tcpSessions.delete(key);
+        }
+        return true;
+    }
+
+    /**
+     * List current port forwards (without the internal server handles).
+     * @returns {Array<Object>}
+     */
+    listPortForwards() {
+        return [...this.portForwards.values()].map(({ hostPort, guestPort, guestHost, protocol, bind }) => ({
+            hostPort, guestPort, guestHost, protocol, bind,
+        }));
+    }
+
+    /**
+     * Normalize a Node socket remote address for firewall matching.
+     * @private
+     */
+    _normalizeRemoteAddress(address) {
+        return String(address || '').replace(/^::ffff:/, '');
+    }
+
+    /**
+     * Allocate an ephemeral source port for an inbound (port-forwarded) flow.
+     * @private
+     */
+    _allocateIncomingPort() {
+        for (let i = 0; i < 20000; i++) {
+            const port = 40000 + ((this.nextIncomingPort - 40000 + i) % 20000);
+            if (!this.usedIncomingPorts.has(port)) {
+                this.usedIncomingPorts.add(port);
+                this.nextIncomingPort = 40000 + ((port - 40000 + 1) % 20000);
+                return port;
+            }
+        }
+        throw new Error('No ephemeral ports available for port forwarding');
+    }
+
+    /**
+     * Handle a host connection accepted by a port-forward listener. This is
+     * the mirror image of `_openTcpConnect`: instead of connecting a host
+     * socket after a guest SYN, we accept a host socket and ask the worker to
+     * perform an active TCP open toward the guest.
+     * @private
+     */
+    async _handleIncomingTcp(socket, forward) {
+        socket.pause();
+        socket.setKeepAlive(true, 30000);
+        socket.setTimeout(300000);
+
+        if (!this.isReady || this.destroyed || !this.networkEnabled) {
+            socket.destroy();
+            return;
+        }
+
+        const clientIP = this._normalizeRemoteAddress(socket.remoteAddress);
+        try {
+            const action = await this._evaluateFirewall('in', 'tcp', clientIP, forward.hostPort, null);
+            if (action === 'deny' || !this.networkEnabled || this.destroyed) {
+                socket.destroy();
+                return;
+            }
+        } catch (err) {
+            socket.destroy();
+            return;
+        }
+
+        let incomingPort;
+        try {
+            incomingPort = this._allocateIncomingPort();
+        } catch (err) {
+            socket.destroy();
+            return;
+        }
+
+        // The worker computes flow keys from the guest's packet direction, so
+        // this key is `guest -> gateway` just like an outbound flow. The main
+        // thread and worker must agree on this exact string for data routing.
+        const key = `TCP:${forward.guestHost}:${forward.guestPort}:${GATEWAY_IP}:${incomingPort}`;
+        const session = {
+            socket,
+            srcIP: forward.guestHost,
+            srcPort: forward.guestPort,
+            dstIP: GATEWAY_IP,
+            dstPort: incomingPort,
+            incoming: true,
+            incomingPort,
+            forward,
+            rateLimitPaused: this.networkRateLimited,
+            ringBufferPaused: false,
+            flowPaused: false,
+            connectAnnouncementPending: false,
+            pendingResume: null,
+        };
+        this.tcpSessions.set(key, session);
+        this._wireTcpSocket(key, socket, session);
+
+        // The incoming-connect message must enter the ring before any host
+        // bytes are read, so the worker creates the guest flow first. Resume
+        // the socket only after the message is actually written.
+        this._enqueueRingEvent(
+            () => this.ringWriter.writeTcpIncomingConnect({
+                key,
+                guestHost: forward.guestHost,
+                guestPort: forward.guestPort,
+                srcPort: incomingPort,
+            }),
+            () => socket.resume(),
+        );
+    }
+
     /**
      * Schedule flushing of pending ring buffer data
      * @private
@@ -638,7 +1146,10 @@ class AgentVM {
                         console.log(`[RingBuffer] Sent deferred END for ${key}`);
                     }
                 }
-                if (session.socketClosed) this.tcpSessions.delete(key);
+                if (session.socketClosed) {
+                    this._releaseTcpSession(session);
+                    this.tcpSessions.delete(key);
+                }
                 
                 clearInterval(session.ringBufferFlushTimer);
                 session.ringBufferFlushTimer = null;
@@ -716,6 +1227,22 @@ class AgentVM {
                 this.onStdout(dataUint8);
             } else if (type === 'stderr' && this.onStderr) {
                 this.onStderr(dataUint8);
+            }
+            return;
+        }
+
+        // Persistent-root bootstrap uses its own marker protocol because
+        // `exec` replaces the shell before the normal command marker runs.
+        if (this.pendingBootstrap) {
+            const bootstrap = this.pendingBootstrap;
+            if (type === 'stdout') {
+                bootstrap.stdoutStr += text;
+                if (bootstrap.stdoutStr.includes(bootstrap.marker)) {
+                    const overlay = !bootstrap.stdoutStr.includes('AGENTVM_OVERLAY_UNSUPPORTED');
+                    bootstrap.resolve(overlay);
+                }
+            } else {
+                bootstrap.stderrStr += text;
             }
             return;
         }

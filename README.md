@@ -13,7 +13,7 @@ The entire project, including network stack and hacks for making host directory 
 
 > ⚠️ **DISCLAIMER**: This library is highly experimental and should be used at your own risk. It is not recommended for production use. The underlying WASI implementation may have security vulnerabilities and the API may change without notice.
 
-Latest version on npm: 0.0.5
+Latest version on npm: 0.3.0
 
 ## Installation
 
@@ -95,6 +95,7 @@ main();
 - `options.mounts`: Object mapping VM paths to host paths (e.g., `{ '/mnt/data': './data' }`). Supports reading and writing files from the VM to the host filesystem.
 - `options.network`: Enable networking (default: `true`). Provides full TCP/UDP NAT for internet access.
 - `options.mac`: MAC address for the VM (default: `02:00:00:00:00:01`).
+- `options.persistentRoot`: Persist the guest root filesystem per workspace via an overlay (default: `false`). Requires a `/workspace` mount.
 
 ### `vm.start()`
 Starts the VM worker. Returns a Promise.
@@ -105,6 +106,21 @@ Executes a shell command.
 
 ### `vm.stop()`
 Terminates the VM.
+
+### `vm.setNetworkEnabled(boolean)`
+Enable or disable guest networking at runtime without a VM restart. Disabling drops all live TCP/UDP host sockets immediately.
+
+### `vm.setFirewall({ default, rules })` / `vm.clearFirewall()`
+Install or clear ordered firewall rules. Rules are `{ id, direction: 'in'|'out', protocol: 'tcp'|'udp', remote: hostname|IP|CIDR|'*', port: number|range|'*', action: 'allow'|'deny' }`. First match wins.
+
+### `vm.addPortForward({ hostPort, guestPort, guestHost?, bind? })`
+Expose a guest TCP server on a host port at runtime. `guestHost` defaults to `192.168.127.3`; `bind` defaults to `127.0.0.1` (use `0.0.0.0` for LAN exposure). Returns a Promise.
+
+### `vm.removePortForward(hostPort)` / `vm.listPortForwards()`
+Remove or list live port forwards.
+
+### `vm.snapshotRoot()`
+Fallback persistence helper when overlayfs is unavailable: writes the guest root (minus `/workspace`, `/proc`, `/sys`, `/dev`, `/run`) to `/workspace/.pi-box/root.tar.gz`. The next start restores it automatically.
 
 ## Features
 

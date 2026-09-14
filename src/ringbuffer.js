@@ -53,6 +53,7 @@ const NET_MSG_TCP_ERROR = 4;
 const NET_MSG_TCP_CLOSE = 5;
 const NET_MSG_UDP_RECV = 6;
 const NET_MSG_DNS_RESULT = 7;
+const NET_MSG_TCP_INCOMING_CONNECT = 8;
 
 /**
  * Ring buffer writer (used by main thread)
@@ -261,6 +262,27 @@ class RingBufferWriter {
     }
 
     /**
+     * Write an inbound (port-forwarded) TCP connection request.
+     * @param {Object} msg - { key, guestHost, guestPort, srcPort }
+     */
+    writeTcpIncomingConnect(msg) {
+        // Format: keyLen(1) + key + guestHostLen(1) + guestHost
+        //         + guestPort(2) + srcPort(2)
+        const keyBytes = Buffer.from(String(msg.key || ''), 'utf8');
+        const hostBytes = Buffer.from(String(msg.guestHost || ''), 'utf8');
+        if (keyBytes.length > 255 || hostBytes.length > 255) return false;
+        const payload = Buffer.alloc(1 + keyBytes.length + 1 + hostBytes.length + 2 + 2);
+        let o = 0;
+        payload[o++] = keyBytes.length;
+        keyBytes.copy(payload, o); o += keyBytes.length;
+        payload[o++] = hostBytes.length;
+        hostBytes.copy(payload, o); o += hostBytes.length;
+        payload.writeUInt16LE(Number(msg.guestPort) || 0, o); o += 2;
+        payload.writeUInt16LE(Number(msg.srcPort) || 0, o); o += 2;
+        return this.writeMessage(NET_MSG_TCP_INCOMING_CONNECT, payload);
+    }
+
+    /**
      * Write a UDP datagram received by an existing NAT flow.
      * @param {Object} msg - { key, data }
      */
@@ -458,6 +480,18 @@ class RingBufferReader {
         return { key, name, qtype, ips, error };
     }
 
+    /** Parse an inbound TCP connection request: { key, guestHost, guestPort, srcPort }. */
+    parseTcpIncomingConnect(payload) {
+        let o = 0;
+        const keyLen = payload[o++];
+        const key = payload.slice(o, o + keyLen).toString('utf8'); o += keyLen;
+        const hostLen = payload[o++];
+        const guestHost = payload.slice(o, o + hostLen).toString('utf8'); o += hostLen;
+        const guestPort = payload.readUInt16LE(o); o += 2;
+        const srcPort = payload.readUInt16LE(o); o += 2;
+        return { key, guestHost, guestPort, srcPort };
+    }
+
     /** Parse a UDP receive message: { key, data }. */
     parseUdpRecv(payload) {
         const keyLen = payload[0];
@@ -514,5 +548,6 @@ module.exports = {
     NET_MSG_TCP_ERROR,
     NET_MSG_TCP_CLOSE,
     NET_MSG_UDP_RECV,
-    NET_MSG_DNS_RESULT
+    NET_MSG_DNS_RESULT,
+    NET_MSG_TCP_INCOMING_CONNECT
 };
