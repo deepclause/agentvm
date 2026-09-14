@@ -22,6 +22,7 @@ class AgentVM {
      * @param {boolean} [options.debug] - Enable debug logging.
      * @param {boolean} [options.interactive] - Interactive/raw mode - skip shell setup for direct terminal access.
      * @param {boolean} [options.persistentRoot] - Persist the guest root filesystem per workspace via an overlay (default: false). Requires a `/workspace` mount.
+     * @param {string} [options.persistentRootDir] - Guest directory under `/workspace` where overlay state lives (default: `.agentvm`). Can be relative to `/workspace` or an absolute path under `/workspace`.
      */
     constructor(options = {}) {
         this.wasmPath = options.wasmPath || path.resolve(__dirname, '../agentvm-alpine-python.wasm');
@@ -32,6 +33,9 @@ class AgentVM {
         this.debug = options.debug || false;
         this.interactive = options.interactive || false;
         this.persistentRoot = options.persistentRoot || false;
+        this.persistentRootDir = options.persistentRootDir || null;
+        this.persistentRootGuestDir = null;
+        this.persistentRootHostDir = null;
         this.rootPersistenceMode = 'none'; // 'overlay' when the overlay pivot succeeds
         this.firewall = { default: 'allow', rules: [] };
         this.portForwards = new Map(); // hostPort -> { hostPort, guestPort, guestHost, protocol, bind, server }
@@ -286,14 +290,36 @@ class AgentVM {
      * @private
      */
     _preparePersistentRoot() {
-        const workspaceHost = this.mounts['/workspace'];
+        const workspaceMount = '/workspace';
+        const workspaceHost = this.mounts[workspaceMount];
         if (!workspaceHost) {
             throw new Error('persistentRoot requires a "/workspace" mount');
         }
-        const base = path.join(path.resolve(workspaceHost), '.pi-box', 'overlay');
-        fs.mkdirSync(path.join(base, 'upper'), { recursive: true });
-        fs.mkdirSync(path.join(base, 'work'), { recursive: true });
-        this.persistentRootBaseGuest = '/workspace/.pi-box/overlay';
+
+        // The persistence directory is stored under the existing workspace 9p
+        // mount so it is automatically per-workspace. Consumers (pi-box or
+        // anything else) can override the subdirectory; agentvm itself has no
+        // opinion about the application name.
+        let guestDir = this.persistentRootDir || '.agentvm';
+        if (guestDir.startsWith('/')) {
+            if (guestDir !== workspaceMount && !guestDir.startsWith(`${workspaceMount}/`)) {
+                throw new Error(`persistentRootDir must be under the "${workspaceMount}" mount`);
+            }
+        } else {
+            guestDir = `${workspaceMount}/${guestDir}`;
+        }
+        guestDir = path.posix.normalize(guestDir);
+
+        const rel = path.posix.relative(workspaceMount, guestDir);
+        if (rel === '..' || rel.startsWith('../') || path.posix.isAbsolute(rel)) {
+            throw new Error(`persistentRootDir must be under the "${workspaceMount}" mount`);
+        }
+
+        const hostBase = path.join(path.resolve(workspaceHost), ...rel.split('/'));
+        fs.mkdirSync(path.join(hostBase, 'upper'), { recursive: true });
+        fs.mkdirSync(path.join(hostBase, 'work'), { recursive: true });
+        this.persistentRootGuestDir = guestDir;
+        this.persistentRootHostDir = hostBase;
     }
 
     /**
@@ -305,9 +331,10 @@ class AgentVM {
      * @private
      */
     _buildOverlayPreamble(marker) {
+        const dir = this.persistentRootGuestDir;
         return [
-            'mkdir -p /workspace/.pi-box/overlay/upper /workspace/.pi-box/overlay/work /newroot',
-            'if mount -t overlay overlay -o lowerdir=/,upperdir=/workspace/.pi-box/overlay/upper,workdir=/workspace/.pi-box/overlay/work /newroot 2>/dev/null; then',
+            `mkdir -p ${dir}/upper ${dir}/work /newroot`,
+            `if mount -t overlay overlay -o lowerdir=/,upperdir=${dir}/upper,workdir=${dir}/work /newroot 2>/dev/null; then`,
             '  mkdir -p /newroot/workspace',
             '  mount --move /workspace /newroot/workspace 2>/dev/null || mount --bind /workspace /newroot/workspace',
             '  cd /newroot',
@@ -320,8 +347,8 @@ class AgentVM {
             'else',
             '  echo AGENTVM_OVERLAY_UNSUPPORTED',
             `  echo ${marker}`,
-            '  if [ -f /workspace/.pi-box/root.tar.gz ]; then',
-            '    tar xzf /workspace/.pi-box/root.tar.gz -C / 2>/dev/null',
+            `  if [ -f ${dir}/root.tar.gz ]; then`,
+            `    tar xzf ${dir}/root.tar.gz -C / 2>/dev/null`,
             '  fi',
             'fi',
         ].join('\n');
@@ -387,13 +414,15 @@ class AgentVM {
 
     /**
      * Fallback persistence when overlayfs is unavailable: snapshot the guest
-     * root to `/workspace/.pi-box/root.tar.gz`. Call before `stop()`; the next
+     * root to `<persistentRootDir>/root.tar.gz`. Call before `stop()`; the next
      * start restores it automatically.
      * @returns {Promise<{stdout: string, stderr: string, exitCode: number}>}
      */
     async snapshotRoot() {
         if (!this.isReady) throw new Error('VM not ready');
-        return this.exec('tar czf /workspace/.pi-box/root.tar.gz / --exclude=/workspace --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run --exclude=/newroot 2>/dev/null; echo snapshot-ok');
+        if (!this.persistentRootGuestDir) throw new Error('persistentRoot is not enabled');
+        const dir = this.persistentRootGuestDir;
+        return this.exec(`tar czf ${dir}/root.tar.gz / --exclude=/workspace --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run --exclude=/newroot 2>/dev/null; echo snapshot-ok`);
     }
 
     /**

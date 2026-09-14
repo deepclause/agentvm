@@ -96,6 +96,7 @@ main();
 - `options.network`: Enable networking (default: `true`). Provides full TCP/UDP NAT for internet access.
 - `options.mac`: MAC address for the VM (default: `02:00:00:00:00:01`).
 - `options.persistentRoot`: Persist the guest root filesystem per workspace via an overlay (default: `false`). Requires a `/workspace` mount.
+- `options.persistentRootDir`: Guest directory under `/workspace` where overlay state lives (default: `.agentvm`). May be relative to `/workspace` or an absolute path under `/workspace` (for example `/workspace/.pi-box/overlay`).
 
 ### `vm.start()`
 Starts the VM worker. Returns a Promise.
@@ -120,7 +121,7 @@ Expose a guest TCP server on a host port at runtime. `guestHost` defaults to `19
 Remove or list live port forwards.
 
 ### `vm.snapshotRoot()`
-Fallback persistence helper when overlayfs is unavailable: writes the guest root (minus `/workspace`, `/proc`, `/sys`, `/dev`, `/run`) to `/workspace/.pi-box/root.tar.gz`. The next start restores it automatically.
+Fallback persistence helper when overlayfs is unavailable: writes the guest root (minus `/workspace`, `/proc`, `/sys`, `/dev`, `/run`) to `<persistentRootDir>/root.tar.gz`. The next start restores it automatically.
 
 ## Features
 
