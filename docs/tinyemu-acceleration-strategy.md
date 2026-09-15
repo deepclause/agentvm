@@ -532,6 +532,14 @@ Codegen improvements that produced these numbers:
   miss / unaligned / cross-page) resumes the interpreter at the exact faulting
   instruction.
 
+**Leaf call inlining.** A loop body containing a small helper call could not
+form a self-loop trace because the call ended the trace. The decoder now
+inlines a straight-line leaf callee (no branch/call, does not write `ra`, ends
+in `ret`), capped at `AGENTVM_JIT_INLINE_MAX` (default 6) instructions so a
+large inlined callee cannot bloat the trace. On a loop calling a
+one-instruction helper the JIT measures **~6×**; the cap keeps `python-loop`
+from regressing.
+
 `AGENTVM_JIT=1` still opts in (the default remains off); when off, a
 `jit_enabled` flag makes the C dispatcher return immediately, so the default
 path pays nothing. The build applies `image/patches/tinyemu-jit-table.patch`
