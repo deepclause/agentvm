@@ -3,6 +3,7 @@ const { WASI } = require('node:wasi');
 const fs = require('node:fs');
 const { NetworkStack } = require('./network');
 const { RiscVBlockJit, BAIL_BIT, BAIL_MASK, isSupportedInstruction } = require('./jit');
+const refRun = require('./riscv-ref').run;
 const { expandCompressed } = require('./riscv-c');
 const { RingBufferReader } = require('./ringbuffer');
 
@@ -79,6 +80,8 @@ const JIT_HIT_THRESHOLD = Number(process.env.AGENTVM_JIT_THRESHOLD || 50);
 const JIT_PC_MIN = BigInt(process.env.AGENTVM_JIT_PC_MIN || '0');
 const JIT_PC_MAX = BigInt(process.env.AGENTVM_JIT_PC_MAX || '0x4000000000');
 const JIT_ALLOW_COMPRESSED = process.env.AGENTVM_JIT_NO_C !== '1';
+// Differential verification against src/riscv-ref.js (debug only, slow).
+const JIT_VERIFY = process.env.AGENTVM_JIT_VERIFY === '1';
 const jitHitCounts = new Map();
 const jitBlockCache = new Map();
 const jitUnsupported = new Set();
@@ -86,6 +89,7 @@ const jitUnsupported = new Set();
 // interpreter at least once so it can fill the TLB. Otherwise the JIT would be
 // re-entered at the same PC and bail forever.
 const jitBailSkip = new Set();
+const jitVerifyReported = new Set();
 const JIT_TERMINAL = new Set([0x63, 0x6f, 0x67]);
 
 async function start() {
@@ -1450,7 +1454,14 @@ async function start() {
                             jitUnsupported.add(pcKey);
                             return 0;
                         }
-                        entry = { first, run, cycles: instructions.length };
+                        entry = {
+                            first,
+                            run,
+                            cycles: instructions.length,
+                            instructions,
+                            sizes,
+                            hasStore: instructions.some((n) => (n & 0x7f) === 0x23),
+                        };
                         jitBlockCache.set(pcKey, entry);
                         if (DEBUG_JIT) {
                             parentPort.postMessage({ type: 'debug', msg: `JIT compile pc=0x${pcKey} (${instructions.length} insns, sizes=${sizes.join(',')}): ${instructions.map((n) => n.toString(16)).join(',')}` });
@@ -1460,6 +1471,70 @@ async function start() {
                     const regsPtr = Number(exports.jit_regs_ptr(statePtr));
                     const tlbRead = Number(exports.jit_tlb_ptr(statePtr, 0));
                     const tlbWrite = Number(exports.jit_tlb_ptr(statePtr, 1));
+
+                    if (JIT_VERIFY) {
+                        const view0 = () => new BigInt64Array(instance.exports.memory.buffer, regsPtr, 32);
+                        const snap = Array.from(view0());
+                        const rd = (addr, size) => {
+                            switch (size) {
+                                case 1: return exports.jit_read_u8(statePtr, addr);
+                                case 2: return exports.jit_read_u16(statePtr, addr);
+                                case 4: return exports.jit_read_u32(statePtr, addr);
+                                default: return exports.jit_read_u64(statePtr, addr);
+                            }
+                        };
+                        const wr = (addr, size, val) => {
+                            switch (size) {
+                                case 1: exports.jit_write_u8(statePtr, addr, val); break;
+                                case 2: exports.jit_write_u16(statePtr, addr, val); break;
+                                case 4: exports.jit_write_u32(statePtr, addr, val); break;
+                                default: exports.jit_write_u64(statePtr, addr, val); break;
+                            }
+                        };
+                        const refRegs = snap.slice();
+                        const undos = [];
+                        const memIface = {
+                            read(addr, size, signed) {
+                                const v = rd(addr, size);
+                                return signed ? BigInt.asIntN(size * 8, v) : v;
+                            },
+                            write(addr, size, val) {
+                                undos.push({ addr, size, old: rd(addr, size) });
+                                wr(addr, size, val);
+                                return true;
+                            },
+                        };
+                        // Run the reference on a copy of the registers, undo its
+                        // memory writes, then run the JIT from the same state.
+                        const refRes = refRun(entry.instructions, entry.sizes, refRegs, memIface, pc);
+                        for (let i = undos.length - 1; i >= 0; i--) wr(undos[i].addr, undos[i].size, undos[i].old);
+                        const jitNext = entry.run(regsPtr, tlbRead, pc, statePtr, tlbWrite);
+                        const jitRegs = Array.from(view0());
+                        if (jitNext & BAIL_BIT) {
+                            exports.jit_sub_cycles(statePtr, entry.cycles);
+                            exports.jit_set_pc(statePtr, jitNext & BAIL_MASK);
+                            jitBailSkip.add((jitNext & BAIL_MASK).toString(16));
+                            return 0;
+                        }
+                        const refNext = refRes.fault ? refRes.pc : refRes.next;
+                        let detail = '';
+                        for (let i = 0; i < 32; i++) {
+                            if (jitRegs[i] !== refRegs[i]) detail += ` x${i}:jit=${jitRegs[i]},ref=${refRegs[i]}`;
+                        }
+                        if (jitNext !== refNext) detail += ` pc:jit=0x${jitNext.toString(16)},ref=0x${refNext.toString(16)}`;
+                        if (detail && !jitVerifyReported.has(pcKey)) {
+                            jitVerifyReported.add(pcKey);
+                            parentPort.postMessage({ type: 'debug', msg: `JIT VERIFY MISMATCH pc=0x${pcKey} ${entry.instructions.map((n) => n.toString(16))} [${entry.sizes}]${detail}` });
+                        }
+                        {
+                            const v = view0();
+                            for (let i = 0; i < 32; i++) v[i] = jitRegs[i];
+                        }
+                        exports.jit_sub_cycles(statePtr, entry.cycles);
+                        exports.jit_set_pc(statePtr, jitNext);
+                        return 1;
+                    }
+
                     const next = entry.run(regsPtr, tlbRead, pc, statePtr, tlbWrite);
                     exports.jit_sub_cycles(statePtr, entry.cycles);
                     if (next & BAIL_BIT) {
@@ -1477,7 +1552,7 @@ async function start() {
                     }
                     return 1;
                 } catch (err) {
-                    if (DEBUG_JIT) parentPort.postMessage({ type: 'debug', msg: `JIT fallback: ${err.message}` });
+                    if (DEBUG_JIT) parentPort.postMessage({ type: 'debug', msg: `JIT fallback: ${err.message}${JIT_VERIFY ? '\n' + err.stack : ''}` });
                     return 0;
                 }
             },

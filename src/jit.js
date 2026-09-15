@@ -197,7 +197,7 @@ class RiscVBlockJit {
 
         let pc = 0;
         for (let i = 0; i < instructions.length; i++) {
-            this._emitInstruction(out, instructions[i], pc);
+            this._emitInstruction(out, instructions[i], pc, sizes[i]);
             pc += sizes[i];
         }
 
@@ -427,7 +427,7 @@ class RiscVBlockJit {
         out.push(Buffer.from([opcode, 0x00, 0x00])); // store, align=0 offset=0
     }
 
-    _emitInstruction(out, insn, pc) {
+    _emitInstruction(out, insn, pc, size = 4) {
         const opcode = insn & 0x7f;
         const rd = (insn >>> 7) & 0x1f;
         const rs1 = (insn >>> 15) & 0x1f;
@@ -583,14 +583,14 @@ class RiscVBlockJit {
                     21,
                 );
                 this._beginStore(out, rd);
-                this._emitPcConst(out, pc + 4);
+                this._emitPcConst(out, pc + size);
                 this._endStore(out, rd);
                 this._emitReturnRel(out, pc + imm);
                 break;
             }
             case 0x67: { // JALR
                 this._beginStore(out, rd);
-                this._emitPcConst(out, pc + 4);
+                this._emitPcConst(out, pc + size);
                 this._endStore(out, rd);
                 this._loadReg(out, rs1);
                 this._const64(out, immI);

@@ -41,8 +41,8 @@ function expandCompressed(insn) {
         const rd1 = 8 + ((insn >> 2) & 7);
         const rs1 = 8 + ((insn >> 7) & 7);
         switch (funct3) {
-            case 0: { // C.ADDI4SPN
-                const imm = (((insn >> 12) & 3) << 4) | (((insn >> 7) & 0xf) << 6) | (((insn >> 5) & 1) << 3) | (((insn >> 6) & 1) << 2);
+            case 0: { // C.ADDI4SPN (imm[5:4]=inst[12:11], imm[9:6]=inst[10:7], imm[3]=inst[5], imm[2]=inst[6])
+                const imm = (((insn >> 11) & 3) << 4) | (((insn >> 7) & 0xf) << 6) | (((insn >> 5) & 1) << 3) | (((insn >> 6) & 1) << 2);
                 if (imm === 0) return null;
                 return encI(rd1, 2, 0, imm);
             }
@@ -147,12 +147,12 @@ function expandCompressed(insn) {
                 const shamt = ((insn >> 2) & 0x1f) | (((insn >> 12) & 1) << 5);
                 return encI(rd, rd, 1, shamt);
             }
-            case 2: { // C.LWSP
-                const imm = (((insn >> 12) & 1) << 5) | (((insn >> 4) & 7) << 6) | (((insn >> 2) & 3) << 2);
+            case 2: { // C.LWSP (CI: offset field = {inst[12], inst[6:2]}, scaled by 4)
+                const imm = ((((insn >> 12) & 1) << 5) | ((insn >> 2) & 0x1f)) << 2;
                 return encI(rd, 2, 2, imm, 0x03);
             }
-            case 3: { // C.LDSP
-                const imm = (((insn >> 12) & 1) << 5) | (((insn >> 4) & 7) << 6) | (((insn >> 2) & 3) << 3);
+            case 3: { // C.LDSP (CI: same field, scaled by 8)
+                const imm = ((((insn >> 12) & 1) << 5) | ((insn >> 2) & 0x1f)) << 3;
                 return encI(rd, 2, 3, imm, 0x03);
             }
             case 4: { // C.JR / C.MV / C.EBREAK / C.JALR / C.ADD
@@ -168,12 +168,12 @@ function expandCompressed(insn) {
                 if (rs2 !== 0 && rs1 !== 0) return encR(rs1, rs1, rs2, 0, 0); // C.ADD
                 return null;
             }
-            case 6: { // C.SWSP
-                const imm = (((insn >> 12) & 1) << 5) | (((insn >> 7) & 7) << 6) | (((insn >> 9) & 3) << 2);
+            case 6: { // C.SWSP (CSS: offset = inst[12:7], scaled by 4)
+                const imm = ((insn >> 7) & 0x3f) << 2;
                 return encS(2, rs2, 2, imm);
             }
-            case 7: { // C.SDSP
-                const imm = (((insn >> 12) & 1) << 5) | (((insn >> 7) & 7) << 6) | (((insn >> 9) & 3) << 3);
+            case 7: { // C.SDSP (CSS: same field, scaled by 8)
+                const imm = ((insn >> 7) & 0x3f) << 3;
                 return encS(2, rs2, 3, imm);
             }
             default:

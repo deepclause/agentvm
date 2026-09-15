@@ -457,23 +457,34 @@ up (each is covered by a unit test):
 - `sraiw` tested the wrong instruction bit for the arithmetic shift;
 - the compressed decoder expanded `c.lw`/`c.ld`/`c.lwsp`/`c.ldsp` to `slti`
   instead of loads (wrong opcode), decoded CA-format `c.sub`/`c.xor`/`c.or`/
-  `c.and`/`c.subw`/`c.addw` with the wrong discriminator, and dropped the sign
-  of `c.lui`;
-- `c.addiw` was missing entirely.
+  `c.and`/`c.subw`/`c.addw` with the wrong discriminator, dropped the sign of
+  `c.lui`, used the wrong offset fields for `c.lwsp`/`c.ldsp`/`c.swsp`/
+  `c.sdsp`, and took `c.addi4spn`'s `imm[5:4]` from the wrong bits;
+- `c.addiw` was missing entirely;
+- `JAL`/`JALR` hard-coded the link address as `pc + 4`, which is wrong for
+  2-byte compressed instructions (e.g. `c.jalr`).
 
-With compressed translation disabled (`AGENTVM_JIT_NO_C=1`, a debugging knob),
-the JIT boots a full VM, runs a 50 M-iteration integer loop with the correct
-result, and measures **1.07×** over the interpreter. With compressed decoding
-enabled it still hangs, so at least one compressed encoding is still wrong; the
-next step is a differential decoder test that generates compressed instructions
-with `riscv64-linux-gnu-as` and compares each expansion against the assembler's
-disassembly.
+Two independent checkers now exist:
 
-The structural limit remains: TinyEMU calls `jit_try_block` once per basic
-block, and the generated block returns after every branch. A hot loop therefore
-crosses WASM→JS→WASM once per iteration. To win on real workloads the JIT must
-keep dispatch in WASM and execute a loop/region per host call; the translator,
-TLB export and bail semantics are the foundation for that.
+- `tools/check-riscv-c.js` assembles a corpus with `riscv64-linux-gnu-as` and
+  compares every compressed expansion against the assembler (ALU, loads/stores,
+  shifts, branches and jumps all match).
+- `AGENTVM_JIT_VERIFY=1` runs `src/riscv-ref.js`, an independent BigInt
+  reference interpreter, differentially against every translated block. It
+  found and helped fix the `JALR` link bug and now reports **zero** mismatches
+  across ALU/load/store/branch blocks (the reference's stores are undone before
+  the JIT runs so load-after-store blocks are checked cleanly).
+
+So the translator itself is now believed correct. Full-VM boot under
+`AGENTVM_JIT=1` still does not complete, and it is **not** a translation error:
+with `AGENTVM_JIT_NO_C=1` (compressed translation off) the JIT boots a full VM,
+runs a 50 M-iteration integer loop with the correct result, and measures
+**1.07×** over the interpreter. The remaining blocker is the dispatch model:
+TinyEMU calls `jit_try_block` from JavaScript once per basic block, and the
+generated block returns after every branch, so a hot loop crosses
+WASM→JS→WASM once per iteration. To win on real workloads the JIT must keep
+dispatch in WASM and execute a whole loop/region per host call; the translator,
+TLB export, bail semantics and verifier are the foundation for that.
 
 ### 7.7 Expected impact
 
