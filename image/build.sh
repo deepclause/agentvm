@@ -111,7 +111,7 @@ s = s.replace(old_assets_clone, new_assets_clone)
 config_copy = "COPY --link --from=assets /config/tinyemu/linux_rv64_config ./.config\n"
 config_tune = config_copy + (
     "RUN scripts/config --disable CC_OPTIMIZE_FOR_SIZE "
-    "--enable CC_OPTIMIZE_FOR_PERFORMANCE"
+    "--enable CC_OPTIMIZE_FOR_PERFORMANCE --enable TRANSPARENT_HUGEPAGE --enable TRANSPARENT_HUGEPAGE_ALWAYS"
     + (" --enable RISCV_PV_ACCEL" if pv_accel else "")
     + "\n"
 )
