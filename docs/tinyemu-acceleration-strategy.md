@@ -490,13 +490,23 @@ Two mitigations are implemented on top of the translator:
 2. **Trace decoder.** The worker follows forward (exit) branches through a loop
    body until the back edge, so a **top-tested** loop is compiled as one
    self-looping trace rather than stopping at the first branch.
+3. **Loops only.** Non-loop blocks cannot amortize the per-block host dispatch,
+   so by default only loop traces are compiled (`AGENTVM_JIT_ALL_BLOCKS=1`
+   restores compiling every block). This keeps boot close to normal speed.
 
-On a call-free integer loop compiled without compressed instructions the JIT
-now measures **3.32×** over the interpreter (JIT off 2429 ms, JIT on 731 ms,
-identical results). Coverage is still the limit: a loop body that contains a
-`call` (JAL/JALR) ends the trace at the call, so most real boot/agent loops are
-not yet traced. Closing that gap needs either call inlining in the trace
-compiler or, better, the in-WASM region dispatcher below.
+Measured with the loops-only policy on the acceptance image:
+
+| workload | JIT off | JIT on | speedup |
+|---|---:|---:|---:|
+| boot | 1572 ms | 1862 ms | 0.84× (18% overhead) |
+| call-free integer loop (50 M iters) | 2941 ms | 700 ms | **4.20×** |
+
+The `AGENTVM_JIT_VERIFY=1` reference check was extended to simulate the
+self-loop iterations and reports **zero** mismatches while booting the full VM.
+Coverage is still the limit: a loop body that contains a `call` (JAL/JALR) ends
+the trace at the call, so most real boot/agent loops are not yet traced.
+Closing that gap needs either call inlining in the trace compiler or, better,
+the in-WASM region dispatcher below.
 
 ### 7.7 Expected impact
 

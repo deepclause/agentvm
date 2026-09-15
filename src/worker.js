@@ -80,6 +80,7 @@ const JIT_HIT_THRESHOLD = Number(process.env.AGENTVM_JIT_THRESHOLD || 50);
 const JIT_PC_MIN = BigInt(process.env.AGENTVM_JIT_PC_MIN || '0');
 const JIT_PC_MAX = BigInt(process.env.AGENTVM_JIT_PC_MAX || '0x4000000000');
 const JIT_ALLOW_COMPRESSED = process.env.AGENTVM_JIT_NO_C !== '1';
+const JIT_ONLY_LOOPS = process.env.AGENTVM_JIT_ALL_BLOCKS !== '1';
 // Differential verification against src/riscv-ref.js (debug only, slow).
 const JIT_VERIFY = process.env.AGENTVM_JIT_VERIFY === '1';
 const jitHitCounts = new Map();
@@ -1441,6 +1442,7 @@ async function start() {
                         const sizes = [];
                         let cursor = pc;
                         let ok = true;
+                        let isLoop = false;
                         for (;;) {
                             if (instructions.length >= 256) { ok = false; break; }
                             const insn = readGuestInsn(exports, statePtr, cursor);
@@ -1451,14 +1453,20 @@ async function start() {
                             sizes.push(Number(insn.size));
                             if (op === 0x63) {
                                 const target = cursor + BigInt(branchOffset(word));
-                                if (target === pc) break;                 // back edge to the trace start
+                                if (target === pc) { isLoop = true; break; } // back edge to the trace start
                                 if (target > cursor) { cursor += insn.size; continue; } // forward exit
                                 ok = false; break;                        // backward branch into the middle
                             }
-                            if (op === 0x6f || op === 0x67) break;        // terminal jump/return
+                            if (op === 0x6f) {
+                                const rd = (word >>> 7) & 0x1f;
+                                const target = cursor + BigInt(jalOffset(word));
+                                if (rd === 0 && target === pc) isLoop = true;
+                                break;                                    // otherwise a terminal jump
+                            }
+                            if (op === 0x67) break;                       // terminal return
                             cursor += insn.size;
                         }
-                        if (!ok || instructions.length === 0) {
+                        if (!ok || instructions.length === 0 || (JIT_ONLY_LOOPS && !isLoop)) {
                             jitUnsupported.add(pcKey);
                             return 0;
                         }
@@ -1469,6 +1477,9 @@ async function start() {
                             jitUnsupported.add(pcKey);
                             return 0;
                         }
+                        // A non-loop block cannot amortize the per-block host
+                        // dispatch, so by default only self-loop traces are
+                        // compiled; everything else stays in the interpreter.
                         entry = {
                             first,
                             run: compiled.run,
@@ -1498,7 +1509,7 @@ async function start() {
                     const tlbRead = jitFixed.tlbRead;
                     const tlbWrite = jitFixed.tlbWrite;
 
-                    if (JIT_VERIFY && !entry.selfLoop) {
+                    if (JIT_VERIFY) {
                         const view0 = () => new BigInt64Array(instance.exports.memory.buffer, regsPtr, 32);
                         const snap = Array.from(view0());
                         const rd = (addr, size) => {
@@ -1532,7 +1543,14 @@ async function start() {
                         };
                         // Run the reference on a copy of the registers, undo its
                         // memory writes, then run the JIT from the same state.
-                        const refRes = refRun(entry.instructions, entry.sizes, refRegs, memIface, pc);
+                        // Run the reference for the same number of internal
+                        // iterations the JIT self-loop performs (up to the
+                        // budget), so they can be compared directly.
+                        let refRes;
+                        for (let it = 0; ; it++) {
+                            refRes = refRun(entry.instructions, entry.sizes, refRegs, memIface, pc);
+                            if (refRes.fault || refRes.next !== pc || it + 1 >= LOOP_BUDGET) break;
+                        }
                         for (let i = undos.length - 1; i >= 0; i--) wr(undos[i].addr, undos[i].size, undos[i].old);
                         const jitNext = entry.run(regsPtr, tlbRead, pc, statePtr, tlbWrite);
                         const jitRegs = Array.from(view0());
