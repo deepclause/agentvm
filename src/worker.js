@@ -1469,7 +1469,8 @@ async function start() {
                             if (op === 0x67) break;                       // terminal return
                             cursor += insn.size;
                         }
-                        if (!ok || instructions.length === 0 || (JIT_ONLY_LOOPS && !isLoop && instructions.length < JIT_MIN_BLOCK)) {
+                        const allowedNonLoop = JIT_MIN_BLOCK > 0 && instructions.length >= JIT_MIN_BLOCK;
+                        if (!ok || instructions.length === 0 || (JIT_ONLY_LOOPS && !isLoop && !allowedNonLoop)) {
                             jitUnsupported.add(pcKey);
                             return 0;
                         }

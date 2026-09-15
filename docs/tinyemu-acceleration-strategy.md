@@ -500,13 +500,23 @@ Measured with the loops-only policy on the acceptance image:
 |---|---:|---:|---:|
 | boot | 1572 ms | 1862 ms | 0.84× (18% overhead) |
 | call-free integer loop (50 M iters) | 2941 ms | 700 ms | **4.20×** |
+| `node` integer loop | 2420 ms | 2870 ms | 0.84× |
+| `python3 sum(range(2e6))` | 5010 ms | 7781 ms | 0.64× |
+
+So the JIT is a clear win on ALU-only loops and a **loss** on the memory-heavy
+Node/Python loops that matter. The likely cause is V8 tiering: the interpreter
+is one large WASM function that V8 turbo-fans, while each generated loop trace
+is a small separate `WebAssembly.Module` that V8 only baseline-compiles
+(Liftoff), so its memory-access path is slower than the interpreter's. Growing
+the loop budget (up to 65 536 iterations per call) did not change this, so it
+is not call overhead or tier-up latency.
 
 The `AGENTVM_JIT_VERIFY=1` reference check was extended to simulate the
 self-loop iterations and reports **zero** mismatches while booting the full VM.
-Coverage is still the limit: a loop body that contains a `call` (JAL/JALR) ends
-the trace at the call, so most real boot/agent loops are not yet traced.
-Closing that gap needs either call inlining in the trace compiler or, better,
-the in-WASM region dispatcher below.
+The JIT stays off by default (`AGENTVM_JIT=1` opts in). Making it a real win on
+Node/Python needs generated code that V8 optimizes (one large module per
+trace/region, or an AOT-compiled hot set) plus coverage of loops that contain
+calls — i.e. the in-WASM region dispatcher below, not more per-block tuning.
 
 ### 7.7 Expected impact
 

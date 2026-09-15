@@ -10,7 +10,7 @@ const BAIL_MASK = (1n << 63n) - 1n;
 // Maximum iterations a self-loop block executes per host call. This amortizes
 // the JavaScript dispatch across many guest iterations; the interpreter is
 // re-entered periodically so timers and interrupts still fire.
-const LOOP_BUDGET = 64;
+const LOOP_BUDGET = Number(process.env.AGENTVM_JIT_LOOP_BUDGET || 64);
 
 // Minimal RISC-V (RV64) integer block translator -> WebAssembly.
 //
