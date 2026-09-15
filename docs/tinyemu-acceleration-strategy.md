@@ -507,12 +507,12 @@ Measured on the acceptance image:
 | workload | JIT off | JIT on | speedup |
 |---|---:|---:|---:|
 | boot | 1572 ms | 1618 ms | 0.97× |
-| call-free ALU loop (50 M iters) | 2760 ms | 176 ms | **15.68×** |
+| call-free ALU loop (50 M iters) | 2791 ms | 190 ms | **14.7–15.7×** |
 | call-free load/store loop (5 M iters) | 250 ms | 113 ms | **2.21×** |
-| `node` integer loop | 2550 ms | 2593 ms | 0.98× |
-| `node` string loop | 2761 ms | 2761 ms | 1.00× |
-| `python3 sum(range(2e6))` | 5046 ms | 5006 ms | 1.01× |
-| `python3` for-loop (1e6) | 22584 ms | 23500 ms | 0.96× |
+| `node` integer loop | 2668 ms | 2560 ms | 1.04× |
+| `node` string loop | 2740 ms | 2687 ms | 1.02× |
+| `python3 sum(range(2e6))` | 4230 ms | 4460 ms | 0.95× |
+| `python3` for-loop (1e6) | 22829 ms | 21770 ms | 1.05× |
 
 With the JavaScript per-boundary hook gone, Node and Python are at parity and
 the loop speedup rose from 7.8× to 15.7× (the remaining 2–4% on some workloads
@@ -532,9 +532,10 @@ Codegen improvements that produced these numbers:
   miss / unaligned / cross-page) resumes the interpreter at the exact faulting
   instruction.
 
-`AGENTVM_JIT=1` still opts in (the default remains off). The build applies
-`image/patches/tinyemu-jit-table.patch` and links with
-`-Wl,--export-table -Wl,--growable-table`.
+`AGENTVM_JIT=1` still opts in (the default remains off); when off, a
+`jit_enabled` flag makes the C dispatcher return immediately, so the default
+path pays nothing. The build applies `image/patches/tinyemu-jit-table.patch`
+and links with `-Wl,--export-table -Wl,--growable-table`.
 
 ### 7.7 Expected impact
 
