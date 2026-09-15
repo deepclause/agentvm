@@ -87,8 +87,12 @@ explicit opt-in escape hatch, not a default.
   - Kernel config is already lean (UP, HZ=100, no modules/PCI/KALLSYMS);
     `NO_HZ_IDLE`, disabled EFI/virtio-input/compaction are left for a
     separate, individually measured change.
-- **Tier 2 (JIT) — this is the next step.** `tools/jit-spike.js` remains the
-  go/no-go measurement.
+- **Tier 2 (JIT) — foundation implemented; blocked on in-WASM dispatch.**
+  `src/jit.js` now has a tested `directTlb` mode (inlined TLB, direct memory,
+  precise bail) and `image/patches/tinyemu-jit-tlb.patch` exports the TLB
+  pointers. `AGENTVM_JIT=1` still hangs because dispatch happens in JavaScript
+  once per basic block and a translated block corrupts control flow; see
+  §7.6 for the isolated diagnosis and the required next step.
 
 ---
 
@@ -424,22 +428,58 @@ miss). On Node v22:
 | 400 | 20 000 | 3 335.4 ms | 69.3 ms | **48.1×** | match |
 | 1000 | 30 000 | 12 143.8 ms | 269.8 ms | **45.0×** | match |
 
-This is the memory-access path only; dispatch and decoding still need fixing
-(§7.1, §7.2). But it shows why the old JIT could never win and that the
-proposed integration removes the dominant per-access cost. Run it with:
+This is the memory-access path only; dispatch and decoding still need fixing.
+But it shows why the old JIT could never win and that the proposed integration
+removes the dominant per-access cost. Run it with:
 
 ```bash
 node tools/jit-spike.js [units] [iterations]
 ```
 
-### 7.6 Expected impact
+### 7.6 Implementation status and the remaining blocker
+
+The direct-TLB translator is implemented on `perf/tinyemu-jit`:
+
+- `src/jit.js` `directTlb` mode: imports the emulator memory, inlines the TLB
+  check in generated WASM, does direct loads/stores, and **bails precisely** on
+  a TLB miss, unaligned access or cross-page access by returning the faulting
+  instruction's PC with the high bit set. Everything before the access has
+  already committed, so the interpreter resumes correctly. Stores check the
+  write TLB, so write protection cannot be bypassed.
+- `image/patches/tinyemu-jit-tlb.patch` exports `jit_tlb_ptr(state, which)`.
+- `isSupportedInstruction()` strictly rejects the M extension (which shares
+the OP opcode with add/sub and was previously mistranslated).
+- `test/jit-direct.test.js` covers stores/loads, sign/zero extension, precise
+  bail, unaligned bail, and M-extension rejection (8 checks).
+
+End-to-end, `AGENTVM_JIT=1` still hangs during boot. The cause is now isolated:
+
+1. **Per-block JavaScript dispatch is structural.** TinyEMU calls
+   `jit_try_block` once per basic block. Even with all translation cached, a hot
+   loop that ends at a backward branch crosses WASM→JS→WASM once per iteration,
+   which cancels the translated block's savings. (Disabling compilation with a
+   huge `AGENTVM_JIT_THRESHOLD` lets the VM boot normally, confirming that the
+   per-call overhead itself is survivable; it is the *executed* translated code
+   that hangs.)
+2. **A translated-code bug corrupts control flow.** With immediate compilation
+   and a user-space PC gate, boot reaches userspace and then a block returns
+   PC 0 (`ret` with a clobbered return register), after which the guest spins.
+   A JS reference interpreter for the supported subset, run differentially
+   against the JIT, is the needed next tool.
+
+The lesson is that a winning JIT must keep dispatch **inside WASM** and execute
+multiple basic blocks (a loop) per host call. The translator and TLB export are
+the correct foundation; the missing piece is the in-WASM region/trace
+scheduler.
+
+### 7.7 Expected impact
 
 A correct WASM-native translator with direct memory and trace chaining should
 be 3–8× over the interpreter on compute-bound code. It is a large project; the
 MVP (phase 1 ISA, single blocks, differential harness, one workload) is the
 gate. If the MVP does not beat the interpreter by ≥2× on a Node loop, stop.
 
-### 7.7 Alternatives to writing one
+### 7.8 Alternatives to writing one
 
 - **Put the riscv64 guest under QEMU TCG→WASM instead of TinyEMU**, reusing the
   c2wx HCI/region machinery. QEMU TCG already handles every instruction, MMU,

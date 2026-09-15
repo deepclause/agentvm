@@ -31,6 +31,13 @@ TINYEMU_REV="${TINYEMU_REV:-e4e9bd198f9c0505ab4c77a6a9d038059cd1474a}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+# Keep the kernel patch in its own build context so that changing a TinyEMU
+# patch does not invalidate the (expensive) kernel build stage.
+mkdir -p "$WORK/kernel-patches"
+if [ "$PV_ACCEL" = "1" ]; then
+    cp "$HERE/patches/linux-riscv-pv-accel.patch" "$WORK/kernel-patches/"
+fi
+
 echo "==> Building riscv64 source image: $IMAGE_NAME"
 docker buildx build \
     --platform linux/riscv64 \
@@ -47,6 +54,7 @@ git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-low-risk-performance.patch"
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-rv64-only.patch"
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-jit-exports.patch"
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-jit-hook.patch"
+git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-jit-tlb.patch"
 # Generated without context to avoid preserving upstream trailing whitespace.
 git -C "$WORK/tinyemu" apply --unidiff-zero "$HERE/patches/tinyemu-fast-branch.patch"
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-writable-second-drive.patch"
@@ -178,7 +186,7 @@ echo "==> Converting to WASM: $OUT (memory ${VM_MEMORY_SIZE_MB} MiB)"
     --build-arg "INIT_DEBUG=false" \
     --dockerfile "$WORK/Dockerfile.c2w" \
     --extra-flag "--build-context=tinyemu-patched=$WORK/tinyemu" \
-    --extra-flag "--build-context=kernel-patches=$HERE/patches" \
+    --extra-flag "--build-context=kernel-patches=$WORK/kernel-patches" \
     "$IMAGE_NAME" \
     "$OUT"
 

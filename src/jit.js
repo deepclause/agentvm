@@ -2,6 +2,11 @@
 
 const { decodeRiscV } = require('./riscv-c');
 
+// High bit of the i64 returned by a direct-TLB block means "bail at this PC".
+// The low 63 bits are the guest PC to resume the interpreter at.
+const BAIL_BIT = -(1n << 63n);
+const BAIL_MASK = (1n << 63n) - 1n;
+
 // Minimal RISC-V (RV64) integer block translator -> WebAssembly.
 //
 // This is the first JIT milestone. It translates straight-line sequences of
@@ -73,13 +78,23 @@ class RiscVBlockJit {
         this.instructions = instructions;
         this.sizes = sizes || instructions.map(() => 4);
         this.externalMemory = !!options.externalMemory;
+        // directTlb: import the emulator's linear memory and do guest accesses
+        // by checking TinyEMU's TLB in generated WASM. This avoids a JS
+        // callback per load/store, which is what makes the JS-callback mode
+        // unusable. Params: (regs, tlbRead, pc:i64, statePtr, tlbWrite).
+        this.directTlb = !!options.directTlb;
     }
 
     _typeSection() {
         const parts = [];
-        const runParams = this.externalMemory
-            ? [0x7f, 0x7f, 0x7e, 0x7f] // regs, mem, pc (i64), statePtr
-            : [0x7f, 0x7f, 0x7e];
+        let runParams;
+        if (this.directTlb) {
+            runParams = [0x7f, 0x7f, 0x7e, 0x7f, 0x7f]; // regs, tlbRead, pc(i64), statePtr, tlbWrite
+        } else if (this.externalMemory) {
+            runParams = [0x7f, 0x7f, 0x7e, 0x7f]; // regs, mem, pc(i64), statePtr
+        } else {
+            runParams = [0x7f, 0x7f, 0x7e];
+        }
         parts.push(Buffer.concat([
             Buffer.from([0x60]), u32leb(runParams.length), Buffer.from(runParams),
             u32leb(1), Buffer.from([0x7e]),
@@ -100,34 +115,22 @@ class RiscVBlockJit {
     }
 
     _importSection() {
-        if (!this.externalMemory) {
-            return section(2, Buffer.concat([
-                u32leb(1),
-                stringBytes('env'),
-                stringBytes('memory'),
-                Buffer.from([0x02, 0x00, 0x01]), // memory, min 1 page
-            ]));
-        }
         const envMemory = Buffer.concat([
             stringBytes('env'),
             stringBytes('memory'),
-            Buffer.from([0x02, 0x00, 0x01]),
+            Buffer.from([0x02, 0x00, 0x01]), // memory, min 1 page
         ]);
-        const envLoad = Buffer.concat([
-            stringBytes('env'),
-            stringBytes('load'),
-            Buffer.from([0x00]), u32leb(1),
-        ]);
-        const envStore = Buffer.concat([
-            stringBytes('env'),
-            stringBytes('store'),
-            Buffer.from([0x00]), u32leb(2),
+        if (!this.externalMemory) {
+            return section(2, Buffer.concat([u32leb(1), envMemory]));
+        }
+        const fn = (mod, name, type) => Buffer.concat([
+            stringBytes(mod), stringBytes(name), Buffer.from([0x00]), u32leb(type),
         ]);
         return section(2, Buffer.concat([
             u32leb(3),
             envMemory,
-            envLoad,
-            envStore,
+            fn('env', 'load', 1),
+            fn('env', 'store', 2),
         ]));
     }
 
@@ -185,7 +188,12 @@ class RiscVBlockJit {
 
     _emitBody(instructions, sizes) {
         const out = [];
-        out.push(Buffer.from([0x00])); // zero locals
+        if (this.directTlb) {
+            // locals 5 = vaddr (i64), 6 = TLB entry address (i32), 7 = val (i64)
+            out.push(Buffer.from([0x03, 0x01, 0x7e, 0x01, 0x7f, 0x01, 0x7e]));
+        } else {
+            out.push(Buffer.from([0x00])); // zero locals
+        }
 
         let pc = 0;
         for (let i = 0; i < instructions.length; i++) {
@@ -290,7 +298,79 @@ class RiscVBlockJit {
         out.push(Buffer.from([0x6a])); // i32.add
     }
 
-    _emitLoad(out, rd, rs1, imm, opcode, size) {
+    // --- direct-TLB memory model (see constructor comment) ----------------
+    // vaddr = reg[rs1] + imm (i64, local 5)
+    // entry = tlb<tlbLocal> + ((vaddr >> 12) & 255) * 16 (i32, local 6)
+    // tlbLocal is 1 (read) for loads and 4 (write) for stores, so a store
+    // always re-checks the write TLB and cannot bypass write protection.
+    _emitTlbEntry(out, rs1, imm, tlbLocal) {
+        this._loadReg(out, rs1);
+        if (imm) {
+            this._const64(out, imm);
+            out.push(Buffer.from([0x7c])); // i64.add
+        }
+        out.push(Buffer.from([0x21, 0x05])); // local.set 5
+        out.push(Buffer.from([0x20, 0x05])); // local.get 5
+        this._const64(out, 12n);
+        out.push(Buffer.from([0x88])); // i64.shr_u
+        this._const64(out, 255n);
+        out.push(Buffer.from([0x83])); // i64.and
+        out.push(Buffer.from([0xa7])); // i32.wrap_i64
+        out.push(Buffer.from([0x41]));
+        out.push(s32leb(4));
+        out.push(Buffer.from([0x74])); // i32.shl  (idx * 16)
+        out.push(Buffer.from([0x20, tlbLocal])); // local.get tlb ptr
+        out.push(Buffer.from([0x6a])); // i32.add
+        out.push(Buffer.from([0x21, 0x06])); // local.set 6
+    }
+
+    // i64.load(entry) == (vaddr & mask), where mask allows the low size-1 bits.
+    _emitTlbHit(out, size) {
+        out.push(Buffer.from([0x20, 0x06]));
+        out.push(Buffer.from([0x29, 0x03, 0x00])); // i64.load
+        out.push(Buffer.from([0x20, 0x05]));
+        this._const64(out, BigInt(-4096 + (size - 1)));
+        out.push(Buffer.from([0x83])); // i64.and
+        out.push(Buffer.from([0x51])); // i64.eq
+    }
+
+    // host = i32.wrap(vaddr) + i32.load(entry + 8)
+    _emitHostAddr(out) {
+        out.push(Buffer.from([0x20, 0x05]));
+        out.push(Buffer.from([0xa7])); // i32.wrap_i64
+        out.push(Buffer.from([0x20, 0x06]));
+        out.push(Buffer.from([0x28, 0x02, 0x08])); // i32.load offset=8
+        out.push(Buffer.from([0x6a])); // i32.add
+    }
+
+    // Bail out of the block: return (startPc + offset) with the high bit set.
+    // The host hands control back to the interpreter at that exact PC; all
+    // earlier instructions have already committed, so this is precise.
+    _emitBail(out, offset) {
+        out.push(Buffer.from([0x20, 0x02])); // local.get 2 (start pc)
+        this._const64(out, offset);
+        out.push(Buffer.from([0x7c])); // i64.add
+        this._const64(out, BAIL_BIT);
+        out.push(Buffer.from([0x84])); // i64.or
+        out.push(Buffer.from([0x0f])); // return
+    }
+
+    _emitLoad(out, rd, rs1, imm, opcode, size, pc = 0) {
+        if (this.directTlb) {
+            this._beginStore(out, rd);
+            this._emitTlbEntry(out, rs1, imm, 1);
+            this._emitTlbHit(out, size);
+            out.push(Buffer.from([0x04, 0x40])); // if (void)
+            this._emitHostAddr(out);
+            out.push(Buffer.from([opcode, 0x00, 0x00])); // direct load
+            out.push(Buffer.from([0x21, 0x07])); // local.set 7 (val)
+            out.push(Buffer.from([0x05])); // else
+            this._emitBail(out, pc);
+            out.push(Buffer.from([0x0b])); // end if
+            out.push(Buffer.from([0x20, 0x07])); // local.get 7 (val)
+            this._endStore(out, rd);
+            return;
+        }
         if (this.externalMemory) {
             this._beginStore(out, rd);
             out.push(Buffer.from([0x20, 0x03])); // local.get 3 (statePtr)
@@ -309,7 +389,19 @@ class RiscVBlockJit {
         this._endStore(out, rd);
     }
 
-    _emitStore(out, rs1, rs2, imm, opcode, size) {
+    _emitStore(out, rs1, rs2, imm, opcode, size, pc = 0) {
+        if (this.directTlb) {
+            this._emitTlbEntry(out, rs1, imm, 4);
+            this._emitTlbHit(out, size);
+            out.push(Buffer.from([0x04, 0x40])); // if (void)
+            this._emitHostAddr(out);
+            this._loadReg(out, rs2);
+            out.push(Buffer.from([opcode, 0x00, 0x00])); // direct store
+            out.push(Buffer.from([0x05])); // else
+            this._emitBail(out, pc);
+            out.push(Buffer.from([0x0b])); // end if
+            return;
+        }
         if (this.externalMemory) {
             out.push(Buffer.from([0x20, 0x03])); // local.get 3 (statePtr)
             this._loadReg(out, rs1);
@@ -509,7 +601,7 @@ class RiscVBlockJit {
                 const loadOpcode = loads[funct3];
                 if (loadOpcode === undefined) throw new Error(`unsupported LOAD funct3=${funct3}`);
                 const loadSize = [1, 2, 4, 8, 1, 2, 4][funct3];
-                this._emitLoad(out, rd, rs1, immI, loadOpcode, loadSize);
+                this._emitLoad(out, rd, rs1, immI, loadOpcode, loadSize, pc);
                 break;
             }
             case 0x23: { // STORE
@@ -522,7 +614,7 @@ class RiscVBlockJit {
                 const storeOpcode = stores[funct3];
                 if (storeOpcode === undefined) throw new Error(`unsupported STORE funct3=${funct3}`);
                 const storeSize = [1, 2, 4, 8][funct3];
-                this._emitStore(out, rs1, rs2, immS, storeOpcode, storeSize);
+                this._emitStore(out, rs1, rs2, immS, storeOpcode, storeSize, pc);
                 break;
             }
             case 0x63: { // BRANCH
@@ -552,10 +644,51 @@ class RiscVBlockJit {
     }
 }
 
+// Strictly validate the integer instructions the direct-TLB translator
+// actually implements. In particular the M extension shares opcodes with the
+// base ISA (funct7 0x01) and must be rejected, not silently treated as add.
+function isSupportedInstruction(insn) {
+    const opcode = insn & 0x7f;
+    const funct3 = (insn >>> 12) & 7;
+    const funct7 = (insn >>> 25) & 0x7f;
+    switch (opcode) {
+        case 0x13: // OP-IMM: funct7 is part of the immediate except for shifts
+            if (funct3 === 1) return funct7 === 0x00; // slli
+            if (funct3 === 5) return funct7 === 0x00 || funct7 === 0x20; // srli/srai
+            return funct3 === 0 || funct3 === 2 || funct3 === 3 || funct3 === 4 ||
+                funct3 === 6 || funct3 === 7;
+        case 0x1b: // OP-IMM-32
+            if (funct3 === 1) return funct7 === 0x00; // slliw
+            if (funct3 === 5) return funct7 === 0x00 || funct7 === 0x20; // srliw/sraiw
+            return funct3 === 0; // addiw (funct7 is immediate)
+        case 0x33: // OP
+            if (funct3 === 0) return funct7 === 0x00 || funct7 === 0x20; // add/sub
+            if (funct3 === 5) return funct7 === 0x00 || funct7 === 0x20; // srl/sra
+            return funct7 === 0x00; // sll/slt/sltu/xor/or/and
+        case 0x3b: // OP-32
+            if (funct3 === 0) return funct7 === 0x00 || funct7 === 0x20; // addw/subw
+            if (funct3 === 1) return funct7 === 0x00; // sllw
+            if (funct3 === 5) return funct7 === 0x00 || funct7 === 0x20; // srlw/sraw
+            return false;
+        case 0x03: // LOAD
+            return funct3 <= 6;
+        case 0x23: // STORE
+            return funct3 <= 3;
+        case 0x37: // LUI
+        case 0x17: // AUIPC
+        case 0x6f: // JAL
+        case 0x67: // JALR
+            return true;
+        case 0x63: // BRANCH
+            return funct3 !== 2 && funct3 !== 3; // no reserved encodings
+        default:
+            return false;
+    }
+}
+
 function decodeBlock(code, pc) {
     const instructions = [];
     const sizes = [];
-    const supported = new Set([0x13, 0x33, 0x1b, 0x3b, 0x03, 0x23, 0x37, 0x17, 0x6f, 0x67, 0x63]);
     let cursor = pc;
     while (cursor < code.length) {
         const decoded = decodeRiscV(code, cursor);
@@ -564,7 +697,7 @@ function decodeBlock(code, pc) {
         }
         const insn = decoded.word >>> 0;
         const opcode = insn & 0x7f;
-        if (!supported.has(opcode)) {
+        if (!isSupportedInstruction(insn)) {
             return { instructions, sizes, terminal: 'unsupported', nextPc: cursor };
         }
         instructions.push(insn);
@@ -577,4 +710,4 @@ function decodeBlock(code, pc) {
     return { instructions, sizes, terminal: 'fallthrough', nextPc: cursor };
 }
 
-module.exports = { RiscVBlockJit, decodeBlock, u32leb, s32leb, s64leb, sext };
+module.exports = { RiscVBlockJit, decodeBlock, isSupportedInstruction, u32leb, s32leb, s64leb, sext, BAIL_BIT, BAIL_MASK };
