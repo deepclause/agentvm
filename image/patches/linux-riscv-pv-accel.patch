@@ -1,0 +1,138 @@
+diff --git a/arch/riscv/Kconfig b/arch/riscv/Kconfig
+index 593cf0926..ce1585dce 100644
+--- a/arch/riscv/Kconfig
++++ b/arch/riscv/Kconfig
+@@ -681,6 +681,19 @@ config PORTABLE
+ 	select OF
+ 	select MMU
+ 
++config RISCV_PV_ACCEL
++	bool "Paravirtual acceleration for bulk memory operations"
++	depends on MMU
++	help
++	  Route page clearing/copying and bulk memset/memcpy through a
++	  TinyEMU paravirtual hypercall (custom-0, funct7 0x70).  This is only
++	  meaningful under an emulator that implements the hypercall, such as
++	  the container2wasm/AgentVM TinyEMU build.  If the emulator does not
++	  implement it, the custom instruction raises an illegal-instruction
++	  trap, so do NOT enable this on real hardware or on a stock emulator.
++	  The emulator itself falls back to the software routine when a range
++	  is not plain RAM (MMIO, unmapped), so correctness is preserved.
++
+ menu "Power management options"
+ 
+ source "kernel/power/Kconfig"
+diff --git a/arch/riscv/include/asm/page.h b/arch/riscv/include/asm/page.h
+index ac70b0fd9..399197dec 100644
+--- a/arch/riscv/include/asm/page.h
++++ b/arch/riscv/include/asm/page.h
+@@ -49,12 +49,24 @@
+ 
+ #ifndef __ASSEMBLY__
+ 
++#ifdef CONFIG_RISCV_PV_ACCEL
++void pv_clear_page(void *page);
++void pv_copy_page(void *to, void *from);
++void pv_clear_user_page(void *page, unsigned long vaddr);
++void pv_copy_user_page(void *to, void *from, unsigned long vaddr);
++#define clear_page(pgaddr)			pv_clear_page(pgaddr)
++#define copy_page(to, from)			pv_copy_page((to), (from))
++#define clear_user_page(pgaddr, vaddr, page)	pv_clear_user_page((pgaddr), (vaddr))
++#define copy_user_page(vto, vfrom, vaddr, topg) \
++			pv_copy_user_page((vto), (vfrom), (vaddr))
++#else
+ #define clear_page(pgaddr)			memset((pgaddr), 0, PAGE_SIZE)
+ #define copy_page(to, from)			memcpy((to), (from), PAGE_SIZE)
+ 
+ #define clear_user_page(pgaddr, vaddr, page)	memset((pgaddr), 0, PAGE_SIZE)
+ #define copy_user_page(vto, vfrom, vaddr, topg) \
+ 			memcpy((vto), (vfrom), PAGE_SIZE)
++#endif
+ 
+ /*
+  * Use struct definitions to apply C type checking
+diff --git a/arch/riscv/mm/Makefile b/arch/riscv/mm/Makefile
+index d76aabf4b..6170e1f3f 100644
+--- a/arch/riscv/mm/Makefile
++++ b/arch/riscv/mm/Makefile
+@@ -31,3 +31,4 @@ endif
+ 
+ obj-$(CONFIG_DEBUG_VIRTUAL) += physaddr.o
+ obj-$(CONFIG_RISCV_DMA_NONCOHERENT) += dma-noncoherent.o
++obj-$(CONFIG_RISCV_PV_ACCEL) += pv_accel.o
+diff --git a/arch/riscv/mm/pv_accel.c b/arch/riscv/mm/pv_accel.c
+new file mode 100644
+index 000000000..e47e79980
+--- /dev/null
++++ b/arch/riscv/mm/pv_accel.c
+@@ -0,0 +1,70 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Paravirtual bulk-memory acceleration for TinyEMU / container2wasm.
++ *
++ * The emulator decodes a custom-0 instruction (opcode 0x0b) with
++ * funct7 == 0x70 as a hypercall.  Arguments are passed in the standard ABI
++ * argument registers a0..a2 and the result is returned in a0:
++ *
++ *	0  the emulator performed the operation directly on guest RAM
++ *	1  the range is not plain RAM (or unsupported); use the software path
++ *
++ * Every operation is a pure data movement whose only observable effect is on
++ * the very same guest physical memory, so the guest cannot tell the
++ * difference.  The emulator never runs guest-supplied code, so there is no
++ * new escape surface: it merely does the memcpy/memset the kernel asked for.
++ */
++
++#include <linux/string.h>
++#include <asm/page.h>
++
++#define PV_OP_CLEAR_PAGE	2
++#define PV_OP_COPY_PAGE		3
++
++static __always_inline long pv_call(unsigned long op,
++				    unsigned long a0, unsigned long a1)
++{
++	register unsigned long r0 asm("a0") = a0;
++	register unsigned long r1 asm("a1") = a1;
++
++	/*
++	 * funct3 = op, funct7 = 0x70.  The rd/rs1/rs2 fields are dummy: the
++	 * emulator reads a0..a2 directly.  Encoding a0/a1 as rs1/rs2 keeps the
++	 * compiler from dropping the inputs.
++	 */
++	asm volatile(".insn r 0x0b, %2, 0x70, x0, %0, %1"
++		     : "+r"(r0)
++		     : "r"(r1), "i"(op)
++		     : "memory");
++
++	return (long)r0;
++}
++
++void pv_clear_page(void *page)
++{
++	if (pv_call(PV_OP_CLEAR_PAGE, (unsigned long)page, 0) != 0)
++		memset(page, 0, PAGE_SIZE);
++}
++
++void pv_copy_page(void *to, void *from)
++{
++	if (pv_call(PV_OP_COPY_PAGE, (unsigned long)to,
++		    (unsigned long)from) != 0)
++		memcpy(to, from, PAGE_SIZE);
++}
++
++/*
++ * The user-page variants are used on the anonymous-fault and COW paths.  On
++ * RISC-V there is no VIPT cache-alias problem, so the vaddr argument (used only
++ * for cache flushing on other architectures) can be ignored and the same page
++ * operation is used.
++ */
++void pv_clear_user_page(void *page, unsigned long vaddr)
++{
++	pv_clear_page(page);
++}
++
++void pv_copy_user_page(void *to, void *from, unsigned long vaddr)
++{
++	pv_copy_page(to, from);
++}

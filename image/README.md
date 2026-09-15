@@ -55,6 +55,24 @@ The build applies the compatibility patch plus
 - and runs Binaryen `wasm-opt -O3` over the linked TinyEMU module before
   Wizer snapshots it.
 
+## Paravirtual bulk-memory acceleration (PV_ACCEL)
+
+The build also applies `patches/tinyemu-pv-accel.patch` and
+`patches/linux-riscv-pv-accel.patch` by default (`PV_ACCEL=1`):
+
+- TinyEMU decodes a custom-0 instruction (`funct7 = 0x70`) as a hypercall that
+  performs bulk `memset`/`memcpy` on guest RAM directly.
+- The guest kernel (`CONFIG_RISCV_PV_ACCEL`) routes `clear_page`/`copy_page`
+  through it, so anonymous-page faults and `fork`/COW no longer interpret
+  hundreds of guest stores per page. If the emulator cannot service a range it
+  returns a status and the kernel runs the normal software routine.
+
+Build the unaccelerated baseline for A/B measurement with:
+
+```bash
+PV_ACCEL=0 ./build.sh /tmp/agentvm-baseline.wasm
+```
+
 The image also disables verbose init and kernel logging. The c2w recipe already
 disables TinyEMU's unused SDL, x86, RV128, SLIRP, and network-filesystem
 features, and uses Wizer; the build preserves those settings.
