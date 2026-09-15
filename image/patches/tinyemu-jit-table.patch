@@ -1,8 +1,8 @@
 diff --git a/riscv_cpu.c b/riscv_cpu.c
-index c05623a..3d18301 100644
+index c05623a..5ddb142 100644
 --- a/riscv_cpu.c
 +++ b/riscv_cpu.c
-@@ -52,8 +52,85 @@
+@@ -52,8 +52,100 @@
  
  #ifdef CONFIG_JIT
  extern int initialized;
@@ -47,17 +47,32 @@ index c05623a..3d18301 100644
 +__attribute__((import_module("env"), import_name("jit_compile")))
 +int32_t jit_compile(uint32_t state_ptr);
 +
++static int32_t jit_enabled = 0;
++
++__attribute__((export_name("jit_set_enabled")))
++void jit_set_enabled(int32_t v)
++{
++    jit_enabled = v;
++}
++
 +typedef int64_t (*jit_block_fn_t)(uint32_t regs, uint32_t tlb_read,
 +                                  uint64_t pc, uint32_t state, uint32_t tlb_write);
 +
 +static int32_t jit_try_block(uint32_t state_ptr)
 +{
 +    RISCVCPUState *s = (RISCVCPUState *)(uintptr_t)state_ptr;
-+    target_ulong pc = s->pc;
-+    uint32_t slot = (uint32_t)((pc >> 1) ^ (pc >> 13)) & JIT_MAP_MASK;
-+    JITMapEntry *e = &jit_map[slot];
++    target_ulong pc;
++    uint32_t slot;
++    JITMapEntry *e;
 +    jit_block_fn_t fn;
 +    uint64_t next;
++
++    if (!jit_enabled)
++        return 0;
++
++    pc = s->pc;
++    slot = (uint32_t)((pc >> 1) ^ (pc >> 13)) & JIT_MAP_MASK;
++    e = &jit_map[slot];
 +
 +    if (e->index == JIT_UNSUPPORTED)
 +        return 0;

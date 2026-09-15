@@ -1598,6 +1598,7 @@ async function start() {
     instance = inst;
     if (JIT_ENABLED && instance.exports.__indirect_function_table) {
         jitTable = instance.exports.__indirect_function_table;
+        if (instance.exports.jit_set_enabled) instance.exports.jit_set_enabled(1);
     }
 
     parentPort.postMessage({ type: 'ready' });
