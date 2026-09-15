@@ -7,6 +7,11 @@ const { decodeRiscV } = require('./riscv-c');
 const BAIL_BIT = -(1n << 63n);
 const BAIL_MASK = (1n << 63n) - 1n;
 
+// Maximum iterations a self-loop block executes per host call. This amortizes
+// the JavaScript dispatch across many guest iterations; the interpreter is
+// re-entered periodically so timers and interrupts still fire.
+const LOOP_BUDGET = 64;
+
 // Minimal RISC-V (RV64) integer block translator -> WebAssembly.
 //
 // This is the first JIT milestone. It translates straight-line sequences of
@@ -71,6 +76,19 @@ function stringBytes(str) {
 function sext(value, bits) {
     const shift = 32 - bits;
     return (value << shift) >> shift;
+}
+
+// Branch/jump offsets, shared by the translator and the trace decoder.
+function branchOffset(insn) {
+    return sext(
+        (((insn >>> 31) & 1) << 12) | (((insn >>> 7) & 1) << 11) |
+        (((insn >>> 25) & 0x3f) << 5) | (((insn >>> 8) & 0xf) << 1), 13);
+}
+
+function jalOffset(insn) {
+    return sext(
+        (((insn >>> 31) & 1) << 20) | (((insn >>> 12) & 0xff) << 12) |
+        (((insn >>> 20) & 1) << 11) | (((insn >>> 21) & 0x3ff) << 1), 21);
 }
 
 class RiscVBlockJit {
@@ -186,26 +204,95 @@ class RiscVBlockJit {
         return instance._buildModule(bodies, blocks.map((_, i) => `run_${i}`));
     }
 
+    _branchImm(insn) {
+        return branchOffset(insn);
+    }
+
+    _jalImm(insn) {
+        return jalOffset(insn);
+    }
+
     _emitBody(instructions, sizes) {
+        const n = instructions.length;
+        const offsets = new Array(n);
+        let total = 0;
+        for (let i = 0; i < n; i++) {
+            offsets[i] = total;
+            total += sizes[i];
+        }
+
+        // A block whose terminal branch/jump targets its own start is a
+        // bottom-tested loop. Run it internally so a hot loop pays the host
+        // dispatch once per LOOP_BUDGET iterations instead of once per
+        // iteration.
+        this.selfLoop = null;
+        if (n > 0) {
+            const last = instructions[n - 1];
+            const op = last & 0x7f;
+            const lastOff = offsets[n - 1];
+            if (op === 0x63 && lastOff + this._branchImm(last) === 0) {
+                this.selfLoop = {
+                    cond: true,
+                    opcode: { 0: 0x51, 1: 0x52, 4: 0x53, 5: 0x59, 6: 0x54, 7: 0x5a }[(last >>> 12) & 7],
+                    rs1: (last >>> 15) & 0x1f,
+                    rs2: (last >>> 20) & 0x1f,
+                    exit: total,
+                };
+            } else if (op === 0x6f && ((last >>> 7) & 0x1f) === 0 && lastOff + this._jalImm(last) === 0) {
+                this.selfLoop = { cond: false, exit: total };
+            }
+        }
+
+        const budgetLocal = this.directTlb ? 8 : 3;
         const out = [];
         if (this.directTlb) {
-            // locals 5 = vaddr (i64), 6 = TLB entry address (i32), 7 = val (i64)
-            out.push(Buffer.from([0x03, 0x01, 0x7e, 0x01, 0x7f, 0x01, 0x7e]));
+            if (this.selfLoop) {
+                // locals 5 = vaddr (i64), 6 = TLB entry (i32), 7 = val (i64),
+                // 8 = loop budget (i32)
+                out.push(Buffer.from([0x04, 0x01, 0x7e, 0x01, 0x7f, 0x01, 0x7e, 0x01, 0x7f]));
+            } else {
+                out.push(Buffer.from([0x03, 0x01, 0x7e, 0x01, 0x7f, 0x01, 0x7e]));
+            }
+        } else if (this.selfLoop) {
+            out.push(Buffer.from([0x01, 0x01, 0x7f])); // local 3 = budget (i32)
         } else {
             out.push(Buffer.from([0x00])); // zero locals
         }
 
-        let pc = 0;
-        for (let i = 0; i < instructions.length; i++) {
-            this._emitInstruction(out, instructions[i], pc, sizes[i]);
-            pc += sizes[i];
+        if (this.selfLoop) {
+            const sl = this.selfLoop;
+            out.push(Buffer.from([0x41]));
+            out.push(s32leb(LOOP_BUDGET));
+            out.push(Buffer.from([0x21, budgetLocal]));
+            out.push(Buffer.from([0x03, 0x40])); // loop
+            // if (budget == 0) return startPc  (interpreter services IRQs)
+            out.push(Buffer.from([0x20, budgetLocal, 0x45, 0x04, 0x40]));
+            this._emitReturnRel(out, 0);
+            out.push(Buffer.from([0x0b])); // end if
+            // budget -= 1
+            out.push(Buffer.from([0x20, budgetLocal, 0x41, 0x01, 0x6b, 0x21, budgetLocal]));
+            for (let i = 0; i < n - 1; i++) this._emitInstruction(out, instructions[i], offsets[i], sizes[i]);
+            if (sl.cond) {
+                this._emitBranchCondition(out, sl.opcode, sl.rs1, sl.rs2);
+                out.push(Buffer.from([0x04, 0x40])); // if
+                out.push(Buffer.from([0x0c, 0x01])); // br 1 -> loop
+                out.push(Buffer.from([0x0b])); // end if
+                this._emitReturnRel(out, sl.exit); // not taken: exit the loop
+            } else {
+                out.push(Buffer.from([0x0c, 0x00])); // br 0 -> loop
+            }
+            out.push(Buffer.from([0x0b])); // end loop
+            this._emitReturnRel(out, 0); // unreachable fallback
+            out.push(Buffer.from([0x0b])); // end function
+            return Buffer.concat(out);
         }
 
-        // Fall through: return startPc + 4 * instruction count.
-        out.push(Buffer.from([0x20, 0x02])); // local.get 2 (start pc, i64)
-        this._const64(out, pc);
-        out.push(Buffer.from([0x7c])); // i64.add
-        out.push(Buffer.from([0x0f])); // return
+        for (let i = 0; i < n; i++) {
+            this._emitInstruction(out, instructions[i], offsets[i], sizes[i]);
+        }
+
+        // Fall through: return startPc + total size.
+        this._emitReturnRel(out, total);
         out.push(Buffer.from([0x0b])); // end
         return Buffer.concat(out);
     }
@@ -288,12 +375,18 @@ class RiscVBlockJit {
     }
 
     _emitConditionalBranch(out, opcode, rs1, rs2, target) {
-        this._loadReg(out, rs1);
-        this._loadReg(out, rs2);
-        out.push(Buffer.from([opcode])); // i64 comparison -> i32
+        this._emitBranchCondition(out, opcode, rs1, rs2);
         out.push(Buffer.from([0x04, 0x40])); // if (empty block type)
         this._emitReturnRel(out, target);
         out.push(Buffer.from([0x0b])); // end if
+    }
+
+    // Push the i32 condition for a branch whose taken target is handled by the
+    // caller. `opcode` is the i64 comparison opcode.
+    _emitBranchCondition(out, opcode, rs1, rs2) {
+        this._loadReg(out, rs1);
+        this._loadReg(out, rs2);
+        out.push(Buffer.from([opcode])); // i64 comparison -> i32
     }
 
     _emitAddress(out, rs1, imm) {
@@ -722,4 +815,4 @@ function decodeBlock(code, pc) {
     return { instructions, sizes, terminal: 'fallthrough', nextPc: cursor };
 }
 
-module.exports = { RiscVBlockJit, decodeBlock, isSupportedInstruction, u32leb, s32leb, s64leb, sext, BAIL_BIT, BAIL_MASK };
+module.exports = { RiscVBlockJit, decodeBlock, isSupportedInstruction, branchOffset, jalOffset, u32leb, s32leb, s64leb, sext, BAIL_BIT, BAIL_MASK, LOOP_BUDGET };

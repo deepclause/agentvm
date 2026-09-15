@@ -476,15 +476,27 @@ Two independent checkers now exist:
   the JIT runs so load-after-store blocks are checked cleanly).
 
 So the translator itself is now believed correct. Full-VM boot under
-`AGENTVM_JIT=1` still does not complete, and it is **not** a translation error:
-with `AGENTVM_JIT_NO_C=1` (compressed translation off) the JIT boots a full VM,
-runs a 50 M-iteration integer loop with the correct result, and measures
-**1.07×** over the interpreter. The remaining blocker is the dispatch model:
+`AGENTVM_JIT=1` still does not complete. The blocker is the dispatch model:
 TinyEMU calls `jit_try_block` from JavaScript once per basic block, and the
-generated block returns after every branch, so a hot loop crosses
-WASM→JS→WASM once per iteration. To win on real workloads the JIT must keep
-dispatch in WASM and execute a whole loop/region per host call; the translator,
-TLB export, bail semantics and verifier are the foundation for that.
+generated block returns after every branch. A hot loop therefore crosses
+WASM→JS→WASM once per iteration, which is far more expensive than the few
+instructions it saves.
+
+Two mitigations are implemented on top of the translator:
+
+1. **Self-looping blocks.** A block whose terminal branch targets its own start
+   (bottom-tested loop) is emitted as a WASM `loop` that runs up to
+   `LOOP_BUDGET` (64) iterations per host call.
+2. **Trace decoder.** The worker follows forward (exit) branches through a loop
+   body until the back edge, so a **top-tested** loop is compiled as one
+   self-looping trace rather than stopping at the first branch.
+
+On a call-free integer loop compiled without compressed instructions the JIT
+now measures **3.32×** over the interpreter (JIT off 2429 ms, JIT on 731 ms,
+identical results). Coverage is still the limit: a loop body that contains a
+`call` (JAL/JALR) ends the trace at the call, so most real boot/agent loops are
+not yet traced. Closing that gap needs either call inlining in the trace
+compiler or, better, the in-WASM region dispatcher below.
 
 ### 7.7 Expected impact
 

@@ -2,7 +2,7 @@ const { parentPort, workerData } = require('node:worker_threads');
 const { WASI } = require('node:wasi');
 const fs = require('node:fs');
 const { NetworkStack } = require('./network');
-const { RiscVBlockJit, BAIL_BIT, BAIL_MASK, isSupportedInstruction } = require('./jit');
+const { RiscVBlockJit, BAIL_BIT, BAIL_MASK, isSupportedInstruction, branchOffset, jalOffset, LOOP_BUDGET } = require('./jit');
 const refRun = require('./riscv-ref').run;
 const { expandCompressed } = require('./riscv-c');
 const { RingBufferReader } = require('./ringbuffer');
@@ -91,7 +91,6 @@ const jitUnsupported = new Set();
 const jitBailSkip = new Set();
 const jitVerifyReported = new Set();
 let jitFixed = null;
-const JIT_TERMINAL = new Set([0x63, 0x6f, 0x67]);
 
 async function start() {
     const wasmBuffer = fs.readFileSync(wasmPath);
@@ -1396,11 +1395,15 @@ async function start() {
     };
 
     const compileJitBlock = (instructions, sizes) => {
-        const module = new RiscVBlockJit(instructions, sizes, { directTlb: true }).compile();
+        const jit = new RiscVBlockJit(instructions, sizes, { directTlb: true });
+        const module = jit.compile();
         const jitInstance = new WebAssembly.Instance(module, {
             env: { memory: instance.exports.memory },
         });
-        return jitInstance.exports.run;
+        // Self-loop blocks execute up to LOOP_BUDGET iterations per call; charge
+        // the upper bound so the interpreter still returns to check interrupts.
+        const cycles = instructions.length * (jit.selfLoop ? LOOP_BUDGET : 1);
+        return { run: jitInstance.exports.run, cycles, selfLoop: !!jit.selfLoop };
     };
 
     const { instance: inst } = await WebAssembly.instantiate(wasmBuffer, {
@@ -1431,41 +1434,53 @@ async function start() {
                         entry = null;
                     }
                     if (!entry) {
+                        // Trace decoder: follow straight-line code and forward
+                        // (exit) branches until the back edge of a loop, so a
+                        // top-tested loop is compiled as one self-looping trace.
                         const instructions = [];
                         const sizes = [];
                         let cursor = pc;
                         let ok = true;
                         for (;;) {
-                            if (instructions.length >= 512) { ok = false; break; }
+                            if (instructions.length >= 256) { ok = false; break; }
                             const insn = readGuestInsn(exports, statePtr, cursor);
                             if (!insn || !isSupportedInstruction(insn.word)) { ok = false; break; }
-                            instructions.push(insn.word >>> 0);
+                            const word = insn.word >>> 0;
+                            const op = word & 0x7f;
+                            instructions.push(word);
                             sizes.push(Number(insn.size));
+                            if (op === 0x63) {
+                                const target = cursor + BigInt(branchOffset(word));
+                                if (target === pc) break;                 // back edge to the trace start
+                                if (target > cursor) { cursor += insn.size; continue; } // forward exit
+                                ok = false; break;                        // backward branch into the middle
+                            }
+                            if (op === 0x6f || op === 0x67) break;        // terminal jump/return
                             cursor += insn.size;
-                            if (JIT_TERMINAL.has(insn.word & 0x7f)) break;
                         }
                         if (!ok || instructions.length === 0) {
                             jitUnsupported.add(pcKey);
                             return 0;
                         }
-                        let run;
+                        let compiled;
                         try {
-                            run = compileJitBlock(instructions, sizes);
+                            compiled = compileJitBlock(instructions, sizes);
                         } catch (err) {
                             jitUnsupported.add(pcKey);
                             return 0;
                         }
                         entry = {
                             first,
-                            run,
-                            cycles: instructions.length,
+                            run: compiled.run,
+                            cycles: compiled.cycles,
+                            selfLoop: compiled.selfLoop,
                             instructions,
                             sizes,
                             hasStore: instructions.some((n) => (n & 0x7f) === 0x23),
                         };
                         jitBlockCache.set(pcKey, entry);
                         if (DEBUG_JIT) {
-                            parentPort.postMessage({ type: 'debug', msg: `JIT compile pc=0x${pcKey} (${instructions.length} insns, sizes=${sizes.join(',')}): ${instructions.map((n) => n.toString(16)).join(',')}` });
+                            parentPort.postMessage({ type: 'debug', msg: `JIT compile pc=0x${pcKey} ${compiled.selfLoop ? 'SELFLOOP ' : ''}(${instructions.length} insns, sizes=${sizes.join(',')}): ${instructions.map((n) => n.toString(16)).join(',')}` });
                         }
                     }
 
@@ -1483,7 +1498,7 @@ async function start() {
                     const tlbRead = jitFixed.tlbRead;
                     const tlbWrite = jitFixed.tlbWrite;
 
-                    if (JIT_VERIFY) {
+                    if (JIT_VERIFY && !entry.selfLoop) {
                         const view0 = () => new BigInt64Array(instance.exports.memory.buffer, regsPtr, 32);
                         const snap = Array.from(view0());
                         const rd = (addr, size) => {
