@@ -12,7 +12,18 @@ RUN apk add --no-cache \
         bash curl git \
         coreutils \
         tmux \
-        e2fsprogs
+        e2fsprogs \
+        jansson fzf
+
+# Build hax (https://usehax.dev) from source; there are no riscv64 binaries.
+RUN apk add --no-cache \
+        build-base meson samurai curl-dev jansson-dev python3 && \
+    git clone https://github.com/OleksandrChekhovskyi/hax.git /tmp/hax && \
+    cd /tmp/hax && \
+    make && \
+    make install && \
+    rm -rf /tmp/hax && \
+    apk del build-base meson samurai curl-dev jansson-dev python3
 
 COPY --link preinstalled/usrlocal /usr/local
 
