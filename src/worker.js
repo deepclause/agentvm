@@ -77,8 +77,8 @@ const JIT_HIT_THRESHOLD = Number(process.env.AGENTVM_JIT_THRESHOLD || 50);
 // Only translate guest PCs in [MIN, MAX). Defaults cover all of SV39. Restricting
 // to low addresses is a debugging aid that keeps the JIT out of early-boot and
 // kernel code.
-const JIT_PC_MIN = BigInt(process.env.AGENTVM_JIT_PC_MIN || '0');
-const JIT_PC_MAX = BigInt(process.env.AGENTVM_JIT_PC_MAX || '0x4000000000');
+const JIT_PC_MIN = Number(process.env.AGENTVM_JIT_PC_MIN || '0');
+const JIT_PC_MAX = Number(process.env.AGENTVM_JIT_PC_MAX || '0x4000000000');
 const JIT_ALLOW_COMPRESSED = process.env.AGENTVM_JIT_NO_C !== '1';
 const JIT_ONLY_LOOPS = process.env.AGENTVM_JIT_ALL_BLOCKS !== '1';
 // Even without a back edge, a sufficiently long straight-line trace can amortize
@@ -95,6 +95,7 @@ const jitUnsupported = new Set();
 const jitBailSkip = new Set();
 const jitVerifyReported = new Set();
 let jitFixed = null;
+let jitExports = null;
 
 async function start() {
     const wasmBuffer = fs.readFileSync(wasmPath);
@@ -1414,7 +1415,7 @@ async function start() {
         env: {
             jit_try_block: (statePtr) => {
                 if (!JIT_ENABLED || !instance) return 0;
-                const exports = instance.exports;
+                const exports = jitExports || (jitExports = instance.exports);
                 if (!exports.jit_read_u16 || !exports.jit_read_u32 ||
                     !exports.jit_regs_ptr || !exports.jit_tlb_ptr) return 0;
 
@@ -1429,25 +1430,35 @@ async function start() {
                             regsPtr: Number(exports.jit_regs_ptr(statePtr)),
                             tlbRead: Number(exports.jit_tlb_ptr(statePtr, 0)),
                             tlbWrite: Number(exports.jit_tlb_ptr(statePtr, 1)),
-                            buffer: null,
-                            pcView: null,
+                            pcLo: null,
+                            pcHi: null,
                         };
                     }
-                    const buf = exports.memory.buffer;
-                    if (jitFixed.buffer !== buf) {
-                        jitFixed.buffer = buf;
+                    // Refresh the PC views only when the memory has grown (a
+                    // detached typed array has length 0). Accessing
+                    // memory.buffer directly on every block boundary is what
+                    // dominates the hook cost.
+                    if (jitFixed.pcLo === null || jitFixed.pcLo.length === 0) {
+                        const buf = exports.memory.buffer;
                         // s->pc is immediately before s->reg[32] in RISCVCPUState.
-                        jitFixed.pcView = new BigInt64Array(buf, jitFixed.regsPtr - 8, 1);
+                        const p = jitFixed.regsPtr - 8;
+                        jitFixed.pcLo = new Int32Array(buf, p, 1);
+                        jitFixed.pcHi = new Int32Array(buf, p + 4, 1);
                     }
-                    const pc = jitFixed.pcView[0];
-                    if (pc < JIT_PC_MIN || pc >= JIT_PC_MAX) return 0;
-                    const pcKey = pc; // BigInt key avoids a string allocation per boundary
+                    // Read the PC as two 32-bit ints to avoid allocating a BigInt
+                    // on every block boundary; user PCs fit in a double exactly.
+                    const pcNum = jitFixed.pcHi[0] * 0x100000000 + (jitFixed.pcLo[0] >>> 0);
+                    if (pcNum < JIT_PC_MIN || pcNum >= JIT_PC_MAX) return 0;
+                    const pcKey = pcNum;
                     if (jitUnsupported.has(pcKey)) return 0;
                     if (jitBailSkip.delete(pcKey)) return 0;
 
                     const hits = (jitHitCounts.get(pcKey) || 0) + 1;
                     jitHitCounts.set(pcKey, hits);
                     if (hits < JIT_HIT_THRESHOLD) return 0;
+
+                    // Only translate/execute paths need the full BigInt PC.
+                    const pc = BigInt(pcKey);
 
                     // Cheap self-modifying-code check: the first instruction
                     // word must match the cached block, otherwise re-translate.

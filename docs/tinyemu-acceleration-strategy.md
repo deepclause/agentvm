@@ -499,27 +499,31 @@ Measured with the loops-only policy on the acceptance image:
 | workload | JIT off | JIT on | speedup |
 |---|---:|---:|---:|
 | boot | 1572 ms | 1862 ms | 0.84× (18% overhead) |
-| call-free ALU loop (50 M iters) | 2941 ms | 700 ms | **4.20×** → **4.84×** with register locals |
-| call-free load/store loop (5 M iters) | 250 ms | 113 ms | **2.21×** with register locals |
-| `node` integer loop | 2420 ms | 2870 ms | 0.84× |
-| `python3 sum(range(2e6))` | 5010 ms | 7781 ms | 0.64× |
+| call-free ALU loop (50 M iters) | ~2560 ms | ~350 ms | **7.30×** |
+| call-free load/store loop (5 M iters) | 250 ms | 113 ms | **2.21×** |
+| `node` integer loop | 2581 ms | 2905 ms | 0.89× |
+| `node` string loop | 2650 ms | 2910 ms | 0.91× |
+| `python3 sum(range(2e6))` | 4606 ms | 5740 ms | 0.80× |
+| `python3` for-loop (1e6) | 22042 ms | 26062 ms | 0.85× |
 
-Two codegen improvements were made after the first measurement:
+Codegen/hook improvements that produced these numbers:
 
 - **Guest registers live in WASM locals** for the duration of a trace, instead
   of being reloaded from memory for every instruction (the interpreter's C
-  compiler does the same, which is why it is fast). Registers are loaded once
-  at trace entry and stored back only at trace exits.
-- **The hook reads `s->pc` directly from linear memory** and keys its caches by
-  the BigInt PC, avoiding a `jit_get_pc()` WASM call and a string allocation at
-  every block boundary.
+  compiler does the same). Registers are loaded once at trace entry and stored
+  back only at trace exits.
+- **The hook reads `s->pc` directly from linear memory** as two 32-bit ints and
+  keys its caches by a Number, avoiding a `jit_get_pc()` WASM call, a BigInt
+  allocation and a string allocation per block boundary.
+- **The PC views are refreshed only when the WASM memory grows** (a detached
+  typed array has length 0), instead of touching `memory.buffer` on every call.
+  This alone cut the hook overhead from ~52% to ~19% on `python3 sum`.
 
-With these, call-free loops are clearly faster (4.84× ALU, 2.21× load/store).
-Node/Python remain slower because their hot loops are not clean self-loops
-(they contain calls or data-dependent branches that exit the trace), so the
-JIT mostly pays the hook cost without looping; disabling compilation entirely
-(`AGENTVM_JIT_THRESHOLD` huge) still costs ~50–70% on `python3 sum(range())`,
-which quantifies the remaining per-boundary host overhead.
+An instrumented run showed the hook is called ~25 million times for a 1 M
+iteration `sum(range())` — it fires on every cross-page function call/return,
+not once per iteration. Those 19% are therefore the remaining blocker for
+Node/Python: the hook must move into WASM (the region dispatcher) for the JIT
+to be a net win on call-heavy code.
 
 The `AGENTVM_JIT_VERIFY=1` reference check was extended to simulate the
 self-loop iterations and reports **zero** mismatches while booting the full VM.
