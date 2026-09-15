@@ -81,6 +81,9 @@ const JIT_PC_MIN = BigInt(process.env.AGENTVM_JIT_PC_MIN || '0');
 const JIT_PC_MAX = BigInt(process.env.AGENTVM_JIT_PC_MAX || '0x4000000000');
 const JIT_ALLOW_COMPRESSED = process.env.AGENTVM_JIT_NO_C !== '1';
 const JIT_ONLY_LOOPS = process.env.AGENTVM_JIT_ALL_BLOCKS !== '1';
+// Even without a back edge, a sufficiently long straight-line trace can amortize
+// the host dispatch. 0 keeps the loops-only default.
+const JIT_MIN_BLOCK = Number(process.env.AGENTVM_JIT_MIN_BLOCK || 0);
 // Differential verification against src/riscv-ref.js (debug only, slow).
 const JIT_VERIFY = process.env.AGENTVM_JIT_VERIFY === '1';
 const jitHitCounts = new Map();
@@ -1466,7 +1469,7 @@ async function start() {
                             if (op === 0x67) break;                       // terminal return
                             cursor += insn.size;
                         }
-                        if (!ok || instructions.length === 0 || (JIT_ONLY_LOOPS && !isLoop)) {
+                        if (!ok || instructions.length === 0 || (JIT_ONLY_LOOPS && !isLoop && instructions.length < JIT_MIN_BLOCK)) {
                             jitUnsupported.add(pcKey);
                             return 0;
                         }
