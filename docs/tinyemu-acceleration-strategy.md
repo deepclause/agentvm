@@ -447,30 +447,33 @@ The direct-TLB translator is implemented on `perf/tinyemu-jit`:
   already committed, so the interpreter resumes correctly. Stores check the
   write TLB, so write protection cannot be bypassed.
 - `image/patches/tinyemu-jit-tlb.patch` exports `jit_tlb_ptr(state, which)`.
-- `isSupportedInstruction()` strictly rejects the M extension (which shares
-the OP opcode with add/sub and was previously mistranslated).
-- `test/jit-direct.test.js` covers stores/loads, sign/zero extension, precise
-  bail, unaligned bail, and M-extension rejection (8 checks).
+- `isSupportedInstruction()` strictly rejects the M extension.
 
-End-to-end, `AGENTVM_JIT=1` still hangs during boot. The cause is now isolated:
+Several real translator/decoder bugs were found and fixed while bringing this
+up (each is covered by a unit test):
 
-1. **Per-block JavaScript dispatch is structural.** TinyEMU calls
-   `jit_try_block` once per basic block. Even with all translation cached, a hot
-   loop that ends at a backward branch crosses WASM→JS→WASM once per iteration,
-   which cancels the translated block's savings. (Disabling compilation with a
-   huge `AGENTVM_JIT_THRESHOLD` lets the VM boot normally, confirming that the
-   per-call overhead itself is survivable; it is the *executed* translated code
-   that hangs.)
-2. **A translated-code bug corrupts control flow.** With immediate compilation
-   and a user-space PC gate, boot reaches userspace and then a block returns
-   PC 0 (`ret` with a clobbered return register), after which the guest spins.
-   A JS reference interpreter for the supported subset, run differentially
-   against the JIT, is the needed next tool.
+- 64-bit shift-right width: `srlw`/`sraw`/`srliw`/`sraiw` shifted the full
+  64-bit register instead of the sign/zero-extended low 32 bits;
+- `sraiw` tested the wrong instruction bit for the arithmetic shift;
+- the compressed decoder expanded `c.lw`/`c.ld`/`c.lwsp`/`c.ldsp` to `slti`
+  instead of loads (wrong opcode), decoded CA-format `c.sub`/`c.xor`/`c.or`/
+  `c.and`/`c.subw`/`c.addw` with the wrong discriminator, and dropped the sign
+  of `c.lui`;
+- `c.addiw` was missing entirely.
 
-The lesson is that a winning JIT must keep dispatch **inside WASM** and execute
-multiple basic blocks (a loop) per host call. The translator and TLB export are
-the correct foundation; the missing piece is the in-WASM region/trace
-scheduler.
+With compressed translation disabled (`AGENTVM_JIT_NO_C=1`, a debugging knob),
+the JIT boots a full VM, runs a 50 M-iteration integer loop with the correct
+result, and measures **1.07×** over the interpreter. With compressed decoding
+enabled it still hangs, so at least one compressed encoding is still wrong; the
+next step is a differential decoder test that generates compressed instructions
+with `riscv64-linux-gnu-as` and compares each expansion against the assembler's
+disassembly.
+
+The structural limit remains: TinyEMU calls `jit_try_block` once per basic
+block, and the generated block returns after every branch. A hot loop therefore
+crosses WASM→JS→WASM once per iteration. To win on real workloads the JIT must
+keep dispatch in WASM and execute a loop/region per host call; the translator,
+TLB export and bail semantics are the foundation for that.
 
 ### 7.7 Expected impact
 

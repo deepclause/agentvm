@@ -14,6 +14,16 @@ async function main() {
         [0x929a, 0x006282b3], // c.add x5, x6
         [0x8082, 0x00008067], // c.jr x1
         [0x829a, 0x00030293], // c.mv x5, x6
+        // assembler-verified CA-format register ops and shift/andi
+        [0x8d0d, 0x40b50533], // c.sub a0, a1
+        [0x8d2d, 0x00b54533], // c.xor a0, a1
+        [0x8d4d, 0x00b56533], // c.or a0, a1
+        [0x8d6d, 0x00b57533], // c.and a0, a1
+        [0x9d0d, 0x40b5053b], // c.subw a0, a1
+        [0x9d2d, 0x00b5053b], // c.addw a0, a1
+        [0x2515, 0x0055051b], // c.addiw a0, 5
+        [0x1522, 0x02851513], // c.slli a0, 40
+        [0x9121, 0x02855513], // c.srli a0, 40
     ];
     for (const [insn, expected] of cases) {
         const actual = expandCompressed(insn);

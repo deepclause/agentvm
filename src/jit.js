@@ -264,6 +264,14 @@ class RiscVBlockJit {
         out.push(Buffer.from([0xac])); // i64.extend_i32_s
     }
 
+    // Zero-extend the low 32 bits of the current i64 value. This is needed
+    // before a *32-bit logical/arithmetic right shift: shifting the full 64-bit
+    // register would shift high bits into the low 32.
+    _emitZeroExtend32(out) {
+        out.push(Buffer.from([0xa7])); // i32.wrap_i64
+        out.push(Buffer.from([0xad])); // i64.extend_i32_u
+    }
+
     // Return startPc + offset. startPc is local 2.
     _emitReturnRel(out, offset) {
         out.push(Buffer.from([0x20, 0x02])); // local.get 2 (start pc, i64)
@@ -481,9 +489,11 @@ class RiscVBlockJit {
                         break;
                     }
                     case 5: { // SRLIW / SRAIW
-                        const isArithmetic = (insn >>> 25) & 1;
+                        const isArithmetic = (insn >>> 30) & 1;
                         this._beginStore(out, rd);
                         this._loadReg(out, rs1);
+                        if (isArithmetic) this._emitSignExtend32(out);
+                        else this._emitZeroExtend32(out);
                         this._const64(out, immI & 0x1f);
                         out.push(Buffer.from([isArithmetic ? 0x87 : 0x88]));
                         this._emitSignExtend32(out);
@@ -521,6 +531,8 @@ class RiscVBlockJit {
                         const isArithmetic = funct7 === 0x20;
                         this._beginStore(out, rd);
                         this._loadReg(out, rs1);
+                        if (isArithmetic) this._emitSignExtend32(out);
+                        else this._emitZeroExtend32(out);
                         this._loadReg(out, rs2);
                         this._const64(out, 0x1fn);
                         out.push(Buffer.from([0x83])); // i64.and

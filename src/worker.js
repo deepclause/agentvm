@@ -78,9 +78,14 @@ const JIT_HIT_THRESHOLD = Number(process.env.AGENTVM_JIT_THRESHOLD || 50);
 // kernel code.
 const JIT_PC_MIN = BigInt(process.env.AGENTVM_JIT_PC_MIN || '0');
 const JIT_PC_MAX = BigInt(process.env.AGENTVM_JIT_PC_MAX || '0x4000000000');
+const JIT_ALLOW_COMPRESSED = process.env.AGENTVM_JIT_NO_C !== '1';
 const jitHitCounts = new Map();
 const jitBlockCache = new Map();
 const jitUnsupported = new Set();
+// Blocks that bailed (TLB miss / unaligned) must be executed by the
+// interpreter at least once so it can fill the TLB. Otherwise the JIT would be
+// re-entered at the same PC and bail forever.
+const jitBailSkip = new Set();
 const JIT_TERMINAL = new Set([0x63, 0x6f, 0x67]);
 
 async function start() {
@@ -1378,6 +1383,7 @@ async function start() {
     const readGuestInsn = (exports, statePtr, addr) => {
         const first = Number(exports.jit_read_u16(statePtr, addr));
         if ((first & 3) !== 3) {
+            if (!JIT_ALLOW_COMPRESSED) return null;
             const expanded = expandCompressed(first);
             return expanded === null ? null : { word: expanded, size: 2n };
         }
@@ -1405,6 +1411,7 @@ async function start() {
                     if (pc < JIT_PC_MIN || pc >= JIT_PC_MAX) return 0;
                     const pcKey = pc.toString(16);
                     if (jitUnsupported.has(pcKey)) return 0;
+                    if (jitBailSkip.delete(pcKey)) return 0;
 
                     const hits = (jitHitCounts.get(pcKey) || 0) + 1;
                     jitHitCounts.set(pcKey, hits);
@@ -1446,7 +1453,7 @@ async function start() {
                         entry = { first, run, cycles: instructions.length };
                         jitBlockCache.set(pcKey, entry);
                         if (DEBUG_JIT) {
-                            parentPort.postMessage({ type: 'debug', msg: `JIT compile pc=0x${pcKey} (${instructions.length} insns): ${instructions.map((n) => n.toString(16)).join(',')}` });
+                            parentPort.postMessage({ type: 'debug', msg: `JIT compile pc=0x${pcKey} (${instructions.length} insns, sizes=${sizes.join(',')}): ${instructions.map((n) => n.toString(16)).join(',')}` });
                         }
                     }
 
@@ -1458,7 +1465,10 @@ async function start() {
                     if (next & BAIL_BIT) {
                         // Precise bail: the block committed everything before
                         // the failing access, so resume the interpreter there.
+                        // Skip the JIT once at that PC so the interpreter can
+                        // service the access (fill the TLB, deliver a fault).
                         exports.jit_set_pc(statePtr, next & BAIL_MASK);
+                        jitBailSkip.add((next & BAIL_MASK).toString(16));
                         return 0;
                     }
                     exports.jit_set_pc(statePtr, next);
