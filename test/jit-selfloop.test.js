@@ -10,7 +10,7 @@ const { RiscVBlockJit, LOOP_BUDGET } = require('../src/jit');
 const REGS = 0x1000;
 
 function compile(insns, sizes) {
-    const jit = new RiscVBlockJit(insns, sizes, { directTlb: true });
+    const jit = new RiscVBlockJit(insns, sizes, { directTlb: true, registerLocals: true });
     const module = jit.compile();
     const memory = new WebAssembly.Memory({ initial: 2 });
     const instance = new WebAssembly.Instance(module, { env: { memory } });

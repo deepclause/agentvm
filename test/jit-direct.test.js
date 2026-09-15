@@ -29,7 +29,7 @@ function setup() {
 
 function runBlock(instructions, setupFn) {
     const { memory, view } = setup();
-    const module = new RiscVBlockJit(instructions, null, { directTlb: true }).compile();
+    const module = new RiscVBlockJit(instructions, null, { directTlb: true, registerLocals: true }).compile();
     const instance = new WebAssembly.Instance(module, { env: { memory } });
     if (setupFn) setupFn(view);
     const next = instance.exports.run(REGS, TLB_R, START_PC, 0, TLB_W);

@@ -1399,7 +1399,7 @@ async function start() {
     };
 
     const compileJitBlock = (instructions, sizes) => {
-        const jit = new RiscVBlockJit(instructions, sizes, { directTlb: true });
+        const jit = new RiscVBlockJit(instructions, sizes, { directTlb: true, registerLocals: true });
         const module = jit.compile();
         const jitInstance = new WebAssembly.Instance(module, {
             env: { memory: instance.exports.memory },
@@ -1415,13 +1415,33 @@ async function start() {
             jit_try_block: (statePtr) => {
                 if (!JIT_ENABLED || !instance) return 0;
                 const exports = instance.exports;
-                if (!exports.jit_get_pc || !exports.jit_read_u16 || !exports.jit_read_u32 ||
+                if (!exports.jit_read_u16 || !exports.jit_read_u32 ||
                     !exports.jit_regs_ptr || !exports.jit_tlb_ptr) return 0;
 
                 try {
-                    const pc = exports.jit_get_pc(statePtr);
+                    // The CPU state pointer is fixed for the VM's lifetime.
+                    // Resolve the fixed pointers once and read s->pc directly
+                    // from linear memory: a jit_get_pc() call here would add a
+                    // JS<->WASM crossing to every block boundary, which alone
+                    // costs ~50% on syscall-heavy workloads.
+                    if (jitFixed === null) {
+                        jitFixed = {
+                            regsPtr: Number(exports.jit_regs_ptr(statePtr)),
+                            tlbRead: Number(exports.jit_tlb_ptr(statePtr, 0)),
+                            tlbWrite: Number(exports.jit_tlb_ptr(statePtr, 1)),
+                            buffer: null,
+                            pcView: null,
+                        };
+                    }
+                    const buf = exports.memory.buffer;
+                    if (jitFixed.buffer !== buf) {
+                        jitFixed.buffer = buf;
+                        // s->pc is immediately before s->reg[32] in RISCVCPUState.
+                        jitFixed.pcView = new BigInt64Array(buf, jitFixed.regsPtr - 8, 1);
+                    }
+                    const pc = jitFixed.pcView[0];
                     if (pc < JIT_PC_MIN || pc >= JIT_PC_MAX) return 0;
-                    const pcKey = pc.toString(16);
+                    const pcKey = pc; // BigInt key avoids a string allocation per boundary
                     if (jitUnsupported.has(pcKey)) return 0;
                     if (jitBailSkip.delete(pcKey)) return 0;
 
@@ -1495,20 +1515,11 @@ async function start() {
                         };
                         jitBlockCache.set(pcKey, entry);
                         if (DEBUG_JIT) {
-                            parentPort.postMessage({ type: 'debug', msg: `JIT compile pc=0x${pcKey} ${compiled.selfLoop ? 'SELFLOOP ' : ''}(${instructions.length} insns, sizes=${sizes.join(',')}): ${instructions.map((n) => n.toString(16)).join(',')}` });
+                            parentPort.postMessage({ type: 'debug', msg: `JIT compile pc=0x${pcKey.toString(16)} ${compiled.selfLoop ? 'SELFLOOP ' : ''}(${instructions.length} insns, sizes=${sizes.join(',')}): ${instructions.map((n) => n.toString(16)).join(',')}` });
                         }
                     }
 
-                    // The CPU state pointer is fixed for the VM's lifetime, so
-                    // resolve these once. Re-reading them per block costs four
-                    // JS<->WASM crossings that dominate short blocks.
-                    if (jitFixed === null) {
-                        jitFixed = {
-                            regsPtr: Number(exports.jit_regs_ptr(statePtr)),
-                            tlbRead: Number(exports.jit_tlb_ptr(statePtr, 0)),
-                            tlbWrite: Number(exports.jit_tlb_ptr(statePtr, 1)),
-                        };
-                    }
+                    // The fixed pointers were resolved at the top of the hook.
                     const regsPtr = jitFixed.regsPtr;
                     const tlbRead = jitFixed.tlbRead;
                     const tlbWrite = jitFixed.tlbWrite;
@@ -1561,7 +1572,7 @@ async function start() {
                         if (jitNext & BAIL_BIT) {
                             exports.jit_sub_cycles(statePtr, entry.cycles);
                             exports.jit_set_pc(statePtr, jitNext & BAIL_MASK);
-                            jitBailSkip.add((jitNext & BAIL_MASK).toString(16));
+                            jitBailSkip.add(jitNext & BAIL_MASK);
                             return 0;
                         }
                         const refNext = refRes.fault ? refRes.pc : refRes.next;
@@ -1572,7 +1583,7 @@ async function start() {
                         if (jitNext !== refNext) detail += ` pc:jit=0x${jitNext.toString(16)},ref=0x${refNext.toString(16)}`;
                         if (detail && !jitVerifyReported.has(pcKey)) {
                             jitVerifyReported.add(pcKey);
-                            parentPort.postMessage({ type: 'debug', msg: `JIT VERIFY MISMATCH pc=0x${pcKey} ${entry.instructions.map((n) => n.toString(16))} [${entry.sizes}]${detail}` });
+                            parentPort.postMessage({ type: 'debug', msg: `JIT VERIFY MISMATCH pc=0x${pcKey.toString(16)} ${entry.instructions.map((n) => n.toString(16))} [${entry.sizes}]${detail}` });
                         }
                         {
                             const v = view0();
@@ -1591,12 +1602,12 @@ async function start() {
                         // Skip the JIT once at that PC so the interpreter can
                         // service the access (fill the TLB, deliver a fault).
                         exports.jit_set_pc(statePtr, next & BAIL_MASK);
-                        jitBailSkip.add((next & BAIL_MASK).toString(16));
+                        jitBailSkip.add(next & BAIL_MASK);
                         return 0;
                     }
                     exports.jit_set_pc(statePtr, next);
                     if (DEBUG_JIT) {
-                        parentPort.postMessage({ type: 'debug', msg: `JIT pc=0x${pcKey} -> 0x${next.toString(16)} (${entry.cycles} insns)` });
+                        parentPort.postMessage({ type: 'debug', msg: `JIT pc=0x${pcKey.toString(16)} -> 0x${next.toString(16)} (${entry.cycles} insns)` });
                     }
                     return 1;
                 } catch (err) {

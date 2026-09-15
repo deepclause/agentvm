@@ -101,6 +101,11 @@ class RiscVBlockJit {
         // callback per load/store, which is what makes the JS-callback mode
         // unusable. Params: (regs, tlbRead, pc:i64, statePtr, tlbWrite).
         this.directTlb = !!options.directTlb;
+        // registerLocals: keep guest registers in WASM locals within the block
+        // instead of reloading them from memory for every instruction. This is
+        // what lets the generated code approach the interpreter's optimized
+        // register allocation.
+        this.registerLocals = !!options.registerLocals;
     }
 
     _typeSection() {
@@ -246,18 +251,20 @@ class RiscVBlockJit {
         const budgetLocal = this.directTlb ? 8 : 3;
         const out = [];
         if (this.directTlb) {
-            if (this.selfLoop) {
-                // locals 5 = vaddr (i64), 6 = TLB entry (i32), 7 = val (i64),
-                // 8 = loop budget (i32)
-                out.push(Buffer.from([0x04, 0x01, 0x7e, 0x01, 0x7f, 0x01, 0x7e, 0x01, 0x7f]));
-            } else {
-                out.push(Buffer.from([0x03, 0x01, 0x7e, 0x01, 0x7f, 0x01, 0x7e]));
-            }
+            const groups = [];
+            const add = (count, type) => { groups.push(count, type); };
+            add(1, 0x7e); // 5: vaddr
+            add(1, 0x7f); // 6: TLB entry
+            add(1, 0x7e); // 7: val / JALR target
+            add(1, 0x7f); // 8: loop budget
+            if (this.registerLocals) add(31, 0x7e); // 9..39: x1..x31
+            out.push(Buffer.from([groups.length / 2, ...groups]));
         } else if (this.selfLoop) {
             out.push(Buffer.from([0x01, 0x01, 0x7f])); // local 3 = budget (i32)
         } else {
             out.push(Buffer.from([0x00])); // zero locals
         }
+        this._emitRegisterPrologue(out);
 
         if (this.selfLoop) {
             const sl = this.selfLoop;
@@ -305,20 +312,51 @@ class RiscVBlockJit {
     }
 
     _loadReg(out, reg) {
+        if (this.registerLocals) {
+            if (reg === 0) this._const64(out, 0n);
+            else out.push(Buffer.from([0x20, 8 + reg])); // local.get xN
+            return;
+        }
         this._regAddr(out, reg);
         out.push(Buffer.from([0x29, 0x03, 0x00])); // i64.load align=3 offset=0
     }
 
     _beginStore(out, reg) {
+        if (this.registerLocals) return; // _endStore writes the local
         this._regAddr(out, reg);
     }
 
     _endStore(out, reg) {
+        if (this.registerLocals) {
+            if (reg === 0) out.push(Buffer.from([0x1a]));     // drop value
+            else out.push(Buffer.from([0x21, 8 + reg]));      // local.set xN
+            return;
+        }
         if (reg === 0) {
             // Writes to x0 are discarded; drop both address and value.
             out.push(Buffer.from([0x1a, 0x1a]));
         } else {
             out.push(Buffer.from([0x37, 0x03, 0x00])); // i64.store align=3 offset=0
+        }
+    }
+
+    _emitRegisterPrologue(out) {
+        if (!this.registerLocals) return;
+        for (let i = 1; i < 32; i++) {
+            out.push(Buffer.from([0x20, 0x00])); // local.get 0 (regs)
+            out.push(Buffer.from([0x41])); out.push(s32leb(i * 8)); out.push(Buffer.from([0x6a])); // i32.add
+            out.push(Buffer.from([0x29, 0x03, 0x00])); // i64.load
+            out.push(Buffer.from([0x21, 8 + i])); // local.set xN
+        }
+    }
+
+    _emitRegisterStoreBack(out) {
+        if (!this.registerLocals) return;
+        for (let i = 1; i < 32; i++) {
+            out.push(Buffer.from([0x20, 0x00]));
+            out.push(Buffer.from([0x41])); out.push(s32leb(i * 8)); out.push(Buffer.from([0x6a]));
+            out.push(Buffer.from([0x20, 8 + i]));
+            out.push(Buffer.from([0x37, 0x03, 0x00])); // i64.store
         }
     }
 
@@ -364,6 +402,11 @@ class RiscVBlockJit {
         out.push(Buffer.from([0x20, 0x02])); // local.get 2 (start pc, i64)
         this._const64(out, offset);
         out.push(Buffer.from([0x7c])); // i64.add
+        if (this.registerLocals) {
+            out.push(Buffer.from([0x21, 0x07])); // local.set 7 (result)
+            this._emitRegisterStoreBack(out);
+            out.push(Buffer.from([0x20, 0x07])); // local.get 7
+        }
         out.push(Buffer.from([0x0f])); // return
     }
 
@@ -453,6 +496,11 @@ class RiscVBlockJit {
         out.push(Buffer.from([0x7c])); // i64.add
         this._const64(out, BAIL_BIT);
         out.push(Buffer.from([0x84])); // i64.or
+        if (this.registerLocals) {
+            out.push(Buffer.from([0x21, 0x07])); // local.set 7
+            this._emitRegisterStoreBack(out);
+            out.push(Buffer.from([0x20, 0x07]));
+        }
         out.push(Buffer.from([0x0f])); // return
     }
 
@@ -690,6 +738,11 @@ class RiscVBlockJit {
                 out.push(Buffer.from([0x7c])); // i64.add
                 this._const64(out, -2n);
                 out.push(Buffer.from([0x83])); // i64.and (mask ~1)
+                if (this.registerLocals) {
+                    out.push(Buffer.from([0x21, 0x07])); // local.set 7 (target)
+                    this._emitRegisterStoreBack(out);
+                    out.push(Buffer.from([0x20, 0x07])); // local.get 7
+                }
                 out.push(Buffer.from([0x0f])); // return
                 break;
             }
