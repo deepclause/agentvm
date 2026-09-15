@@ -85,6 +85,10 @@ const JIT_ONLY_LOOPS = process.env.AGENTVM_JIT_ALL_BLOCKS !== '1';
 // Even without a back edge, a sufficiently long straight-line trace can amortize
 // the host dispatch. 0 keeps the loops-only default.
 const JIT_MIN_BLOCK = Number(process.env.AGENTVM_JIT_MIN_BLOCK || 0);
+const JIT_INLINE = process.env.AGENTVM_JIT_NO_INLINE !== '1';
+// Only inline small leaf callees: larger ones tend to make the trace slower
+// than the interpreter on memory-heavy code.
+const JIT_INLINE_MAX = Number(process.env.AGENTVM_JIT_INLINE_MAX || 6);
 // Differential verification against src/riscv-ref.js (debug only, slow).
 let jitFixed = null;
 
@@ -1475,7 +1479,8 @@ async function start() {
                     if (cop === 0x67) {
                         const crs1 = (w >>> 15) & 0x1f;
                         const cimm = (w >>> 20) & 0xfff;
-                        return (crd === 0 && crs1 === 1 && cimm === 0) ? callee : null;
+                        if (!(crd === 0 && crs1 === 1 && cimm === 0)) return null;
+                        return callee.length > JIT_INLINE_MAX ? null : callee;
                     }
                     if (cop === 0x6f || cop === 0x63) return null;
                     if (crd === 1) return null;
@@ -1506,7 +1511,7 @@ async function start() {
                         if (target === pc) isLoop = true;
                         break;
                     }
-                    const callee = readLeafCallee(target);
+                    const callee = JIT_INLINE ? readLeafCallee(target) : null;
                     if (callee) {
                         inline.add(instructions.length - 1);
                         for (const ci of callee) {
