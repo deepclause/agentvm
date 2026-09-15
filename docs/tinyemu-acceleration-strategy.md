@@ -494,43 +494,47 @@ Two mitigations are implemented on top of the translator:
    so by default only loop traces are compiled (`AGENTVM_JIT_ALL_BLOCKS=1`
    restores compiling every block). This keeps boot close to normal speed.
 
-Measured with the loops-only policy on the acceptance image:
+**In-WASM dispatch is now implemented.** TinyEMU exports its indirect function
+table (`--export-table --growable-table`) and owns a direct-mapped
+`{pc, tableIndex, cycles}` map plus a C `jit_try_block()` that calls compiled
+traces with `call_indirect`. The host loads each compiled trace into the table
+and writes the map entry; the only JavaScript that remains is a `jit_compile`
+hook invoked once per hot PC (after 50 hits in C). Steady-state execution never
+returns to JavaScript.
+
+Measured on the acceptance image:
 
 | workload | JIT off | JIT on | speedup |
 |---|---:|---:|---:|
-| boot | 1572 ms | 1862 ms | 0.84× (18% overhead) |
-| call-free ALU loop (50 M iters) | ~2560 ms | ~330 ms | **7.79×** |
+| boot | 1572 ms | 1618 ms | 0.97× |
+| call-free ALU loop (50 M iters) | 2760 ms | 176 ms | **15.68×** |
 | call-free load/store loop (5 M iters) | 250 ms | 113 ms | **2.21×** |
-| `node` integer loop | 2450 ms | 2804 ms | 0.87× |
-| `node` string loop | 2905 ms | 2814 ms | 1.03× |
-| `python3 sum(range(2e6))` | 5140 ms | 6169 ms | 0.83× |
-| `python3` for-loop (1e6) | 21557 ms | 24931 ms | 0.86× |
+| `node` integer loop | 2550 ms | 2593 ms | 0.98× |
+| `node` string loop | 2761 ms | 2761 ms | 1.00× |
+| `python3 sum(range(2e6))` | 5046 ms | 5006 ms | 1.01× |
+| `python3` for-loop (1e6) | 22584 ms | 23500 ms | 0.96× |
 
-Codegen/hook improvements that produced these numbers:
+With the JavaScript per-boundary hook gone, Node and Python are at parity and
+the loop speedup rose from 7.8× to 15.7× (the remaining 2–4% on some workloads
+is the C-side hot counter and the non-translated cold code).
+
+Codegen improvements that produced these numbers:
 
 - **Guest registers live in WASM locals** for the duration of a trace, instead
   of being reloaded from memory for every instruction (the interpreter's C
   compiler does the same). Registers are loaded once at trace entry and stored
   back only at trace exits.
-- **The hook reads `s->pc` directly from linear memory** as two 32-bit ints and
-  keys its caches by a Number, avoiding a `jit_get_pc()` WASM call, a BigInt
-  allocation and a string allocation per block boundary.
-- **The PC views are refreshed only when the WASM memory grows** (a detached
-  typed array has length 0), instead of touching `memory.buffer` on every call.
-  This alone cut the hook overhead from ~52% to ~19% on `python3 sum`.
+- **Direct `s->pc` reads** as two 32-bit ints with a Number cache key.
+- **Loop-only traces** with a WASM-internal loop (up to 64 iterations per host
+  call).
+- **The C dispatcher subtracts `cycles` from `s->n_cycles`**, so the interpreter
+  still returns to check interrupts between traces, and a `bail` result (TLB
+  miss / unaligned / cross-page) resumes the interpreter at the exact faulting
+  instruction.
 
-An instrumented run showed the hook is called ~25 million times for a 1 M
-iteration `sum(range())` — it fires on every cross-page function call/return,
-not once per iteration. Those 19% are therefore the remaining blocker for
-Node/Python: the hook must move into WASM (the region dispatcher) for the JIT
-to be a net win on call-heavy code.
-
-The `AGENTVM_JIT_VERIFY=1` reference check was extended to simulate the
-self-loop iterations and reports **zero** mismatches while booting the full VM.
-The JIT stays off by default (`AGENTVM_JIT=1` opts in). Making it a real win on
-Node/Python needs generated code that V8 optimizes (one large module per
-trace/region, or an AOT-compiled hot set) plus coverage of loops that contain
-calls — i.e. the in-WASM region dispatcher below, not more per-block tuning.
+`AGENTVM_JIT=1` still opts in (the default remains off). The build applies
+`image/patches/tinyemu-jit-table.patch` and links with
+`-Wl,--export-table -Wl,--growable-table`.
 
 ### 7.7 Expected impact
 

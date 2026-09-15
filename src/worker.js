@@ -73,7 +73,8 @@ function writeIOVs(view, iovs_ptr, iovs_len, data) {
 let instance = null;
 const JIT_ENABLED = process.env.AGENTVM_JIT === '1';
 const DEBUG_JIT = process.env.DEBUG_JIT === '1';
-const JIT_HIT_THRESHOLD = Number(process.env.AGENTVM_JIT_THRESHOLD || 50);
+// The hot threshold now lives in the emulator (JIT_HOT_THRESHOLD in
+// riscv_cpu.c): the C dispatcher only calls jit_compile after that many hits.
 // Only translate guest PCs in [MIN, MAX). Defaults cover all of SV39. Restricting
 // to low addresses is a debugging aid that keeps the JIT out of early-boot and
 // kernel code.
@@ -85,23 +86,7 @@ const JIT_ONLY_LOOPS = process.env.AGENTVM_JIT_ALL_BLOCKS !== '1';
 // the host dispatch. 0 keeps the loops-only default.
 const JIT_MIN_BLOCK = Number(process.env.AGENTVM_JIT_MIN_BLOCK || 0);
 // Differential verification against src/riscv-ref.js (debug only, slow).
-const JIT_VERIFY = process.env.AGENTVM_JIT_VERIFY === '1';
-const jitHitCounts = new Map();
-const jitBlockCache = new Map();
-// Direct-mapped table of PCs that must not be translated (non-loop blocks,
-// unsupported instructions). A typed-array lookup on the hot hook path is far
-// cheaper than a Map; collisions only cause a re-decode, never incorrectness.
-const JIT_UNSUP_BITS = 19;
-const JIT_UNSUP_SIZE = 1 << JIT_UNSUP_BITS;
-const JIT_UNSUP_MASK = JIT_UNSUP_SIZE - 1;
-const jitUnsupported = new Float64Array(JIT_UNSUP_SIZE).fill(NaN);
-// Blocks that bailed (TLB miss / unaligned) must be executed by the
-// interpreter at least once so it can fill the TLB. Otherwise the JIT would be
-// re-entered at the same PC and bail forever.
-const jitBailSkip = new Set();
-const jitVerifyReported = new Set();
 let jitFixed = null;
-let jitExports = null;
 
 async function start() {
     const wasmBuffer = fs.readFileSync(wasmPath);
@@ -1411,228 +1396,118 @@ async function start() {
         const jitInstance = new WebAssembly.Instance(module, {
             env: { memory: instance.exports.memory },
         });
-        // Self-loop blocks execute up to LOOP_BUDGET iterations per call; charge
-        // the upper bound so the interpreter still returns to check interrupts.
+        // Self-loop blocks execute up to LOOP_BUDGET iterations per call; the
+        // emulator subtracts this many cycles so it still checks interrupts.
         const cycles = instructions.length * (jit.selfLoop ? LOOP_BUDGET : 1);
         return { run: jitInstance.exports.run, cycles, selfLoop: !!jit.selfLoop };
     };
 
+    // In-WASM dispatch. riscv_cpu.c keeps a direct-mapped {pc, tableIndex,
+    // cycles} table and calls the compiled function with call_indirect. The
+    // host only installs traces (and only after the C hot counter fires), so
+    // the steady-state execution never returns to JavaScript. Values must
+    // match riscv_cpu.c.
+    const JIT_MAP_BITS = 19;
+    const JIT_MAP_SIZE = 1 << JIT_MAP_BITS;
+    const JIT_MAP_MASK = JIT_MAP_SIZE - 1;
+    const JIT_MAP_BYTES = JIT_MAP_SIZE * 16;
+    const JIT_UNSUPPORTED = 0xFFFFFFFF;
+    const JIT_MAX_SLOTS = 1 << 16;
+    let jitTable = null;
+    let jitTableBase = 0;
+    let jitNextSlot = 0;
+    let jitMapPtr = 0;
+
+    const jitCompile = (statePtr) => {
+        if (!JIT_ENABLED || !jitTable) return 0;
+        const exports = instance.exports;
+        try {
+            if (jitFixed === null) {
+                jitFixed = {
+                    regsPtr: Number(exports.jit_regs_ptr(statePtr)),
+                    pcLo: null,
+                    pcHi: null,
+                };
+                jitTableBase = jitTable.length;
+                jitTable.grow(JIT_MAX_SLOTS);
+                jitMapPtr = Number(exports.jit_map_ptr());
+            }
+            const buf = exports.memory.buffer;
+            if (jitFixed.pcLo === null || jitFixed.pcLo.length === 0) {
+                const p = jitFixed.regsPtr - 8; // s->pc is before s->reg[32]
+                jitFixed.pcLo = new Int32Array(buf, p, 1);
+                jitFixed.pcHi = new Int32Array(buf, p + 4, 1);
+            }
+            const pcNum = jitFixed.pcHi[0] * 0x100000000 + (jitFixed.pcLo[0] >>> 0);
+            const pc = BigInt(pcNum);
+            const slot = Number(((pc >> 1n) ^ (pc >> 13n)) & BigInt(JIT_MAP_MASK));
+            const entryOff = slot * 16;
+            const mdv = new DataView(buf, jitMapPtr, JIT_MAP_BYTES);
+            const mark = (index, cycles) => {
+                mdv.setBigUint64(entryOff, pc, true);
+                mdv.setUint32(entryOff + 8, index, true);
+                mdv.setUint32(entryOff + 12, cycles, true);
+            };
+
+            if (pcNum < JIT_PC_MIN || pcNum >= JIT_PC_MAX) { mark(JIT_UNSUPPORTED, 0); return 0; }
+
+            const instructions = [];
+            const sizes = [];
+            let cursor = pc;
+            let ok = true;
+            let isLoop = false;
+            for (;;) {
+                if (instructions.length >= 256) { ok = false; break; }
+                const insn = readGuestInsn(exports, statePtr, cursor);
+                if (!insn || !isSupportedInstruction(insn.word)) { ok = false; break; }
+                const word = insn.word >>> 0;
+                const op = word & 0x7f;
+                instructions.push(word);
+                sizes.push(Number(insn.size));
+                if (op === 0x63) {
+                    const target = cursor + BigInt(branchOffset(word));
+                    if (target === pc) { isLoop = true; break; }
+                    if (target > cursor) { cursor += insn.size; continue; }
+                    ok = false; break;
+                }
+                if (op === 0x6f) {
+                    const rd = (word >>> 7) & 0x1f;
+                    const target = cursor + BigInt(jalOffset(word));
+                    if (rd === 0 && target === pc) isLoop = true;
+                    break;
+                }
+                if (op === 0x67) break;
+                cursor += insn.size;
+            }
+            const allowedNonLoop = JIT_MIN_BLOCK > 0 && instructions.length >= JIT_MIN_BLOCK;
+            if (!ok || instructions.length === 0 || (JIT_ONLY_LOOPS && !isLoop && !allowedNonLoop)) {
+                mark(JIT_UNSUPPORTED, 0);
+                return 0;
+            }
+            let compiled;
+            try {
+                compiled = compileJitBlock(instructions, sizes);
+            } catch (err) {
+                mark(JIT_UNSUPPORTED, 0);
+                return 0;
+            }
+            if (jitNextSlot >= JIT_MAX_SLOTS) { mark(JIT_UNSUPPORTED, 0); return 0; }
+            const tableIndex = jitTableBase + jitNextSlot++;
+            jitTable.set(tableIndex, compiled.run);
+            mark(tableIndex, compiled.cycles);
+            if (DEBUG_JIT) {
+                parentPort.postMessage({ type: 'debug', msg: `JIT install pc=0x${pc.toString(16)} -> table ${tableIndex} (${instructions.length} insns)` });
+            }
+            return 1;
+        } catch (err) {
+            if (DEBUG_JIT) parentPort.postMessage({ type: 'debug', msg: `JIT compile error: ${err.message}` });
+            return 0;
+        }
+    };
+
     const { instance: inst } = await WebAssembly.instantiate(wasmBuffer, {
         env: {
-            jit_try_block: (statePtr) => {
-                if (!JIT_ENABLED || !instance) return 0;
-                const exports = jitExports || (jitExports = instance.exports);
-                if (!exports.jit_read_u16 || !exports.jit_read_u32 ||
-                    !exports.jit_regs_ptr || !exports.jit_tlb_ptr) return 0;
-
-                try {
-                    // The CPU state pointer is fixed for the VM's lifetime.
-                    // Resolve the fixed pointers once and read s->pc directly
-                    // from linear memory: a jit_get_pc() call here would add a
-                    // JS<->WASM crossing to every block boundary, which alone
-                    // costs ~50% on syscall-heavy workloads.
-                    if (jitFixed === null) {
-                        jitFixed = {
-                            regsPtr: Number(exports.jit_regs_ptr(statePtr)),
-                            tlbRead: Number(exports.jit_tlb_ptr(statePtr, 0)),
-                            tlbWrite: Number(exports.jit_tlb_ptr(statePtr, 1)),
-                            pcLo: null,
-                            pcHi: null,
-                        };
-                    }
-                    // Refresh the PC views only when the memory has grown (a
-                    // detached typed array has length 0). Accessing
-                    // memory.buffer directly on every block boundary is what
-                    // dominates the hook cost.
-                    if (jitFixed.pcLo === null || jitFixed.pcLo.length === 0) {
-                        const buf = exports.memory.buffer;
-                        // s->pc is immediately before s->reg[32] in RISCVCPUState.
-                        const p = jitFixed.regsPtr - 8;
-                        jitFixed.pcLo = new Int32Array(buf, p, 1);
-                        jitFixed.pcHi = new Int32Array(buf, p + 4, 1);
-                    }
-                    // Read the PC as two 32-bit ints to avoid allocating a BigInt
-                    // on every block boundary; user PCs fit in a double exactly.
-                    const pcNum = jitFixed.pcHi[0] * 0x100000000 + (jitFixed.pcLo[0] >>> 0);
-                    if (pcNum < JIT_PC_MIN || pcNum >= JIT_PC_MAX) return 0;
-                    const pcKey = pcNum;
-                    const unsupSlot = pcKey & JIT_UNSUP_MASK;
-                    if (jitUnsupported[unsupSlot] === pcKey) return 0;
-                    if (jitBailSkip.delete(pcKey)) return 0;
-
-                    const hits = (jitHitCounts.get(pcKey) || 0) + 1;
-                    jitHitCounts.set(pcKey, hits);
-                    if (hits < JIT_HIT_THRESHOLD) return 0;
-
-                    // Only translate/execute paths need the full BigInt PC.
-                    const pc = BigInt(pcKey);
-
-                    // Cheap self-modifying-code check: the first instruction
-                    // word must match the cached block, otherwise re-translate.
-                    const first = Number(exports.jit_read_u16(statePtr, pc));
-                    let entry = jitBlockCache.get(pcKey);
-                    if (entry && entry.first !== first) {
-                        jitBlockCache.delete(pcKey);
-                        entry = null;
-                    }
-                    if (!entry) {
-                        // Trace decoder: follow straight-line code and forward
-                        // (exit) branches until the back edge of a loop, so a
-                        // top-tested loop is compiled as one self-looping trace.
-                        const instructions = [];
-                        const sizes = [];
-                        let cursor = pc;
-                        let ok = true;
-                        let isLoop = false;
-                        for (;;) {
-                            if (instructions.length >= 256) { ok = false; break; }
-                            const insn = readGuestInsn(exports, statePtr, cursor);
-                            if (!insn || !isSupportedInstruction(insn.word)) { ok = false; break; }
-                            const word = insn.word >>> 0;
-                            const op = word & 0x7f;
-                            instructions.push(word);
-                            sizes.push(Number(insn.size));
-                            if (op === 0x63) {
-                                const target = cursor + BigInt(branchOffset(word));
-                                if (target === pc) { isLoop = true; break; } // back edge to the trace start
-                                if (target > cursor) { cursor += insn.size; continue; } // forward exit
-                                ok = false; break;                        // backward branch into the middle
-                            }
-                            if (op === 0x6f) {
-                                const rd = (word >>> 7) & 0x1f;
-                                const target = cursor + BigInt(jalOffset(word));
-                                if (rd === 0 && target === pc) isLoop = true;
-                                break;                                    // otherwise a terminal jump
-                            }
-                            if (op === 0x67) break;                       // terminal return
-                            cursor += insn.size;
-                        }
-                        const allowedNonLoop = JIT_MIN_BLOCK > 0 && instructions.length >= JIT_MIN_BLOCK;
-                        if (!ok || instructions.length === 0 || (JIT_ONLY_LOOPS && !isLoop && !allowedNonLoop)) {
-                            jitUnsupported[pcKey & JIT_UNSUP_MASK] = pcKey;
-                            return 0;
-                        }
-                        let compiled;
-                        try {
-                            compiled = compileJitBlock(instructions, sizes);
-                        } catch (err) {
-                            jitUnsupported[pcKey & JIT_UNSUP_MASK] = pcKey;
-                            return 0;
-                        }
-                        // A non-loop block cannot amortize the per-block host
-                        // dispatch, so by default only self-loop traces are
-                        // compiled; everything else stays in the interpreter.
-                        entry = {
-                            first,
-                            run: compiled.run,
-                            cycles: compiled.cycles,
-                            selfLoop: compiled.selfLoop,
-                            instructions,
-                            sizes,
-                            hasStore: instructions.some((n) => (n & 0x7f) === 0x23),
-                        };
-                        jitBlockCache.set(pcKey, entry);
-                        if (DEBUG_JIT) {
-                            parentPort.postMessage({ type: 'debug', msg: `JIT compile pc=0x${pcKey.toString(16)} ${compiled.selfLoop ? 'SELFLOOP ' : ''}(${instructions.length} insns, sizes=${sizes.join(',')}): ${instructions.map((n) => n.toString(16)).join(',')}` });
-                        }
-                    }
-
-                    // The fixed pointers were resolved at the top of the hook.
-                    const regsPtr = jitFixed.regsPtr;
-                    const tlbRead = jitFixed.tlbRead;
-                    const tlbWrite = jitFixed.tlbWrite;
-
-                    if (JIT_VERIFY) {
-                        const view0 = () => new BigInt64Array(instance.exports.memory.buffer, regsPtr, 32);
-                        const snap = Array.from(view0());
-                        const rd = (addr, size) => {
-                            switch (size) {
-                                case 1: return exports.jit_read_u8(statePtr, addr);
-                                case 2: return exports.jit_read_u16(statePtr, addr);
-                                case 4: return exports.jit_read_u32(statePtr, addr);
-                                default: return exports.jit_read_u64(statePtr, addr);
-                            }
-                        };
-                        const wr = (addr, size, val) => {
-                            switch (size) {
-                                case 1: exports.jit_write_u8(statePtr, addr, val); break;
-                                case 2: exports.jit_write_u16(statePtr, addr, val); break;
-                                case 4: exports.jit_write_u32(statePtr, addr, val); break;
-                                default: exports.jit_write_u64(statePtr, addr, val); break;
-                            }
-                        };
-                        const refRegs = snap.slice();
-                        const undos = [];
-                        const memIface = {
-                            read(addr, size, signed) {
-                                const v = rd(addr, size);
-                                return signed ? BigInt.asIntN(size * 8, v) : v;
-                            },
-                            write(addr, size, val) {
-                                undos.push({ addr, size, old: rd(addr, size) });
-                                wr(addr, size, val);
-                                return true;
-                            },
-                        };
-                        // Run the reference on a copy of the registers, undo its
-                        // memory writes, then run the JIT from the same state.
-                        // Run the reference for the same number of internal
-                        // iterations the JIT self-loop performs (up to the
-                        // budget), so they can be compared directly.
-                        let refRes;
-                        for (let it = 0; ; it++) {
-                            refRes = refRun(entry.instructions, entry.sizes, refRegs, memIface, pc);
-                            if (refRes.fault || refRes.next !== pc || it + 1 >= LOOP_BUDGET) break;
-                        }
-                        for (let i = undos.length - 1; i >= 0; i--) wr(undos[i].addr, undos[i].size, undos[i].old);
-                        const jitNext = entry.run(regsPtr, tlbRead, pc, statePtr, tlbWrite);
-                        const jitRegs = Array.from(view0());
-                        if (jitNext & BAIL_BIT) {
-                            exports.jit_sub_cycles(statePtr, entry.cycles);
-                            exports.jit_set_pc(statePtr, jitNext & BAIL_MASK);
-                            jitBailSkip.add(jitNext & BAIL_MASK);
-                            return 0;
-                        }
-                        const refNext = refRes.fault ? refRes.pc : refRes.next;
-                        let detail = '';
-                        for (let i = 0; i < 32; i++) {
-                            if (jitRegs[i] !== refRegs[i]) detail += ` x${i}:jit=${jitRegs[i]},ref=${refRegs[i]}`;
-                        }
-                        if (jitNext !== refNext) detail += ` pc:jit=0x${jitNext.toString(16)},ref=0x${refNext.toString(16)}`;
-                        if (detail && !jitVerifyReported.has(pcKey)) {
-                            jitVerifyReported.add(pcKey);
-                            parentPort.postMessage({ type: 'debug', msg: `JIT VERIFY MISMATCH pc=0x${pcKey.toString(16)} ${entry.instructions.map((n) => n.toString(16))} [${entry.sizes}]${detail}` });
-                        }
-                        {
-                            const v = view0();
-                            for (let i = 0; i < 32; i++) v[i] = jitRegs[i];
-                        }
-                        exports.jit_sub_cycles(statePtr, entry.cycles);
-                        exports.jit_set_pc(statePtr, jitNext);
-                        return 1;
-                    }
-
-                    const next = entry.run(regsPtr, tlbRead, pc, statePtr, tlbWrite);
-                    exports.jit_sub_cycles(statePtr, entry.cycles);
-                    if (next & BAIL_BIT) {
-                        // Precise bail: the block committed everything before
-                        // the failing access, so resume the interpreter there.
-                        // Skip the JIT once at that PC so the interpreter can
-                        // service the access (fill the TLB, deliver a fault).
-                        exports.jit_set_pc(statePtr, next & BAIL_MASK);
-                        jitBailSkip.add(next & BAIL_MASK);
-                        return 0;
-                    }
-                    exports.jit_set_pc(statePtr, next);
-                    if (DEBUG_JIT) {
-                        parentPort.postMessage({ type: 'debug', msg: `JIT pc=0x${pcKey.toString(16)} -> 0x${next.toString(16)} (${entry.cycles} insns)` });
-                    }
-                    return 1;
-                } catch (err) {
-                    if (DEBUG_JIT) parentPort.postMessage({ type: 'debug', msg: `JIT fallback: ${err.message}${JIT_VERIFY ? '\n' + err.stack : ''}` });
-                    return 0;
-                }
-            },
+            jit_compile: (statePtr) => jitCompile(statePtr),
         },
         wasi_snapshot_preview1: {
             ...wasiImport,
@@ -1721,6 +1596,9 @@ async function start() {
     });
     
     instance = inst;
+    if (JIT_ENABLED && instance.exports.__indirect_function_table) {
+        jitTable = instance.exports.__indirect_function_table;
+    }
 
     parentPort.postMessage({ type: 'ready' });
 

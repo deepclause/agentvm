@@ -54,6 +54,7 @@ git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-low-risk-performance.patch"
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-rv64-only.patch"
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-jit-exports.patch"
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-jit-hook.patch"
+git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-jit-table.patch"
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-jit-tlb.patch"
 # Generated without context to avoid preserving upstream trailing whitespace.
 git -C "$WORK/tinyemu" apply --unidiff-zero "$HERE/patches/tinyemu-fast-branch.patch"
@@ -149,6 +150,9 @@ new_cc = "-D_WASI_EMULATED_SIGNAL -DWASI -DCONFIG_RISCV_ONLY_64 -DCONFIG_JIT"
 if pv_accel:
     new_cc += " -DCONFIG_PV_ACCEL"
 new_cc += " -I/tools/wizer/include/"
+# In-WASM JIT dispatch: export the indirect function table so the host can
+# install compiled traces, and allow growing it.
+new_cc += " -Wl,--export-table -Wl,--growable-table"
 assert s.count(old_cc) == 1, "unexpected TinyEMU compiler command"
 s = s.replace(old_cc, new_cc)
 
