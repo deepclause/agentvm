@@ -106,6 +106,11 @@ class RiscVBlockJit {
         // what lets the generated code approach the interpreter's optimized
         // register allocation.
         this.registerLocals = !!options.registerLocals;
+        // Per-instruction guest offsets from the trace start. Needed when call
+        // inlining makes the instruction stream non-contiguous.
+        this.offsets = options.offsets || null;
+        // Set of instruction indices that are inlined calls (emit only the link).
+        this.inline = options.inline || null;
     }
 
     _typeSection() {
@@ -221,9 +226,14 @@ class RiscVBlockJit {
         const n = instructions.length;
         const offsets = new Array(n);
         let total = 0;
-        for (let i = 0; i < n; i++) {
-            offsets[i] = total;
-            total += sizes[i];
+        if (this.offsets && this.offsets.length === n) {
+            for (let i = 0; i < n; i++) offsets[i] = this.offsets[i];
+            total = offsets[n - 1] + sizes[n - 1];
+        } else {
+            for (let i = 0; i < n; i++) {
+                offsets[i] = total;
+                total += sizes[i];
+            }
         }
 
         // A block whose terminal branch/jump targets its own start is a
@@ -278,7 +288,10 @@ class RiscVBlockJit {
             out.push(Buffer.from([0x0b])); // end if
             // budget -= 1
             out.push(Buffer.from([0x20, budgetLocal, 0x41, 0x01, 0x6b, 0x21, budgetLocal]));
-            for (let i = 0; i < n - 1; i++) this._emitInstruction(out, instructions[i], offsets[i], sizes[i]);
+            for (let i = 0; i < n - 1; i++) {
+                this._emitInstruction(out, instructions[i], offsets[i], sizes[i],
+                    this.inline ? this.inline.has(i) : false);
+            }
             if (sl.cond) {
                 this._emitBranchCondition(out, sl.opcode, sl.rs1, sl.rs2);
                 out.push(Buffer.from([0x04, 0x40])); // if
@@ -295,7 +308,8 @@ class RiscVBlockJit {
         }
 
         for (let i = 0; i < n; i++) {
-            this._emitInstruction(out, instructions[i], offsets[i], sizes[i]);
+            this._emitInstruction(out, instructions[i], offsets[i], sizes[i],
+                this.inline ? this.inline.has(i) : false);
         }
 
         // Fall through: return startPc + total size.
@@ -568,7 +582,7 @@ class RiscVBlockJit {
         out.push(Buffer.from([opcode, 0x00, 0x00])); // store, align=0 offset=0
     }
 
-    _emitInstruction(out, insn, pc, size = 4) {
+    _emitInstruction(out, insn, pc, size = 4, inlineCall = false) {
         const opcode = insn & 0x7f;
         const rd = (insn >>> 7) & 0x1f;
         const rs1 = (insn >>> 15) & 0x1f;
@@ -726,7 +740,9 @@ class RiscVBlockJit {
                 this._beginStore(out, rd);
                 this._emitPcConst(out, pc + size);
                 this._endStore(out, rd);
-                this._emitReturnRel(out, pc + imm);
+                // An inlined call keeps only the link write; the callee body
+                // follows inline in the trace and returns to pc + size.
+                if (!inlineCall) this._emitReturnRel(out, pc + imm);
                 break;
             }
             case 0x67: { // JALR

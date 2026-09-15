@@ -1390,8 +1390,10 @@ async function start() {
         return { word: Number(exports.jit_read_u32(statePtr, addr)), size: 4n };
     };
 
-    const compileJitBlock = (instructions, sizes) => {
-        const jit = new RiscVBlockJit(instructions, sizes, { directTlb: true, registerLocals: true });
+    const compileJitBlock = (instructions, sizes, offsets, inline) => {
+        const jit = new RiscVBlockJit(instructions, sizes, {
+            directTlb: true, registerLocals: true, offsets, inline,
+        });
         const module = jit.compile();
         const jitInstance = new WebAssembly.Instance(module, {
             env: { memory: instance.exports.memory },
@@ -1453,17 +1455,44 @@ async function start() {
 
             const instructions = [];
             const sizes = [];
+            const offsets = [];
+            const inline = new Set();
             let cursor = pc;
             let ok = true;
             let isLoop = false;
+            // A straight-line leaf callee (no branch/call, does not write ra,
+            // ends in `ret`) can be inlined so a loop body containing a small
+            // helper still forms a self-loop trace.
+            const readLeafCallee = (target) => {
+                const callee = [];
+                let c = target;
+                for (let guard = 0; guard < 64; guard++) {
+                    const ci = readGuestInsn(exports, statePtr, c);
+                    if (!ci || !isSupportedInstruction(ci.word)) return null;
+                    const w = ci.word >>> 0;
+                    const cop = w & 0x7f;
+                    const crd = (w >>> 7) & 0x1f;
+                    if (cop === 0x67) {
+                        const crs1 = (w >>> 15) & 0x1f;
+                        const cimm = (w >>> 20) & 0xfff;
+                        return (crd === 0 && crs1 === 1 && cimm === 0) ? callee : null;
+                    }
+                    if (cop === 0x6f || cop === 0x63) return null;
+                    if (crd === 1) return null;
+                    callee.push({ word: w, size: Number(ci.size), addr: c });
+                    c += ci.size;
+                }
+                return null;
+            };
             for (;;) {
-                if (instructions.length >= 256) { ok = false; break; }
+                if (instructions.length >= 512) { ok = false; break; }
                 const insn = readGuestInsn(exports, statePtr, cursor);
                 if (!insn || !isSupportedInstruction(insn.word)) { ok = false; break; }
                 const word = insn.word >>> 0;
                 const op = word & 0x7f;
                 instructions.push(word);
                 sizes.push(Number(insn.size));
+                offsets.push(Number(cursor - pc));
                 if (op === 0x63) {
                     const target = cursor + BigInt(branchOffset(word));
                     if (target === pc) { isLoop = true; break; }
@@ -1473,7 +1502,21 @@ async function start() {
                 if (op === 0x6f) {
                     const rd = (word >>> 7) & 0x1f;
                     const target = cursor + BigInt(jalOffset(word));
-                    if (rd === 0 && target === pc) isLoop = true;
+                    if (rd === 0) {
+                        if (target === pc) isLoop = true;
+                        break;
+                    }
+                    const callee = readLeafCallee(target);
+                    if (callee) {
+                        inline.add(instructions.length - 1);
+                        for (const ci of callee) {
+                            instructions.push(ci.word);
+                            sizes.push(ci.size);
+                            offsets.push(Number(ci.addr - pc));
+                        }
+                        cursor += insn.size; // continue after the call returns
+                        continue;
+                    }
                     break;
                 }
                 if (op === 0x67) break;
@@ -1486,7 +1529,7 @@ async function start() {
             }
             let compiled;
             try {
-                compiled = compileJitBlock(instructions, sizes);
+                compiled = compileJitBlock(instructions, sizes, offsets, inline);
             } catch (err) {
                 mark(JIT_UNSUPPORTED, 0);
                 return 0;
