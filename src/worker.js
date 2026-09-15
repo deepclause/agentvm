@@ -90,6 +90,7 @@ const jitUnsupported = new Set();
 // re-entered at the same PC and bail forever.
 const jitBailSkip = new Set();
 const jitVerifyReported = new Set();
+let jitFixed = null;
 const JIT_TERMINAL = new Set([0x63, 0x6f, 0x67]);
 
 async function start() {
@@ -1468,9 +1469,19 @@ async function start() {
                         }
                     }
 
-                    const regsPtr = Number(exports.jit_regs_ptr(statePtr));
-                    const tlbRead = Number(exports.jit_tlb_ptr(statePtr, 0));
-                    const tlbWrite = Number(exports.jit_tlb_ptr(statePtr, 1));
+                    // The CPU state pointer is fixed for the VM's lifetime, so
+                    // resolve these once. Re-reading them per block costs four
+                    // JS<->WASM crossings that dominate short blocks.
+                    if (jitFixed === null) {
+                        jitFixed = {
+                            regsPtr: Number(exports.jit_regs_ptr(statePtr)),
+                            tlbRead: Number(exports.jit_tlb_ptr(statePtr, 0)),
+                            tlbWrite: Number(exports.jit_tlb_ptr(statePtr, 1)),
+                        };
+                    }
+                    const regsPtr = jitFixed.regsPtr;
+                    const tlbRead = jitFixed.tlbRead;
+                    const tlbWrite = jitFixed.tlbWrite;
 
                     if (JIT_VERIFY) {
                         const view0 = () => new BigInt64Array(instance.exports.memory.buffer, regsPtr, 32);
