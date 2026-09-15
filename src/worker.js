@@ -1556,6 +1556,9 @@ async function start() {
     const { instance: inst } = await WebAssembly.instantiate(wasmBuffer, {
         env: {
             jit_compile: (statePtr) => jitCompile(statePtr),
+            // Compatibility with images built before in-WASM dispatch, which
+            // import the old JS hook. Unused by the current image.
+            jit_try_block: () => 0,
         },
         wasi_snapshot_preview1: {
             ...wasiImport,
