@@ -499,12 +499,12 @@ Measured with the loops-only policy on the acceptance image:
 | workload | JIT off | JIT on | speedup |
 |---|---:|---:|---:|
 | boot | 1572 ms | 1862 ms | 0.84× (18% overhead) |
-| call-free ALU loop (50 M iters) | ~2560 ms | ~350 ms | **7.30×** |
+| call-free ALU loop (50 M iters) | ~2560 ms | ~330 ms | **7.79×** |
 | call-free load/store loop (5 M iters) | 250 ms | 113 ms | **2.21×** |
-| `node` integer loop | 2581 ms | 2905 ms | 0.89× |
-| `node` string loop | 2650 ms | 2910 ms | 0.91× |
-| `python3 sum(range(2e6))` | 4606 ms | 5740 ms | 0.80× |
-| `python3` for-loop (1e6) | 22042 ms | 26062 ms | 0.85× |
+| `node` integer loop | 2450 ms | 2804 ms | 0.87× |
+| `node` string loop | 2905 ms | 2814 ms | 1.03× |
+| `python3 sum(range(2e6))` | 5140 ms | 6169 ms | 0.83× |
+| `python3` for-loop (1e6) | 21557 ms | 24931 ms | 0.86× |
 
 Codegen/hook improvements that produced these numbers:
 

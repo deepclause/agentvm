@@ -88,7 +88,13 @@ const JIT_MIN_BLOCK = Number(process.env.AGENTVM_JIT_MIN_BLOCK || 0);
 const JIT_VERIFY = process.env.AGENTVM_JIT_VERIFY === '1';
 const jitHitCounts = new Map();
 const jitBlockCache = new Map();
-const jitUnsupported = new Set();
+// Direct-mapped table of PCs that must not be translated (non-loop blocks,
+// unsupported instructions). A typed-array lookup on the hot hook path is far
+// cheaper than a Map; collisions only cause a re-decode, never incorrectness.
+const JIT_UNSUP_BITS = 19;
+const JIT_UNSUP_SIZE = 1 << JIT_UNSUP_BITS;
+const JIT_UNSUP_MASK = JIT_UNSUP_SIZE - 1;
+const jitUnsupported = new Float64Array(JIT_UNSUP_SIZE).fill(NaN);
 // Blocks that bailed (TLB miss / unaligned) must be executed by the
 // interpreter at least once so it can fill the TLB. Otherwise the JIT would be
 // re-entered at the same PC and bail forever.
@@ -1450,7 +1456,8 @@ async function start() {
                     const pcNum = jitFixed.pcHi[0] * 0x100000000 + (jitFixed.pcLo[0] >>> 0);
                     if (pcNum < JIT_PC_MIN || pcNum >= JIT_PC_MAX) return 0;
                     const pcKey = pcNum;
-                    if (jitUnsupported.has(pcKey)) return 0;
+                    const unsupSlot = pcKey & JIT_UNSUP_MASK;
+                    if (jitUnsupported[unsupSlot] === pcKey) return 0;
                     if (jitBailSkip.delete(pcKey)) return 0;
 
                     const hits = (jitHitCounts.get(pcKey) || 0) + 1;
@@ -1502,14 +1509,14 @@ async function start() {
                         }
                         const allowedNonLoop = JIT_MIN_BLOCK > 0 && instructions.length >= JIT_MIN_BLOCK;
                         if (!ok || instructions.length === 0 || (JIT_ONLY_LOOPS && !isLoop && !allowedNonLoop)) {
-                            jitUnsupported.add(pcKey);
+                            jitUnsupported[pcKey & JIT_UNSUP_MASK] = pcKey;
                             return 0;
                         }
                         let compiled;
                         try {
                             compiled = compileJitBlock(instructions, sizes);
                         } catch (err) {
-                            jitUnsupported.add(pcKey);
+                            jitUnsupported[pcKey & JIT_UNSUP_MASK] = pcKey;
                             return 0;
                         }
                         // A non-loop block cannot amortize the per-block host
