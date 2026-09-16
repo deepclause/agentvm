@@ -59,6 +59,9 @@ git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-jit-tlb.patch"
 # Generated without context to avoid preserving upstream trailing whitespace.
 git -C "$WORK/tinyemu" apply --unidiff-zero "$HERE/patches/tinyemu-fast-branch.patch"
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-writable-second-drive.patch"
+# Accept (no-op) chmod on the 9p mount so tools (npm, git, ...) don't fail with
+# EPROTO on /workspace.
+git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-9p-setattr-chmod.patch"
 if [ "$PV_ACCEL" = "1" ]; then
     git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-pv-accel.patch"
 fi
