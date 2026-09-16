@@ -113,3 +113,36 @@ This boots the image and, inside the VM:
 5. runs `pi --help`.
 
 Set `AGENTVM_SKIP_PI=1` to skip the large pi install while iterating.
+
+## Startup shaping (measured experiments)
+
+Two Node-startup experiments were run against the pi-relevant workloads:
+
+### 1. V8 compile cache for the pi bundle (shipped)
+
+The pi agent is a 7.6 MB **ESM** bundle. Bytenode does not support ESM, but
+Node 22's `NODE_COMPILE_CACHE` does. `Dockerfile.pi` pre-populates the cache at
+build time and points the image env at it. Measured on the pi image:
+`pi --version` **31931 ms → 23861 ms (1.34×)**; the cache is 1.8 MB.
+
+### 2. Slim Node without ICU (optional, not shipped)
+
+Alpine's `nodejs` links system ICU; ICU initialization is ~15% of `node`
+startup under emulation (removing the ICU data gave 1840 → 1573 ms). A
+`--with-intl=none` Node needs a from-source musl build:
+
+```bash
+image/build-slim-node.sh          # -> image/slimnode/node (well over an hour)
+```
+
+Then `COPY --link slimnode/node /usr/local/bin/node` into the guest image and
+keep Alpine's `nodejs` only for `npm`. This is deliberately not part of the
+default build: the emulated compile is very long, and the ~15% is on generic
+startup only (negligible next to the pi bundle's parse time, which the compile
+cache addresses).
+
+Negative results from the same sweep, for the record: `vmtouch`/page-cache
+pre-warm, read-ahead/vfs sysctls (read-only), and a 9p `msize` bump (stock
+TinyEMU's 9p layer hangs on 256 KiB messages) did **not** help. Transparent
+huge pages, however, are a large win for guest memory and are enabled in
+`build.sh`.

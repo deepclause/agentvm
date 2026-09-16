@@ -1,0 +1,30 @@
+# Build a Node.js without ICU (and without npm) for Alpine/musl riscv64.
+#
+# ICU initialization is ~15% of `node` startup under TinyEMU emulation (Node
+# with `--with-intl=none` vs Alpine's system-ICU build). This is an *optional*
+# image ingredient, not part of the default build: the emulated riscv64 compile
+# takes well over an hour end to end (V8 dominates), so it is best run once and
+# cached.
+#
+# Usage:
+#   ./build-slim-node.sh          # -> image/slimnode/node
+#   # then in the guest Dockerfile:
+#   #   COPY --link slimnode/node /usr/local/bin/node
+#
+# System OpenSSL/zlib/brotli/nghttp2/c-ares are used instead of the bundled
+# copies: the bundled OpenSSL build mis-detects the target and passes `-m64`.
+FROM alpine:3.21 AS buildnode
+ARG NODE_VERSION=22.23.2
+RUN apk add --no-cache build-base python3 linux-headers curl xz \
+        openssl-dev zlib-dev brotli-dev nghttp2-dev c-ares-dev
+RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}.tar.xz" \
+        -o /tmp/node.tar.xz && tar -C /tmp -xf /tmp/node.tar.xz
+WORKDIR /tmp/node-v${NODE_VERSION}
+RUN ./configure --with-intl=none --without-npm \
+        --shared-openssl --shared-zlib --shared-brotli --shared-nghttp2 --shared-cares \
+    && make -j$(nproc) \
+    && strip out/Release/node \
+    && mkdir -p /out && cp out/Release/node /out/node
+
+FROM scratch AS out
+COPY --from=buildnode /out/node /node
