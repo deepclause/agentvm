@@ -1057,6 +1057,32 @@ async function start() {
         }
     };
 
+    // path_symlink — uvwasi validates the symlink *target*, rejecting any
+    // relative target that escapes with ".." (EINVAL) and absolute targets
+    // (EPERM). That breaks ordinary package managers: npm's
+    // node_modules/.bin/* links target "../pkg/bin/cli.js". Route it to
+    // fs.symlinkSync with the target verbatim; only the link location is
+    // resolved (and sandboxed) within the mount.
+    const origPathSymlink = wasiImport.path_symlink;
+    wasiImport.path_symlink = (old_path_ptr, old_path_len, fd, new_path_ptr, new_path_len) => {
+        const target = readWasiPath(old_path_ptr, old_path_len);
+        if (target === null) return origPathSymlink(old_path_ptr, old_path_len, fd, new_path_ptr, new_path_len);
+        const newPathStr = readWasiPath(new_path_ptr, new_path_len);
+        if (newPathStr === null) return origPathSymlink(old_path_ptr, old_path_len, fd, new_path_ptr, new_path_len);
+        const resolved = resolveMountHostPath(fd, newPathStr);
+        if (resolved.fallback) return origPathSymlink(old_path_ptr, old_path_len, fd, new_path_ptr, new_path_len);
+        if (resolved.errno) return resolved.errno;
+        try {
+            fs.symlinkSync(target, resolved.fullPath);
+            return 0;
+        } catch (err) {
+            if (process.env.DEBUG_WASI_PATH === '1') {
+                parentPort.postMessage({ type: 'debug', msg: `WASI path_symlink CUSTOM FAIL: target="${target}", new="${newPathStr}" => ${err.code} ${err.message}` });
+            }
+            return nodeErrnoToWasi(err.code);
+        }
+    };
+
     // Debug: trace path operations for mount debugging
     const DEBUG_WASI_PATH = process.env.DEBUG_WASI_PATH === '1';
     if (DEBUG_WASI_PATH) {

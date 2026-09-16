@@ -5,5 +5,5 @@ image/*.js
 image/preinstalled/
 logs/
 *.log
-test-mount/
+test-mount*/
 *.tar.gz
