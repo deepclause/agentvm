@@ -1,0 +1,107 @@
+diff --git a/riscv_cpu.c b/riscv_cpu.c
+index c05623a..5ddb142 100644
+--- a/riscv_cpu.c
++++ b/riscv_cpu.c
+@@ -52,8 +52,100 @@
+ 
+ #ifdef CONFIG_JIT
+ extern int initialized;
+-__attribute__((import_module("env"), import_name("jit_try_block")))
+-int32_t jit_try_block(uint32_t state_ptr);
++
++/*
++ * In-WASM dispatch.
++ *
++ * The host compiles guest traces into WASM modules and installs each compiled
++ * function into this module's indirect function table (exported as
++ * __indirect_function_table). jit_map is a host-populated direct-mapped table
++ * from guest PC to {table index, cycle cost}, so the interpreter can call a
++ * translated block with call_indirect without returning to JavaScript.
++ *
++ * A zero index means the slot is empty; collisions only cost a recompile.
++ */
++#define JIT_MAP_BITS 19
++#define JIT_MAP_SIZE (1u << JIT_MAP_BITS)
++#define JIT_MAP_MASK (JIT_MAP_SIZE - 1)
++#define JIT_UNSUPPORTED 0xFFFFFFFFu
++
++typedef struct {
++    uint64_t pc;
++    uint32_t index;
++    uint32_t cycles;
++} JITMapEntry;
++
++static JITMapEntry jit_map[JIT_MAP_SIZE];
++
++/* Hot counter per map slot; the JS compile hook is only invoked once a PC has
++   been hit JIT_HOT_THRESHOLD times, so the steady-state dispatch stays in WASM. */
++#define JIT_HOT_THRESHOLD 50
++static uint16_t jit_hits[JIT_MAP_SIZE];
++
++__attribute__((export_name("jit_map_ptr")))
++uint32_t jit_map_ptr(void)
++{
++    return (uint32_t)(uintptr_t)jit_map;
++}
++
++__attribute__((import_module("env"), import_name("jit_compile")))
++int32_t jit_compile(uint32_t state_ptr);
++
++static int32_t jit_enabled = 0;
++
++__attribute__((export_name("jit_set_enabled")))
++void jit_set_enabled(int32_t v)
++{
++    jit_enabled = v;
++}
++
++typedef int64_t (*jit_block_fn_t)(uint32_t regs, uint32_t tlb_read,
++                                  uint64_t pc, uint32_t state, uint32_t tlb_write);
++
++static int32_t jit_try_block(uint32_t state_ptr)
++{
++    RISCVCPUState *s = (RISCVCPUState *)(uintptr_t)state_ptr;
++    target_ulong pc;
++    uint32_t slot;
++    JITMapEntry *e;
++    jit_block_fn_t fn;
++    uint64_t next;
++
++    if (!jit_enabled)
++        return 0;
++
++    pc = s->pc;
++    slot = (uint32_t)((pc >> 1) ^ (pc >> 13)) & JIT_MAP_MASK;
++    e = &jit_map[slot];
++
++    if (e->index == JIT_UNSUPPORTED)
++        return 0;
++    if (e->index == 0 || e->pc != (uint64_t)pc) {
++        if (++jit_hits[slot] < JIT_HOT_THRESHOLD)
++            return 0;
++        jit_hits[slot] = 0;
++        if (!jit_compile(state_ptr))
++            return 0;
++        e = &jit_map[slot];
++        if (e->index == 0 || e->index == JIT_UNSUPPORTED || e->pc != (uint64_t)pc)
++            return 0;
++    }
++
++    fn = (jit_block_fn_t)(uintptr_t)e->index;
++    next = (uint64_t)fn((uint32_t)(uintptr_t)s->reg,
++                        (uint32_t)(uintptr_t)s->tlb_read,
++                        (uint64_t)pc,
++                        0,
++                        (uint32_t)(uintptr_t)s->tlb_write);
++    s->n_cycles -= (int32_t)e->cycles;
++    if (next & (UINT64_C(1) << 63)) {
++        /* Precise bail: resume the interpreter at the faulting instruction. */
++        s->pc = next & ~(UINT64_C(1) << 63);
++        return 0;
++    }
++    s->pc = next;
++    return 1;
++}
+ #endif
+ 
+ #ifdef CONFIG_JIT

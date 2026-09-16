@@ -2,7 +2,8 @@ const { parentPort, workerData } = require('node:worker_threads');
 const { WASI } = require('node:wasi');
 const fs = require('node:fs');
 const { NetworkStack } = require('./network');
-const { RiscVBlockJit } = require('./jit');
+const { RiscVBlockJit, BAIL_BIT, BAIL_MASK, isSupportedInstruction, branchOffset, jalOffset, LOOP_BUDGET } = require('./jit');
+const refRun = require('./riscv-ref').run;
 const { expandCompressed } = require('./riscv-c');
 const { RingBufferReader } = require('./ringbuffer');
 
@@ -72,16 +73,24 @@ function writeIOVs(view, iovs_ptr, iovs_len, data) {
 let instance = null;
 const JIT_ENABLED = process.env.AGENTVM_JIT === '1';
 const DEBUG_JIT = process.env.DEBUG_JIT === '1';
-const JIT_HIT_THRESHOLD = 50;
-const jitHitCounts = new Map();
-const jitBlockCache = new Map();
-const jitUnsupported = new Set();
-const jitPageCompiled = new Set();
-const JIT_TERMINAL = new Set([0x63, 0x6f, 0x67]);
-const JIT_SUPPORTED = new Set([0x13, 0x33, 0x1b, 0x3b, 0x03, 0x23, 0x37, 0x17, 0x6f, 0x67, 0x63]);
-const aotWasmPath = process.env.AGENTVM_AOT_WASM || null;
-const aotIndexPath = process.env.AGENTVM_AOT_INDEX || null;
-const aotSigMap = new Map();
+// The hot threshold now lives in the emulator (JIT_HOT_THRESHOLD in
+// riscv_cpu.c): the C dispatcher only calls jit_compile after that many hits.
+// Only translate guest PCs in [MIN, MAX). Defaults cover all of SV39. Restricting
+// to low addresses is a debugging aid that keeps the JIT out of early-boot and
+// kernel code.
+const JIT_PC_MIN = Number(process.env.AGENTVM_JIT_PC_MIN || '0');
+const JIT_PC_MAX = Number(process.env.AGENTVM_JIT_PC_MAX || '0x4000000000');
+const JIT_ALLOW_COMPRESSED = process.env.AGENTVM_JIT_NO_C !== '1';
+const JIT_ONLY_LOOPS = process.env.AGENTVM_JIT_ALL_BLOCKS !== '1';
+// Even without a back edge, a sufficiently long straight-line trace can amortize
+// the host dispatch. 0 keeps the loops-only default.
+const JIT_MIN_BLOCK = Number(process.env.AGENTVM_JIT_MIN_BLOCK || 0);
+const JIT_INLINE = process.env.AGENTVM_JIT_NO_INLINE !== '1';
+// Only inline small leaf callees: larger ones tend to make the trace slower
+// than the interpreter on memory-heavy code.
+const JIT_INLINE_MAX = Number(process.env.AGENTVM_JIT_INLINE_MAX || 6);
+// Differential verification against src/riscv-ref.js (debug only, slow).
+let jitFixed = null;
 
 async function start() {
     const wasmBuffer = fs.readFileSync(wasmPath);
@@ -1393,148 +1402,178 @@ async function start() {
     const readGuestInsn = (exports, statePtr, addr) => {
         const first = Number(exports.jit_read_u16(statePtr, addr));
         if ((first & 3) !== 3) {
+            if (!JIT_ALLOW_COMPRESSED) return null;
             const expanded = expandCompressed(first);
             return expanded === null ? null : { word: expanded, size: 2n };
         }
         return { word: Number(exports.jit_read_u32(statePtr, addr)), size: 4n };
     };
 
-    const jitLoad = (statePtr, addr, size) => {
-        const e = instance.exports;
-        switch (size) {
-            case 1: return e.jit_read_u8(statePtr, addr);
-            case 2: return e.jit_read_u16(statePtr, addr);
-            case 4: return e.jit_read_u32(statePtr, addr);
-            case 8: return e.jit_read_u64(statePtr, addr);
-            default: return 0n;
-        }
-    };
-
-    const jitStore = (statePtr, addr, size, val) => {
-        const e = instance.exports;
-        switch (size) {
-            case 1: e.jit_write_u8(statePtr, addr, val); break;
-            case 2: e.jit_write_u16(statePtr, addr, val); break;
-            case 4: e.jit_write_u32(statePtr, addr, val); break;
-            case 8: e.jit_write_u64(statePtr, addr, val); break;
-        }
-        return 0;
-    };
-
-    const compileJitBlock = (instructions, sizes) => {
-        const module = new RiscVBlockJit(instructions, sizes, { externalMemory: true }).compile();
-        const jitInstance = new WebAssembly.Instance(module, {
-            env: { memory: instance.exports.memory, load: jitLoad, store: jitStore },
+    const compileJitBlock = (instructions, sizes, offsets, inline) => {
+        const jit = new RiscVBlockJit(instructions, sizes, {
+            directTlb: true, registerLocals: true, offsets, inline,
         });
-        return jitInstance.exports.run;
+        const module = jit.compile();
+        const jitInstance = new WebAssembly.Instance(module, {
+            env: { memory: instance.exports.memory },
+        });
+        // Self-loop blocks execute up to LOOP_BUDGET iterations per call; the
+        // emulator subtracts this many cycles so it still checks interrupts.
+        const cycles = instructions.length * (jit.selfLoop ? LOOP_BUDGET : 1);
+        return { run: jitInstance.exports.run, cycles, selfLoop: !!jit.selfLoop };
     };
 
-    const precompileJitPage = (exports, statePtr, pageStart) => {
-        const pageEnd = pageStart + 0x1000n;
-        let cursor = pageStart;
-        while (cursor < pageEnd) {
-            const first = readGuestInsn(exports, statePtr, cursor);
-            if (!first) { cursor += 2n; continue; }
-            const opcode = first.word & 0x7f;
-            if (!JIT_SUPPORTED.has(opcode)) { cursor += first.size; continue; }
+    // In-WASM dispatch. riscv_cpu.c keeps a direct-mapped {pc, tableIndex,
+    // cycles} table and calls the compiled function with call_indirect. The
+    // host only installs traces (and only after the C hot counter fires), so
+    // the steady-state execution never returns to JavaScript. Values must
+    // match riscv_cpu.c.
+    const JIT_MAP_BITS = 19;
+    const JIT_MAP_SIZE = 1 << JIT_MAP_BITS;
+    const JIT_MAP_MASK = JIT_MAP_SIZE - 1;
+    const JIT_MAP_BYTES = JIT_MAP_SIZE * 16;
+    const JIT_UNSUPPORTED = 0xFFFFFFFF;
+    const JIT_MAX_SLOTS = 1 << 16;
+    let jitTable = null;
+    let jitTableBase = 0;
+    let jitNextSlot = 0;
+    let jitMapPtr = 0;
+
+    const jitCompile = (statePtr) => {
+        if (!JIT_ENABLED || !jitTable) return 0;
+        const exports = instance.exports;
+        try {
+            if (jitFixed === null) {
+                jitFixed = {
+                    regsPtr: Number(exports.jit_regs_ptr(statePtr)),
+                    pcLo: null,
+                    pcHi: null,
+                };
+                jitTableBase = jitTable.length;
+                jitTable.grow(JIT_MAX_SLOTS);
+                jitMapPtr = Number(exports.jit_map_ptr());
+            }
+            const buf = exports.memory.buffer;
+            if (jitFixed.pcLo === null || jitFixed.pcLo.length === 0) {
+                const p = jitFixed.regsPtr - 8; // s->pc is before s->reg[32]
+                jitFixed.pcLo = new Int32Array(buf, p, 1);
+                jitFixed.pcHi = new Int32Array(buf, p + 4, 1);
+            }
+            const pcNum = jitFixed.pcHi[0] * 0x100000000 + (jitFixed.pcLo[0] >>> 0);
+            const pc = BigInt(pcNum);
+            const slot = Number(((pc >> 1n) ^ (pc >> 13n)) & BigInt(JIT_MAP_MASK));
+            const entryOff = slot * 16;
+            const mdv = new DataView(buf, jitMapPtr, JIT_MAP_BYTES);
+            const mark = (index, cycles) => {
+                mdv.setBigUint64(entryOff, pc, true);
+                mdv.setUint32(entryOff + 8, index, true);
+                mdv.setUint32(entryOff + 12, cycles, true);
+            };
+
+            if (pcNum < JIT_PC_MIN || pcNum >= JIT_PC_MAX) { mark(JIT_UNSUPPORTED, 0); return 0; }
 
             const instructions = [];
             const sizes = [];
-            const blockStart = cursor;
-            let blockCursor = cursor;
-            for (;;) {
-                const insn = readGuestInsn(exports, statePtr, blockCursor);
-                if (!insn) break;
-                const op = insn.word & 0x7f;
-                if (!JIT_SUPPORTED.has(op)) break;
-                instructions.push(insn.word >>> 0);
-                sizes.push(Number(insn.size));
-                blockCursor += insn.size;
-                if (JIT_TERMINAL.has(op)) break;
-            }
-            if (instructions.length > 0) {
-                const key = `${blockStart.toString(16)}:${instructions.map((n) => n.toString(16)).join(',')}`;
-                if (!jitBlockCache.has(key)) {
-                    try {
-                        jitBlockCache.set(key, compileJitBlock(instructions, sizes));
-                    } catch (err) {
-                        // Leave this block to the interpreter.
+            const offsets = [];
+            const inline = new Set();
+            let cursor = pc;
+            let ok = true;
+            let isLoop = false;
+            // A straight-line leaf callee (no branch/call, does not write ra,
+            // ends in `ret`) can be inlined so a loop body containing a small
+            // helper still forms a self-loop trace.
+            const readLeafCallee = (target) => {
+                const callee = [];
+                let c = target;
+                for (let guard = 0; guard < 64; guard++) {
+                    const ci = readGuestInsn(exports, statePtr, c);
+                    if (!ci || !isSupportedInstruction(ci.word)) return null;
+                    const w = ci.word >>> 0;
+                    const cop = w & 0x7f;
+                    const crd = (w >>> 7) & 0x1f;
+                    if (cop === 0x67) {
+                        const crs1 = (w >>> 15) & 0x1f;
+                        const cimm = (w >>> 20) & 0xfff;
+                        if (!(crd === 0 && crs1 === 1 && cimm === 0)) return null;
+                        return callee.length > JIT_INLINE_MAX ? null : callee;
                     }
+                    if (cop === 0x6f || cop === 0x63) return null;
+                    if (crd === 1) return null;
+                    callee.push({ word: w, size: Number(ci.size), addr: c });
+                    c += ci.size;
                 }
+                return null;
+            };
+            for (;;) {
+                if (instructions.length >= 512) { ok = false; break; }
+                const insn = readGuestInsn(exports, statePtr, cursor);
+                if (!insn || !isSupportedInstruction(insn.word)) { ok = false; break; }
+                const word = insn.word >>> 0;
+                const op = word & 0x7f;
+                instructions.push(word);
+                sizes.push(Number(insn.size));
+                offsets.push(Number(cursor - pc));
+                if (op === 0x63) {
+                    const target = cursor + BigInt(branchOffset(word));
+                    if (target === pc) { isLoop = true; break; }
+                    if (target > cursor) { cursor += insn.size; continue; }
+                    ok = false; break;
+                }
+                if (op === 0x6f) {
+                    const rd = (word >>> 7) & 0x1f;
+                    const target = cursor + BigInt(jalOffset(word));
+                    if (rd === 0) {
+                        if (target === pc) isLoop = true;
+                        break;
+                    }
+                    const callee = JIT_INLINE ? readLeafCallee(target) : null;
+                    if (callee) {
+                        inline.add(instructions.length - 1);
+                        for (const ci of callee) {
+                            instructions.push(ci.word);
+                            sizes.push(ci.size);
+                            offsets.push(Number(ci.addr - pc));
+                        }
+                        cursor += insn.size; // continue after the call returns
+                        continue;
+                    }
+                    break;
+                }
+                if (op === 0x67) break;
+                cursor += insn.size;
             }
-            cursor = blockCursor;
+            const allowedNonLoop = JIT_MIN_BLOCK > 0 && instructions.length >= JIT_MIN_BLOCK;
+            if (!ok || instructions.length === 0 || (JIT_ONLY_LOOPS && !isLoop && !allowedNonLoop)) {
+                mark(JIT_UNSUPPORTED, 0);
+                return 0;
+            }
+            let compiled;
+            try {
+                compiled = compileJitBlock(instructions, sizes, offsets, inline);
+            } catch (err) {
+                mark(JIT_UNSUPPORTED, 0);
+                return 0;
+            }
+            if (jitNextSlot >= JIT_MAX_SLOTS) { mark(JIT_UNSUPPORTED, 0); return 0; }
+            const tableIndex = jitTableBase + jitNextSlot++;
+            jitTable.set(tableIndex, compiled.run);
+            mark(tableIndex, compiled.cycles);
+            if (DEBUG_JIT) {
+                parentPort.postMessage({ type: 'debug', msg: `JIT install pc=0x${pc.toString(16)} -> table ${tableIndex} (${instructions.length} insns)` });
+            }
+            return 1;
+        } catch (err) {
+            if (DEBUG_JIT) parentPort.postMessage({ type: 'debug', msg: `JIT compile error: ${err.message}` });
+            return 0;
         }
     };
 
     const { instance: inst } = await WebAssembly.instantiate(wasmBuffer, {
         env: {
-            jit_try_block: (statePtr) => {
-                if (!JIT_ENABLED || !instance) return 0;
-                const exports = instance.exports;
-                if (!exports.jit_get_pc || !exports.jit_read_u16 || !exports.jit_read_u32 || !exports.jit_regs_ptr) return 0;
-
-                try {
-                    const pc = exports.jit_get_pc(statePtr);
-                    const pcKey = pc.toString(16);
-                    if (jitUnsupported.has(pcKey)) return 0;
-
-                    const hits = (jitHitCounts.get(pcKey) || 0) + 1;
-                    jitHitCounts.set(pcKey, hits);
-                    if (hits < JIT_HIT_THRESHOLD) return 0;
-
-                    const pageStart = pc & ~0xfffn;
-                    if (!jitPageCompiled.has(pageStart.toString(16))) {
-                        precompileJitPage(exports, statePtr, pageStart);
-                        jitPageCompiled.add(pageStart.toString(16));
-                    }
-
-                    const instructions = [];
-                    const sizes = [];
-                    let cursor = pc;
-                    for (;;) {
-                        const insn = readGuestInsn(exports, statePtr, cursor);
-                        if (!insn) return 0;
-                        const opcode = insn.word & 0x7f;
-                        if (!JIT_SUPPORTED.has(opcode)) {
-                            jitUnsupported.add(pcKey);
-                            return 0;
-                        }
-                        instructions.push(insn.word >>> 0);
-                        sizes.push(Number(insn.size));
-                        cursor += insn.size;
-                        if (JIT_TERMINAL.has(opcode)) break;
-                    }
-
-                    const sig = instructions.map((n) => n.toString(16)).join(',');
-                    const aotRun = aotSigMap.get(sig);
-                    if (aotRun) {
-                        const regsPtr = Number(exports.jit_regs_ptr(statePtr));
-                        const nextPc = aotRun(regsPtr, 0, pc, statePtr);
-                        exports.jit_sub_cycles(statePtr, instructions.length);
-                        exports.jit_set_pc(statePtr, nextPc);
-                        return 1;
-                    }
-
-                    const key = `${pcKey}:${sig}`;
-                    let run = jitBlockCache.get(key);
-                    if (!run) {
-                        run = compileJitBlock(instructions, sizes);
-                        jitBlockCache.set(key, run);
-                    }
-
-                    const regsPtr = Number(exports.jit_regs_ptr(statePtr));
-                    const nextPc = run(regsPtr, 0, pc, statePtr);
-                    exports.jit_sub_cycles(statePtr, instructions.length);
-                    exports.jit_set_pc(statePtr, nextPc);
-                    if (DEBUG_JIT) {
-                        parentPort.postMessage({ type: 'debug', msg: `JIT block pc=0x${pcKey} -> 0x${nextPc.toString(16)} (${instructions.length} insns, hits=${hits})` });
-                    }
-                    return 1;
-                } catch (err) {
-                    if (DEBUG_JIT) parentPort.postMessage({ type: 'debug', msg: `JIT fallback: ${err.message}` });
-                    return 0;
-                }
-            },
+            jit_compile: (statePtr) => jitCompile(statePtr),
+            // Compatibility with images built before in-WASM dispatch, which
+            // import the old JS hook. Unused by the current image.
+            jit_try_block: () => 0,
         },
         wasi_snapshot_preview1: {
             ...wasiImport,
@@ -1623,22 +1662,9 @@ async function start() {
     });
     
     instance = inst;
-
-    if (JIT_ENABLED && aotWasmPath && aotIndexPath) {
-        try {
-            const aotBytes = fs.readFileSync(aotWasmPath);
-            const aotModule = new WebAssembly.Module(aotBytes);
-            const aotInstance = new WebAssembly.Instance(aotModule, {
-                env: { memory: instance.exports.memory, load: jitLoad, store: jitStore },
-            });
-            const index = JSON.parse(fs.readFileSync(aotIndexPath, 'utf8'));
-            for (const entry of index) {
-                aotSigMap.set(entry.sig, aotInstance.exports[entry.export]);
-            }
-            if (DEBUG_JIT) parentPort.postMessage({ type: 'debug', msg: `AOT loaded: ${aotSigMap.size} blocks` });
-        } catch (err) {
-            parentPort.postMessage({ type: 'debug', msg: `AOT load failed: ${err.message}` });
-        }
+    if (JIT_ENABLED && instance.exports.__indirect_function_table) {
+        jitTable = instance.exports.__indirect_function_table;
+        if (instance.exports.jit_set_enabled) instance.exports.jit_set_enabled(1);
     }
 
     parentPort.postMessage({ type: 'ready' });

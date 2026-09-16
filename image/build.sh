@@ -17,6 +17,9 @@ OUT="${1:-$HERE/agentvm-alpine-python-node.wasm}"
 DOCKERFILE="${DOCKERFILE:-Dockerfile.acceptance}"
 IMAGE_NAME="${IMAGE_NAME:-agentvm-alpine-python-node:riscv64}"
 C2W="${C2W:-c2w}"
+# Paravirtual bulk-memory acceleration (TinyEMU hypercall + guest kernel).
+# Set PV_ACCEL=0 to build the unaccelerated baseline for A/B measurement.
+PV_ACCEL="${PV_ACCEL:-1}"
 # Guest RAM. The writable overlay (and /run tmpfs) default to ~half of this,
 # so the pi coding agent needs substantially more than the 128 MiB default.
 VM_MEMORY_SIZE_MB="${VM_MEMORY_SIZE_MB:-1024}"
@@ -27,6 +30,13 @@ TINYEMU_REPO="${TINYEMU_REPO:-https://github.com/ktock/tinyemu-c2w}"
 TINYEMU_REV="${TINYEMU_REV:-e4e9bd198f9c0505ab4c77a6a9d038059cd1474a}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+
+# Keep the kernel patch in its own build context so that changing a TinyEMU
+# patch does not invalidate the (expensive) kernel build stage.
+mkdir -p "$WORK/kernel-patches"
+if [ "$PV_ACCEL" = "1" ]; then
+    cp "$HERE/patches/linux-riscv-pv-accel.patch" "$WORK/kernel-patches/"
+fi
 
 echo "==> Building riscv64 source image: $IMAGE_NAME"
 docker buildx build \
@@ -44,17 +54,24 @@ git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-low-risk-performance.patch"
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-rv64-only.patch"
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-jit-exports.patch"
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-jit-hook.patch"
+git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-jit-table.patch"
+git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-jit-tlb.patch"
 # Generated without context to avoid preserving upstream trailing whitespace.
 git -C "$WORK/tinyemu" apply --unidiff-zero "$HERE/patches/tinyemu-fast-branch.patch"
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-writable-second-drive.patch"
+if [ "$PV_ACCEL" = "1" ]; then
+    git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-pv-accel.patch"
+fi
 rm -rf "$WORK/tinyemu/.git"
 
 echo "==> Generating patched c2w Dockerfile"
 "$C2W" --show-dockerfile > "$WORK/Dockerfile.c2w"
 python3 - "$WORK/Dockerfile.c2w" <<'PY'
 import sys
+import os
 p = sys.argv[1]
 s = open(p).read()
+pv_accel = os.environ.get("PV_ACCEL", "1") == "1"
 old = """FROM ubuntu:22.04 AS tinyemu-repo-base
 ARG TINYEMU_REPO
 ARG TINYEMU_REPO_VERSION
@@ -89,10 +106,37 @@ s = s.replace(old_assets_clone, new_assets_clone)
 # The stock c2w kernel is optimized for size (-Os). npm and Node spend a lot
 # of time in guest syscalls and filesystem/network paths, so use the kernel's
 # normal performance profile (-O2). Apply this to both riscv64 kernel stages.
+# When PV_ACCEL=1 we also patch the riscv64 kernel to route page clear/copy
+# through the TinyEMU hypercall (see patches/linux-riscv-pv-accel.patch).
 config_copy = "COPY --link --from=assets /config/tinyemu/linux_rv64_config ./.config\n"
-config_tune = config_copy + "RUN scripts/config --disable CC_OPTIMIZE_FOR_SIZE --enable CC_OPTIMIZE_FOR_PERFORMANCE\n"
+config_tune = config_copy + (
+    "RUN scripts/config --disable CC_OPTIMIZE_FOR_SIZE "
+    "--enable CC_OPTIMIZE_FOR_PERFORMANCE --enable TRANSPARENT_HUGEPAGE --enable TRANSPARENT_HUGEPAGE_ALWAYS"
+    + (" --enable RISCV_PV_ACCEL" if pv_accel else "")
+    + "\n"
+)
 assert s.count(config_copy) == 2, "unexpected riscv64 kernel config stages"
 s = s.replace(config_copy, config_tune)
+
+if pv_accel:
+    old_riscv_clone = (
+        "FROM gcc-riscv64-linux-gnu-base AS linux-riscv64-dev-common\n"
+        "RUN apt-get update && apt-get install -y gperf flex bison bc\n"
+        "RUN mkdir /work-buildlinux\n"
+        "WORKDIR /work-buildlinux\n"
+        "RUN git clone -b v6.1 --depth 1 https://github.com/torvalds/linux\n"
+    )
+    new_riscv_clone = (
+        "FROM gcc-riscv64-linux-gnu-base AS linux-riscv64-dev-common\n"
+        "RUN apt-get update && apt-get install -y gperf flex bison bc\n"
+        "RUN mkdir /work-buildlinux\n"
+        "WORKDIR /work-buildlinux\n"
+        "COPY --from=kernel-patches / /kernel-patches/\n"
+        "RUN git clone -b v6.1 --depth 1 https://github.com/torvalds/linux && \\\n"
+        "    cd /work-buildlinux/linux && git apply /kernel-patches/linux-riscv-pv-accel.patch\n"
+    )
+    assert s.count(old_riscv_clone) == 1, "unexpected riscv64 kernel clone stage"
+    s = s.replace(old_riscv_clone, new_riscv_clone)
 
 # The target is always riscv64. The stock recipe links a separate RV32 CPU and
 # also compiles the 32-bit decoder into the RV64 object. The source patch
@@ -102,7 +146,13 @@ new_objects = "riscv_machine.o softfp.o riscv_cpu64.o fs_disk.o"
 assert s.count(old_objects) == 1, "unexpected TinyEMU object list"
 s = s.replace(old_objects, new_objects)
 old_cc = "-D_WASI_EMULATED_SIGNAL -DWASI -I/tools/wizer/include/"
-new_cc = "-D_WASI_EMULATED_SIGNAL -DWASI -DCONFIG_RISCV_ONLY_64 -DCONFIG_JIT -I/tools/wizer/include/"
+new_cc = "-D_WASI_EMULATED_SIGNAL -DWASI -DCONFIG_RISCV_ONLY_64 -DCONFIG_JIT"
+if pv_accel:
+    new_cc += " -DCONFIG_PV_ACCEL"
+new_cc += " -I/tools/wizer/include/"
+# In-WASM JIT dispatch: export the indirect function table so the host can
+# install compiled traces, and allow growing it.
+new_cc += " -Wl,--export-table -Wl,--growable-table"
 assert s.count(old_cc) == 1, "unexpected TinyEMU compiler command"
 s = s.replace(old_cc, new_cc)
 
@@ -140,6 +190,7 @@ echo "==> Converting to WASM: $OUT (memory ${VM_MEMORY_SIZE_MB} MiB)"
     --build-arg "INIT_DEBUG=false" \
     --dockerfile "$WORK/Dockerfile.c2w" \
     --extra-flag "--build-context=tinyemu-patched=$WORK/tinyemu" \
+    --extra-flag "--build-context=kernel-patches=$WORK/kernel-patches" \
     "$IMAGE_NAME" \
     "$OUT"
 

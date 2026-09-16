@@ -12,7 +12,18 @@ RUN apk add --no-cache \
         bash curl git \
         coreutils \
         tmux \
-        e2fsprogs
+        e2fsprogs \
+        jansson fzf
+
+# Build hax (https://usehax.dev) from source; there are no riscv64 binaries.
+RUN apk add --no-cache \
+        build-base meson samurai curl-dev jansson-dev python3 && \
+    git clone https://github.com/OleksandrChekhovskyi/hax.git /tmp/hax && \
+    cd /tmp/hax && \
+    make && \
+    make install && \
+    rm -rf /tmp/hax && \
+    apk del build-base meson samurai curl-dev jansson-dev python3
 
 COPY --link preinstalled/usrlocal /usr/local
 
@@ -28,3 +39,12 @@ RUN rm -f /usr/local/bin/pi && \
     chmod +x /usr/local/bin/node
 
 CMD ["/bin/sh"]
+
+# Under emulation, parsing/compiling the 7.6 MB ESM pi bundle is ~28% of `pi`
+# startup. V8's compile cache persists the bytecode and supports ESM (bytenode
+# does not), so pre-populate it at build time. The cache is keyed by source
+# content and V8 version; a stale entry is simply re-populated at runtime.
+ENV NODE_COMPILE_CACHE=/usr/local/lib/pi-cache
+RUN /usr/bin/node --single-threaded-gc \
+        /usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js --version \
+        >/dev/null 2>&1 || true
