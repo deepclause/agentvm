@@ -28,6 +28,9 @@ const EXT_TLA_TS = `import type { Meta } from './tla-meta.ts';\nconst impl = pro
 const EXT_TLA_META = `export interface Meta { v: number }\n`;
 const EXT_TLA_IMPL = `export default { name: 'impl' }\n`;
 
+// Resolving paths via import.meta.url at load time (pi-subagents does this).
+const EXT_META_TS = `export const metaUrl = import.meta.url;\n`;
+
 const BENCH = `const { createRequire } = require('node:module');
 const req = createRequire('${PI}/package.json');
 async function main() {
@@ -44,6 +47,9 @@ async function main() {
   const jiti2 = staticJiti(__filename, { moduleCache: false });
   const m2 = await jiti2.import('/tmp/ext/tla.ts', { default: true });
   console.log('TLA ok=' + (typeof m2 === 'function') + ' ms=' + (Date.now() - t1));
+
+  const m3 = await jiti.import('/tmp/ext/meta.ts');
+  console.log('META url=' + m3.metaUrl);
 }
 main().catch((e) => console.log('RESULT err=' + e.message));
 `;
@@ -63,6 +69,7 @@ async function test() {
         await withTimeout(vm.exec(`cat > /tmp/ext/tla-meta.ts <<'EOF'\n${EXT_TLA_META}EOF`), 20000);
         await withTimeout(vm.exec(`cat > /tmp/ext/tla-impl.ts <<'EOF'\n${EXT_TLA_IMPL}EOF`), 20000);
         await withTimeout(vm.exec(`cat > /tmp/ext/tla.ts <<'EOF'\n${EXT_TLA_TS}EOF`), 20000);
+        await withTimeout(vm.exec(`cat > /tmp/ext/meta.ts <<'EOF'\n${EXT_META_TS}EOF`), 20000);
         await withTimeout(vm.exec(`cat > /tmp/ext/bench.cjs <<'EOF'\n${BENCH}EOF`), 20000);
 
         const res = await withTimeout(vm.exec('node /tmp/ext/bench.cjs 2>&1'), 180000);
@@ -72,6 +79,11 @@ async function test() {
         check('jiti-real (babel) is kept', /jiti\-real/.test((await withTimeout(vm.exec('ls /usr/local/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/ 2>&1'), 20000)).stdout));
         check('typescript extension loads through the shim', /RESULT ok=true/.test(out), out.split('\n')[0]);
         check('top-level await extension loads (Babel fallback)', /TLA ok=true/.test(out), (out.split('\n').find((l) => l.startsWith('TLA ')) || ''));
+        check(
+            'import.meta.url resolves to the file URL',
+            /META url=file:\/\/\/tmp\/ext\/meta\.ts/.test(out),
+            (out.split('\n').find((l) => l.startsWith('META ')) || '')
+        );
 
         const ms = Number((out.match(/ms=(\d+)/) || [])[1] || 0);
         check('cold load is well under the Babel path (>28s)', ms > 0 && ms < 15000, `ms=${ms}`);

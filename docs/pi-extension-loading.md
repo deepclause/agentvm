@@ -56,9 +56,22 @@ still never loads Babel. A TLA extension loads in ~14 s cold (Babel load +
 transform) and ~0.14 s once warm; without the fallback it fails outright and pi
 exits, which surfaced as pi-box reconnecting in a loop.
 
+esbuild's CommonJS output also blanks `import.meta` (`const import_meta = {}`), so
+`import.meta.url` becomes `undefined`. Extensions that resolve their own files at
+load time (pi-subagents does `fileURLToPath(import.meta.url)` in
+`src/agents/agents.ts`) then throw `ERR_INVALID_ARG_TYPE`. Babel inlines the
+value, so the shim substitutes the file URL/dirname/filename before transforming.
+
 `static.mjs` imports `jiti-real/dist/jiti.cjs` directly instead of
 `jiti-real/lib/jiti-static.mjs`, because the latter eagerly imports
 `dist/babel.cjs` (~4 s) even when no file needs it.
+
+**Cache invalidation.** jiti caches transpiled output in `$TMPDIR/jiti` keyed by
+source (not by transform). Changing the shim does **not** invalidate existing
+entries, so stale output (e.g. the old `import.meta`-blanking transform) keeps
+being served and the transform is never called again. Clear `$TMPDIR/jiti`
+after changing the transform (`rm -rf /tmp/jiti`), and ship a clean cache in the
+image.
 
 ### B. Warm / persist the fsCache
 

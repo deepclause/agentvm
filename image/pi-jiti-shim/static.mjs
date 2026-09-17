@@ -1,4 +1,6 @@
 import { createRequire } from 'node:module';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 // Import the real jiti engine directly rather than ../jiti-real/lib/jiti-static.mjs:
 // that module eagerly imports dist/babel.cjs (~4s under emulation), which we only
 // need for files esbuild cannot handle.
@@ -25,14 +27,27 @@ function getBabelTransform() {
   return babelTransform;
 }
 
+// esbuild blanks import.meta for CJS; inline the values Babel would produce.
+function rewriteImportMeta(source, filename) {
+  if (typeof filename !== 'string' || !/import\s*\.\s*meta\b/.test(source)) return source;
+  const url = pathToFileURL(filename).href;
+  return source
+    .replace(/\bimport\s*\.\s*meta\s*\.\s*url\b/g, JSON.stringify(url))
+    .replace(/\bimport\s*\.\s*meta\s*\.\s*filename\b/g, JSON.stringify(filename))
+    .replace(/\bimport\s*\.\s*meta\s*\.\s*dirname\b/g, JSON.stringify(path.dirname(filename)));
+}
+
 const fastTransform = (opts) => {
   try {
     return {
-      code: esbuild.transformSync(opts.source, {
-        loader: opts && opts.ts === false ? 'js' : 'ts',
-        format: 'cjs',
-        target: 'node20',
-      }).code,
+      code: esbuild.transformSync(
+        rewriteImportMeta(opts.source, opts && opts.filename),
+        {
+          loader: opts && opts.ts === false ? 'js' : 'ts',
+          format: 'cjs',
+          target: 'node20',
+        }
+      ).code,
     };
   } catch (error) {
     const babel = getBabelTransform();

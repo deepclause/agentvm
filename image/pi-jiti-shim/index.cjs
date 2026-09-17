@@ -13,7 +13,17 @@
 // real Babel transform (loaded lazily, once). If esbuild is unavailable, or the
 // caller already supplied a transform, the real jiti/Babel path is used
 // unchanged.
+//
+// esbuild's CommonJS output also blanks `import.meta` (`const import_meta = {}`),
+// which breaks extensions that resolve their own path at load time (pi-subagents
+// calls `fileURLToPath(import.meta.url)`); Babel inlines the value, so we
+// substitute it before transforming.
+//
+// jiti's filesystem cache (`$TMPDIR/jiti`) is keyed by source, not by transform,
+// so cached output from an older transform can outlive a shim change. Bump
+// SHIM_CACHE_TAG to force a rebuild of stale entries.
 const path = require('node:path');
+const { pathToFileURL } = require('node:url');
 const real = require('jiti-real');
 
 let esbuild = null;
@@ -35,15 +45,25 @@ function getBabelTransform() {
   return babelTransform;
 }
 
+/** esbuild blanks import.meta for CJS; inline the values Babel would produce. */
+function rewriteImportMeta(source, filename) {
+  if (typeof filename !== 'string' || !/import\s*\.\s*meta\b/.test(source)) return source;
+  const url = pathToFileURL(filename).href;
+  return source
+    .replace(/\bimport\s*\.\s*meta\s*\.\s*url\b/g, JSON.stringify(url))
+    .replace(/\bimport\s*\.\s*meta\s*\.\s*filename\b/g, JSON.stringify(filename))
+    .replace(/\bimport\s*\.\s*meta\s*\.\s*dirname\b/g, JSON.stringify(path.dirname(filename)));
+}
+
 const fastTransform = (opts) => {
   if (!esbuild) return getBabelTransform()(opts);
   try {
     return {
-      code: esbuild.transformSync(opts.source, {
+      code: esbuild.transformSync(rewriteImportMeta(opts.source, opts && opts.filename), {
         loader: opts && opts.ts === false ? 'js' : 'ts',
         format: 'cjs',
-        target: 'node20',
-      }).code,
+        target: 'node20'
+      }).code
     };
   } catch (error) {
     const babel = getBabelTransform();
