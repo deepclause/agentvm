@@ -77,26 +77,55 @@ let instance = null;
 // guest's sleep/select path), throttled to AGENTVM_FB_FPS.
 let fbInfo = null;
 let fbLastPostAt = 0;
-let fbPending = false;
+let fbRects = [];
 const FB_MAX_FPS = Number(process.env.AGENTVM_FB_FPS || '20');
 
-function postFrameIfDue() {
+// host_fb_draw import: called from the emulator's fb_refresh() for each
+// damaged rectangle. Copy the rows out of WASM memory now (stride != w*4).
+function hostFbDraw(x, y, w, h) {
     if (!fbInfo || !instance) return;
-    // fb_dirty() returns and clears the guest's write-damage bitmap, so only
-    // changed frames are captured. Remember the damage across throttled polls.
-    if (!instance.exports.fb_dirty || instance.exports.fb_dirty()) fbPending = true;
-    if (!fbPending) return;
+    const stride = fbInfo.stride;
+    const rowBytes = w * 4;
+    const data = new Uint8Array(rowBytes * h);
+    const mem = new Uint8Array(instance.exports.memory.buffer);
+    for (let j = 0; j < h; j++) {
+        const off = fbInfo.ptr + (y + j) * stride + x * 4;
+        data.set(mem.subarray(off, off + rowBytes), j * rowBytes);
+    }
+    fbRects.push({ x, y, w, h, data });
+}
+
+function postFramesIfDue() {
+    if (!fbInfo || !instance || !instance.exports.fb_refresh) return;
     const now = Date.now();
     const minInterval = FB_MAX_FPS > 0 ? 1000 / FB_MAX_FPS : 0;
     if (now - fbLastPostAt < minInterval) return;
+    fbRects = [];
+    instance.exports.fb_refresh(); // emits hostFbDraw per damaged rect
+    if (fbRects.length === 0) return;
     fbLastPostAt = now;
-    fbPending = false;
-    const size = fbInfo.stride * fbInfo.height;
-    const data = new Uint8Array(instance.exports.memory.buffer, fbInfo.ptr, size).slice();
+    const rects = fbRects;
+    fbRects = [];
     parentPort.postMessage(
-        { type: 'framebuffer', width: fbInfo.width, height: fbInfo.height, stride: fbInfo.stride, data },
-        [data.buffer]
+        { type: 'framebuffer', width: fbInfo.width, height: fbInfo.height, stride: fbInfo.stride, rects },
+        rects.map((r) => r.data.buffer)
     );
+}
+
+// Drain host input events (sendKey/sendMouse) and feed the virtio-input devices.
+function drainInput() {
+    if (!instance || !instance.exports.input_key) return;
+    while (ringReader.hasInputData()) {
+        const ev = ringReader.readInput();
+        if (!ev) break;
+        const dv = new DataView(ev.buffer, ev.byteOffset, ev.byteLength);
+        const kind = dv.getUint8(0);
+        if (process.env.DEBUG_FB === '1') {
+            parentPort.postMessage({ type: 'debug', msg: `input kind=${kind} a=${dv.getInt32(1, true)} b=${dv.getInt32(5, true)}` });
+        }
+        if (kind === 0) instance.exports.input_key(dv.getInt32(1, true), dv.getInt32(5, true));
+        else if (kind === 1) instance.exports.input_mouse(dv.getInt32(1, true), dv.getInt32(5, true), dv.getInt32(9, true));
+    }
 }
 const JIT_ENABLED = process.env.AGENTVM_JIT === '1';
 const DEBUG_JIT = process.env.DEBUG_JIT === '1';
@@ -1281,6 +1310,7 @@ async function start() {
     const originalPollOneoff = wasiImport.poll_oneoff;
     wasiImport.poll_oneoff = (in_ptr, out_ptr, nsubscriptions, nevents_ptr) => {
         if (!instance) return originalPollOneoff(in_ptr, out_ptr, nsubscriptions, nevents_ptr);
+        drainInput();
         const view = new DataView(instance.exports.memory.buffer);
         
         let hasStdin = false;
@@ -1447,7 +1477,7 @@ async function start() {
         }
         
         view.setUint32(nevents_ptr, eventsWritten, true);
-        postFrameIfDue();
+        postFramesIfDue();
         return 0; // Success
     };
 
@@ -1628,6 +1658,7 @@ async function start() {
             // Compatibility with images built before in-WASM dispatch, which
             // import the old JS hook. Unused by the current image.
             jit_try_block: () => 0,
+            host_fb_draw: hostFbDraw,
         },
         wasi_snapshot_preview1: {
             ...wasiImport,

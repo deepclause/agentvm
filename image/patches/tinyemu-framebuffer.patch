@@ -1,56 +1,17 @@
-diff --git a/machine.h b/machine.h
-index cb630b5..7f34f31 100644
---- a/machine.h
-+++ b/machine.h
-@@ -183,6 +183,7 @@ void sdl_init(int width, int height);
- typedef struct SimpleFBState SimpleFBState;
- SimpleFBState *simplefb_init(PhysMemoryMap *map, uint64_t phys_addr,
-                              FBDevice *fb_dev, int width, int height);
-+int simplefb_take_dirty(FBDevice *fb_dev);
- void simplefb_refresh(FBDevice *fb_dev,
-                       SimpleFBDrawFunc *redraw_func, void *opaque,
-                       PhysMemoryRange *mem_range,
-diff --git a/simplefb.c b/simplefb.c
-index 5664cea..75f0a5c 100644
---- a/simplefb.c
-+++ b/simplefb.c
-@@ -103,6 +103,25 @@ static void simplefb_refresh1(FBDevice *fb_dev,
-                      s->fb_page_count);
- }
- 
-+/* Return (and clear) whether any framebuffer page was written since the last
-+   call. The AgentVM host uses this to fetch only changed frames. */
-+int simplefb_take_dirty(FBDevice *fb_dev)
-+{
-+    SimpleFBState *s = fb_dev->device_opaque;
-+    const uint32_t *dirty_bits;
-+    int i, nwords;
-+
-+    if (!s)
-+        return 0;
-+    dirty_bits = phys_mem_get_dirty_bits(s->mem_range);
-+    nwords = (s->fb_page_count + 31) >> 5;
-+    for (i = 0; i < nwords; i++) {
-+        if (dirty_bits[i] != 0)
-+            return 1;
-+    }
-+    return 0;
-+}
-+
- SimpleFBState *simplefb_init(PhysMemoryMap *map, uint64_t phys_addr,
-                              FBDevice *fb_dev, int width, int height)
- {
 diff --git a/temu.c b/temu.c
-index 92cb196..5cf7087 100644
+index 92cb196..ef8fea3 100644
 --- a/temu.c
 +++ b/temu.c
-@@ -1003,6 +1003,38 @@ static BOOL net_poll_cb(void *arg)
+@@ -1003,6 +1003,74 @@ static BOOL net_poll_cb(void *arg)
  FSVirtFile *info;
  int initialized = FALSE;
  VirtMachine *s;
 +
-+/* Host framebuffer access (AgentVM). fb_dev is created by virt_machine_init
-+   only when the config has a display0 device; these return 0 without one. */
++/* ---- AgentVM virtual framebuffer + input ---------------------------------
++   framebuffer: fb_dev is created by virt_machine_init only when the config has
++   a display0 device. fb_dirty() returns the guest's write damage; fb_refresh()
++   walks it and calls the host_fb_draw import for each damaged rectangle.
++   input: virtio-input keyboard (evdev keycodes) and absolute tablet. */
 +__attribute__((export_name("fb_ptr")))
 +uint32_t fb_ptr(void)
 +{
@@ -75,10 +36,43 @@ index 92cb196..5cf7087 100644
 +    return (s && s->fb_dev) ? s->fb_dev->stride : 0;
 +}
 +
-+__attribute__((export_name("fb_dirty")))
-+int fb_dirty(void)
++__attribute__((import_module("env"), import_name("host_fb_draw")))
++void host_fb_draw(int x, int y, int w, int h);
++
++static void fb_host_redraw(FBDevice *fb_dev, void *opaque,
++                           int x, int y, int w, int h)
 +{
-+    return (s && s->fb_dev) ? simplefb_take_dirty(s->fb_dev) : 0;
++    host_fb_draw(x, y, w, h);
++}
++
++/* Emit the damaged rectangles (host_fb_draw per rectangle). */
++__attribute__((export_name("fb_refresh")))
++void fb_refresh(void)
++{
++    if (s && s->fb_dev && s->fb_dev->refresh)
++        s->fb_dev->refresh(s->fb_dev, fb_host_redraw, NULL);
++}
++
++/* keycode is a Linux evdev keycode; buttons 1=left 2=right 4=middle. */
++__attribute__((export_name("input_key")))
++void input_key(int down, int keycode)
++{
++    if (s)
++        vm_send_key_event(s, down, (uint16_t)keycode);
++}
++
++__attribute__((export_name("input_mouse")))
++void input_mouse(int x, int y, int buttons)
++{
++    if (!s)
++        return;
++    if (vm_mouse_is_absolute(s)) {
++        int w = s->fb_dev ? s->fb_dev->width : 1024;
++        int h = s->fb_dev ? s->fb_dev->height : 768;
++        x = (x * 32768) / w;
++        y = (y * 32768) / h;
++    }
++    vm_send_mouse_event(s, x, y, 0, (unsigned int)buttons);
 +}
  VirtMachineParams p_s, *p = &p_s;
  

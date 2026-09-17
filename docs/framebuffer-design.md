@@ -6,46 +6,50 @@ Goal: expose a virtual framebuffer so that
 2. an app *embedding* AgentVM can display it, and
 3. input can flow back (keyboard/mouse).
 
-Status: **M0 implemented** (framebuffer enabled by default, `onFramebuffer`/
-`getFramebuffer` host API, `/dev/fb0`, dirty-gated frame push). M1-M3 pending.
+Status: **M0-M2 implemented** (framebuffer enabled by default, damaged-rect
+frames, `onFramebuffer`/`getFramebuffer`, `sendKey`/`sendMouse`, `/dev/fb0` and
+`/dev/input/eventN`).
 
-## M0 (implemented)
-
-What landed:
+## Implemented (M0-M2)
 
 - `image/build.sh` (default `FRAMEBUFFER=1`) enables the kernel `FB_SIMPLE` and
   `INPUT_EVDEV`, emits `display0: { device: "simplefb", width: 1024, height:
   768 }` + `input_device: "virtio"` into the TinyEMU config, and applies
-  `image/patches/tinyemu-framebuffer.patch`.
-- The patch exports `fb_ptr`/`fb_width`/`fb_height`/`fb_stride` and
-  `fb_dirty` (returns and clears the simplefb write-damage bitmap).
-- `src/worker.js` reads those exports, and in its `poll_oneoff` handler
-  captures a full frame only when `fb_dirty()` is set, throttled to
-  `AGENTVM_FB_FPS` (default 20). Idle VMs push nothing.
-- `src/index.js` creates `/dev/fb0` at boot (the container `/dev` is a tmpfs
-  without udev) and exposes `onFramebuffer(cb)` / `getFramebuffer()`.
-- `test/framebuffer.test.js` and `examples/framebuffer/fb-demo.c` (a bouncing
-  ball; cross-compile with `examples/framebuffer/build.sh`).
+  `image/patches/tinyemu-framebuffer.patch`. `FRAMEBUFFER=0` builds without it.
+- The patch exports `fb_ptr/width/height/stride` and `fb_refresh`, imports
+  `host_fb_draw`, and exports `input_key`/`input_mouse`.
+- `fb_refresh` walks the simplefb dirty bitmap and calls `host_fb_draw` once
+  per damaged Y-range (**M1**). The worker copies each rect and posts it,
+  throttled to `AGENTVM_FB_FPS` (20); idle VMs push nothing.
+- `src/index.js` creates `/dev/fb0` and `/dev/input/event*` at boot (the
+  container `/dev` is a tmpfs without udev) and exposes `onFramebuffer(cb)` /
+  `getFramebuffer()` / `sendKey(code, down)` / `sendMouse(x, y, buttons)` (**M2**).
 
 ```js
 const vm = new AgentVM();
 await vm.start();
-vm.onFramebuffer(({ width, height, stride, data }) => blit(data, width, height));
-// or poll: const frame = vm.getFramebuffer();
+vm.onFramebuffer(({ width, height, data, rects }) => blit(data, width, height));
+const frame = vm.getFramebuffer();      // full accumulated frame
+vm.sendKey('ArrowLeft', true);          // evdev name or code
+vm.sendMouse(512, 384, 1);              // x, y, buttons (1=left)
 ```
 
-Guest side: write to `/dev/fb0` (framebuffer format `a8r8g8b8`, stride 4096 for
-1024x768). Do not `msync` a device mapping (EINVAL); writes are immediately
-visible. `examples/framebuffer/build.sh` builds a static riscv64 demo:
+Guest side: write to `/dev/fb0` (`a8r8g8b8`, stride 4096 for 1024x768) and read
+`/dev/input/event0` (virtio_keyboard) / `event1` (virtio_tablet). Do not `msync`
+a device mapping (EINVAL). `examples/framebuffer/build.sh` builds a static
+game with keyboard control:
 
 ```bash
-image/framebuffer/build.sh   # host cross toolchain
-# in the guest: ./fb-demo 10
+examples/framebuffer/build.sh
+# in the guest: ./fb-demo 10   (arrows nudge the ball, space recentres, Esc quits)
 ```
 
-Known M0 limits: full-frame copies (no damaged-rect deltas), frames only flow
-while the guest reaches a WASI sleep/`poll` (a tight non-sleeping render loop
-will not be sampled until M1's PV flush), and no input yet.
+Verified: guest received `code=105` (Left), `code=57` (Space), `code=1` (Esc)
+and quit; ~48 damaged rects over 47 frames; idle produced none.
+
+Known limits: full-frame reassembly on the host (rects are not delta-blitted
+into the app's surfaces), and input is delivered when the worker next reaches a
+WASI `poll` (a blocking non-polling guest would see latency).
 
 ## What we already have
 

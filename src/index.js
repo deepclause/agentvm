@@ -11,6 +11,20 @@ const { normalizeFirewall, matchFirewall, remoteMatches, isHostname, portMatches
 const GATEWAY_IP = '192.168.127.1';
 const GUEST_IP = '192.168.127.3';
 
+// Linux evdev keycodes for sendKey() names.
+const KEY_CODES = {
+    esc: 1, escape: 1, '1': 2, '2': 3, '3': 4, '4': 5, '5': 6, '6': 7, '7': 8,
+    '8': 9, '9': 10, '0': 11, minus: 12, equal: 13, backspace: 14, tab: 15,
+    q: 16, w: 17, e: 18, r: 19, t: 20, y: 21, u: 22, i: 23, o: 24, p: 25,
+    '[': 26, ']': 27, enter: 28, return: 28, ctrl: 29, control: 29,
+    a: 30, s: 31, d: 32, f: 33, g: 34, h: 35, j: 36, k: 37, l: 38, semicolon: 39,
+    quote: 40, backtick: 41, shift: 42, backslash: 43, z: 44, x: 45, c: 46, v: 47,
+    b: 48, n: 49, m: 50, comma: 51, period: 52, slash: 53, alt: 56, space: 57,
+    capslock: 58, up: 103, arrowup: 103, left: 105, arrowleft: 105,
+    right: 106, arrowright: 106, down: 108, arrowdown: 108, delete: 111,
+    home: 102, end: 107, pageup: 104, pagedown: 109, insert: 110,
+};
+
 class AgentVM {
     /**
      * @param {Object} options
@@ -65,6 +79,7 @@ class AgentVM {
         this.isReady = false;
         // Virtual framebuffer (simplefb): the latest frame pushed by the worker.
         this.lastFrame = null;
+        this.framebuffer = null;
         this.framebufferCallbacks = new Set();
         this.destroyed = false;
         
@@ -235,10 +250,7 @@ class AgentVM {
                 } else if (msg.type === 'stderr') {
                     this.handleOutput('stderr', msg.data);
                 } else if (msg.type === 'framebuffer') {
-                    this.lastFrame = msg;
-                    for (const cb of this.framebufferCallbacks) {
-                        try { cb(msg); } catch (err) { console.warn('framebuffer callback error:', err.message); }
-                    }
+                    this._applyFrame(msg);
                 } else if (msg.type === 'debug') {
                     // Worker debug messages
                     if (this.debug) console.log('[Worker]', msg.msg);
@@ -296,9 +308,16 @@ class AgentVM {
 
         if (this.interactive) return;
         // The container /dev is a tmpfs populated without udev; create the
-        // optional simple-framebuffer node (major 29, minor 0). Harmless when
-        // the image has no framebuffer.
-        await this.exec("mknod /dev/fb0 c 29 0 2>/dev/null; stty -echo; export PS1=''");
+        // optional simple-framebuffer node (major 29, minor 0) and the
+        // virtio-input evdev nodes. Harmless when the image has neither.
+        await this.exec(
+            'mknod /dev/fb0 c 29 0 2>/dev/null; ' +
+            'mkdir -p /dev/input; ' +
+            'for d in /sys/class/input/event*; do [ -e "$d/dev" ] || continue; ' +
+            'v=$(cat "$d/dev"); mka=${v%:*}; min=${v##*:}; ' +
+            'mknod "/dev/input/${d##*/}" c "$mka" "$min" 2>/dev/null; done; ' +
+            "stty -echo; export PS1=''"
+        );
 
         // Auto-setup network if the VM has a NIC and the runtime network
         // toggle is currently enabled.
@@ -1199,6 +1218,70 @@ class AgentVM {
             stride: this.lastFrame.stride,
             data: this.lastFrame.data,
         };
+    }
+
+    /**
+     * Apply a framebuffer message: blit the damaged rects into a persistent
+     * full-frame buffer and notify subscribers.
+     * @private
+     */
+    _applyFrame(msg) {
+        const { width, height, stride, rects } = msg;
+        if (!this.framebuffer || this.framebuffer.width !== width ||
+            this.framebuffer.height !== height || this.framebuffer.stride !== stride) {
+            this.framebuffer = { width, height, stride, data: new Uint8Array(stride * height) };
+        }
+        if (rects) {
+            for (const r of rects) {
+                const rowBytes = r.w * 4;
+                for (let j = 0; j < r.h; j++) {
+                    this.framebuffer.data.set(
+                        r.data.subarray(j * rowBytes, (j + 1) * rowBytes),
+                        (r.y + j) * stride + r.x * 4
+                    );
+                }
+            }
+        }
+        this.lastFrame = {
+            width, height, stride,
+            data: this.framebuffer.data,
+            rects: rects || null,
+        };
+        for (const cb of this.framebufferCallbacks) {
+            try { cb(this.lastFrame); } catch (err) { console.warn('framebuffer callback error:', err.message); }
+        }
+    }
+
+    /**
+     * Send a keyboard event to the guest's virtio-input keyboard.
+     * @param {string|number} code - Key name (e.g. 'ArrowLeft', 'Enter', 'a') or
+     *   a raw Linux evdev keycode.
+     * @param {boolean} [down=true] - true for press, false for release.
+     */
+    sendKey(code, down = true) {
+        const keycode = typeof code === 'string' ? KEY_CODES[code.toLowerCase()] : code;
+        if (keycode == null) throw new Error(`unknown key: ${code}`);
+        const buf = Buffer.alloc(9);
+        buf[0] = 0;
+        buf.writeInt32LE(down ? 1 : 0, 1);
+        buf.writeInt32LE(keycode | 0, 5);
+        if (!this.ringWriter.writeInput(buf)) throw new Error('input queue full');
+    }
+
+    /**
+     * Send a pointer event to the guest's virtio-input tablet. Coordinates are
+     * in framebuffer pixels.
+     * @param {number} x
+     * @param {number} y
+     * @param {number} [buttons=0] - 1=left, 2=right, 4=middle.
+     */
+    sendMouse(x, y, buttons = 0) {
+        const buf = Buffer.alloc(13);
+        buf[0] = 1;
+        buf.writeInt32LE(x | 0, 1);
+        buf.writeInt32LE(y | 0, 5);
+        buf.writeInt32LE(buttons | 0, 9);
+        if (!this.ringWriter.writeInput(buf)) throw new Error('input queue full');
     }
 
     /**
