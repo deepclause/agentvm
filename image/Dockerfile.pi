@@ -27,6 +27,21 @@ RUN apk add --no-cache \
 
 COPY --link preinstalled/usrlocal /usr/local
 
+# Speed up pi's TypeScript extension loading. pi compiles extensions with
+# jiti, whose bundled Babel transform costs ~4s to load plus ~2s/KB under
+# emulation (~21s for an 8.5KB extension). Install a shim as the `jiti`
+# package (the real one is kept as `jiti-real`) that injects an esbuild
+# transform, which is native and transforms the same file in milliseconds (~5s
+# cold, 0.3s warm). Falls back to Babel if esbuild is missing. See
+# image/pi-jiti-shim/.
+COPY --link pi-jiti-shim /tmp/pi-jiti-shim
+RUN set -eux; \
+    NM=/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/node_modules; \
+    if [ -d "$NM/jiti" ] && [ ! -d "$NM/jiti-real" ]; then mv "$NM/jiti" "$NM/jiti-real"; fi; \
+    rm -rf "$NM/jiti"; \
+    cp -r /tmp/pi-jiti-shim "$NM/jiti"; \
+    rm -rf /tmp/pi-jiti-shim
+
 # V8's concurrent GC threads contend on the emulated single hart. Disabling
 # concurrent GC measurably speeds Node CPU work and short-lived CLI startup.
 RUN rm -f /usr/local/bin/pi && \
