@@ -63,6 +63,9 @@ class AgentVM {
         this.pendingInternal = null; // internal shell command output capture (both modes)
         this.pendingBootstrap = null; // pivot/chroot bootstrap output capture
         this.isReady = false;
+        // Virtual framebuffer (simplefb): the latest frame pushed by the worker.
+        this.lastFrame = null;
+        this.framebufferCallbacks = new Set();
         this.destroyed = false;
         
         // Callbacks for raw/interactive mode
@@ -231,6 +234,11 @@ class AgentVM {
                     this.handleOutput('stdout', msg.data);
                 } else if (msg.type === 'stderr') {
                     this.handleOutput('stderr', msg.data);
+                } else if (msg.type === 'framebuffer') {
+                    this.lastFrame = msg;
+                    for (const cb of this.framebufferCallbacks) {
+                        try { cb(msg); } catch (err) { console.warn('framebuffer callback error:', err.message); }
+                    }
                 } else if (msg.type === 'debug') {
                     // Worker debug messages
                     if (this.debug) console.log('[Worker]', msg.msg);
@@ -287,7 +295,10 @@ class AgentVM {
         }
 
         if (this.interactive) return;
-        await this.exec("stty -echo; export PS1=''");
+        // The container /dev is a tmpfs populated without udev; create the
+        // optional simple-framebuffer node (major 29, minor 0). Harmless when
+        // the image has no framebuffer.
+        await this.exec("mknod /dev/fb0 c 29 0 2>/dev/null; stty -echo; export PS1=''");
 
         // Auto-setup network if the VM has a NIC and the runtime network
         // toggle is currently enabled.
@@ -1162,6 +1173,32 @@ class AgentVM {
         return [...this.portForwards.values()].map(({ hostPort, guestPort, guestHost, protocol, bind }) => ({
             hostPort, guestPort, guestHost, protocol, bind,
         }));
+    }
+
+    /**
+     * Subscribe to virtual-framebuffer frames (TinyEMU simplefb). The callback
+     * receives { width, height, stride, data } where data is RGBA bytes
+     * (stride bytes per row). Returns an unsubscribe function.
+     * @param {(frame: {width:number,height:number,stride:number,data:Uint8Array}) => void} callback
+     */
+    onFramebuffer(callback) {
+        this.framebufferCallbacks.add(callback);
+        return () => this.framebufferCallbacks.delete(callback);
+    }
+
+    /**
+     * The most recent framebuffer frame, or null if the image has no framebuffer
+     * or no frame has been produced yet.
+     * @returns {{width:number,height:number,stride:number,data:Uint8Array}|null}
+     */
+    getFramebuffer() {
+        if (!this.lastFrame) return null;
+        return {
+            width: this.lastFrame.width,
+            height: this.lastFrame.height,
+            stride: this.lastFrame.stride,
+            data: this.lastFrame.data,
+        };
     }
 
     /**

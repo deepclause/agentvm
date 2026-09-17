@@ -23,6 +23,14 @@ PV_ACCEL="${PV_ACCEL:-1}"
 # Guest RAM. The writable overlay (and /run tmpfs) default to ~half of this,
 # so the pi coding agent needs substantially more than the 128 MiB default.
 VM_MEMORY_SIZE_MB="${VM_MEMORY_SIZE_MB:-1024}"
+# Optional virtual framebuffer: FRAMEBUFFER=1 exposes the guest /dev/fb0 via
+# TinyEMU's simplefb device and exports the pixel buffer to the host (see
+# docs/framebuffer-design.md). FRAMEBUFFER=0 (default) leaves the image as-is.
+FRAMEBUFFER="${FRAMEBUFFER:-1}"
+FB_WIDTH="${FB_WIDTH:-1024}"
+FB_HEIGHT="${FB_HEIGHT:-768}"
+# build.sh's config step reads these from the environment.
+export FRAMEBUFFER FB_WIDTH FB_HEIGHT
 
 # TinyEMU pinned by the embedded c2w Dockerfile. We patch it to accept the
 # `fence.tso` instruction that modern riscv64 node/npm binaries emit.
@@ -62,6 +70,8 @@ git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-writable-second-drive.patch"
 # Accept (no-op) chmod on the 9p mount so tools (npm, git, ...) don't fail with
 # EPROTO on /workspace.
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-9p-setattr-chmod.patch"
+# Export the simplefb pixel buffer to the host (fb_ptr/width/height/stride).
+git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-framebuffer.patch"
 if [ "$PV_ACCEL" = "1" ]; then
     git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-pv-accel.patch"
 fi
@@ -75,6 +85,10 @@ import os
 p = sys.argv[1]
 s = open(p).read()
 pv_accel = os.environ.get("PV_ACCEL", "1") == "1"
+# Optional virtual framebuffer (simple-framebuffer -> /dev/fb0).
+framebuffer = os.environ.get("FRAMEBUFFER", "0") == "1"
+fb_w = os.environ.get("FB_WIDTH", "1024")
+fb_h = os.environ.get("FB_HEIGHT", "768")
 old = """FROM ubuntu:22.04 AS tinyemu-repo-base
 ARG TINYEMU_REPO
 ARG TINYEMU_REPO_VERSION
@@ -112,9 +126,13 @@ s = s.replace(old_assets_clone, new_assets_clone)
 # When PV_ACCEL=1 we also patch the riscv64 kernel to route page clear/copy
 # through the TinyEMU hypercall (see patches/linux-riscv-pv-accel.patch).
 config_copy = "COPY --link --from=assets /config/tinyemu/linux_rv64_config ./.config\n"
+# FB_SIMPLE binds the FDT simple-framebuffer node to /dev/fb0; INPUT_EVDEV
+# exposes virtio-input as /dev/input/eventN.
+fb_kernel_opts = " --enable FB_SIMPLE --enable INPUT_EVDEV" if framebuffer else ""
 config_tune = config_copy + (
     "RUN scripts/config --disable CC_OPTIMIZE_FOR_SIZE "
     "--enable CC_OPTIMIZE_FOR_PERFORMANCE --enable TRANSPARENT_HUGEPAGE --enable TRANSPARENT_HUGEPAGE_ALWAYS"
+    + fb_kernel_opts
     + (" --enable RISCV_PV_ACCEL" if pv_accel else "")
     + "\n"
 )
@@ -162,7 +180,11 @@ s = s.replace(old_cc, new_cc)
 # Run Binaryen's optimizer over the linked TinyEMU module before Wizer
 # snapshots it. This shrinks the emulator and can improve V8 tiering.
 old_config_step = "RUN cat /tinyemu.config.template | LOGLEVEL=$LINUX_LOGLEVEL MEMORY_SIZE=$VM_MEMORY_SIZE_MB envsubst > /out/tinyemu.config"
-new_config_step = old_config_step + " && sed -i '$i\\    drive1: { file: \"/agentvm-persist/upper.img\" },' /out/tinyemu.config"
+config_extra = '    drive1: { file: "/agentvm-persist/upper.img" },'
+if framebuffer:
+    config_extra += '\\n    display0: { device: "simplefb", width: ' + fb_w + ', height: ' + fb_h + ' },'
+    config_extra += '\\n    input_device: "virtio",'
+new_config_step = old_config_step + " && sed -i '$i\\" + config_extra + "' /out/tinyemu.config"
 assert s.count(old_config_step) == 1, "unexpected tinyemu config step"
 s = s.replace(old_config_step, new_config_step)
 

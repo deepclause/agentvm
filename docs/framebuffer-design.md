@@ -6,7 +6,46 @@ Goal: expose a virtual framebuffer so that
 2. an app *embedding* AgentVM can display it, and
 3. input can flow back (keyboard/mouse).
 
-Status: design. Nothing implemented yet.
+Status: **M0 implemented** (framebuffer enabled by default, `onFramebuffer`/
+`getFramebuffer` host API, `/dev/fb0`, dirty-gated frame push). M1-M3 pending.
+
+## M0 (implemented)
+
+What landed:
+
+- `image/build.sh` (default `FRAMEBUFFER=1`) enables the kernel `FB_SIMPLE` and
+  `INPUT_EVDEV`, emits `display0: { device: "simplefb", width: 1024, height:
+  768 }` + `input_device: "virtio"` into the TinyEMU config, and applies
+  `image/patches/tinyemu-framebuffer.patch`.
+- The patch exports `fb_ptr`/`fb_width`/`fb_height`/`fb_stride` and
+  `fb_dirty` (returns and clears the simplefb write-damage bitmap).
+- `src/worker.js` reads those exports, and in its `poll_oneoff` handler
+  captures a full frame only when `fb_dirty()` is set, throttled to
+  `AGENTVM_FB_FPS` (default 20). Idle VMs push nothing.
+- `src/index.js` creates `/dev/fb0` at boot (the container `/dev` is a tmpfs
+  without udev) and exposes `onFramebuffer(cb)` / `getFramebuffer()`.
+- `test/framebuffer.test.js` and `examples/framebuffer/fb-demo.c` (a bouncing
+  ball; cross-compile with `examples/framebuffer/build.sh`).
+
+```js
+const vm = new AgentVM();
+await vm.start();
+vm.onFramebuffer(({ width, height, stride, data }) => blit(data, width, height));
+// or poll: const frame = vm.getFramebuffer();
+```
+
+Guest side: write to `/dev/fb0` (framebuffer format `a8r8g8b8`, stride 4096 for
+1024x768). Do not `msync` a device mapping (EINVAL); writes are immediately
+visible. `examples/framebuffer/build.sh` builds a static riscv64 demo:
+
+```bash
+image/framebuffer/build.sh   # host cross toolchain
+# in the guest: ./fb-demo 10
+```
+
+Known M0 limits: full-frame copies (no damaged-rect deltas), frames only flow
+while the guest reaches a WASI sleep/`poll` (a tight non-sleeping render loop
+will not be sampled until M1's PV flush), and no input yet.
 
 ## What we already have
 

@@ -71,6 +71,33 @@ function writeIOVs(view, iovs_ptr, iovs_len, data) {
 }
 
 let instance = null;
+
+// Optional virtual framebuffer (simplefb). Populated after instantiation from
+// the fb_* exports. Frames are pushed to the main thread from poll_oneoff (the
+// guest's sleep/select path), throttled to AGENTVM_FB_FPS.
+let fbInfo = null;
+let fbLastPostAt = 0;
+let fbPending = false;
+const FB_MAX_FPS = Number(process.env.AGENTVM_FB_FPS || '20');
+
+function postFrameIfDue() {
+    if (!fbInfo || !instance) return;
+    // fb_dirty() returns and clears the guest's write-damage bitmap, so only
+    // changed frames are captured. Remember the damage across throttled polls.
+    if (!instance.exports.fb_dirty || instance.exports.fb_dirty()) fbPending = true;
+    if (!fbPending) return;
+    const now = Date.now();
+    const minInterval = FB_MAX_FPS > 0 ? 1000 / FB_MAX_FPS : 0;
+    if (now - fbLastPostAt < minInterval) return;
+    fbLastPostAt = now;
+    fbPending = false;
+    const size = fbInfo.stride * fbInfo.height;
+    const data = new Uint8Array(instance.exports.memory.buffer, fbInfo.ptr, size).slice();
+    parentPort.postMessage(
+        { type: 'framebuffer', width: fbInfo.width, height: fbInfo.height, stride: fbInfo.stride, data },
+        [data.buffer]
+    );
+}
 const JIT_ENABLED = process.env.AGENTVM_JIT === '1';
 const DEBUG_JIT = process.env.DEBUG_JIT === '1';
 // The hot threshold now lives in the emulator (JIT_HOT_THRESHOLD in
@@ -1420,6 +1447,7 @@ async function start() {
         }
         
         view.setUint32(nevents_ptr, eventsWritten, true);
+        postFrameIfDue();
         return 0; // Success
     };
 
@@ -1691,6 +1719,18 @@ async function start() {
     if (JIT_ENABLED && instance.exports.__indirect_function_table) {
         jitTable = instance.exports.__indirect_function_table;
         if (instance.exports.jit_set_enabled) instance.exports.jit_set_enabled(1);
+    }
+    if (instance.exports.fb_ptr) {
+        const ptr = instance.exports.fb_ptr() >>> 0;
+        const width = instance.exports.fb_width() | 0;
+        const height = instance.exports.fb_height() | 0;
+        const stride = instance.exports.fb_stride() | 0;
+        if (ptr && width > 0 && height > 0 && stride > 0) {
+            fbInfo = { ptr, width, height, stride };
+            if (process.env.DEBUG_FB === '1') {
+                parentPort.postMessage({ type: 'debug', msg: `framebuffer ${width}x${height} stride=${stride} ptr=0x${ptr.toString(16)}` });
+            }
+        }
     }
 
     parentPort.postMessage({ type: 'ready' });

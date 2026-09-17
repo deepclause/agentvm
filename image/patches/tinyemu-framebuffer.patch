@@ -1,0 +1,85 @@
+diff --git a/machine.h b/machine.h
+index cb630b5..7f34f31 100644
+--- a/machine.h
++++ b/machine.h
+@@ -183,6 +183,7 @@ void sdl_init(int width, int height);
+ typedef struct SimpleFBState SimpleFBState;
+ SimpleFBState *simplefb_init(PhysMemoryMap *map, uint64_t phys_addr,
+                              FBDevice *fb_dev, int width, int height);
++int simplefb_take_dirty(FBDevice *fb_dev);
+ void simplefb_refresh(FBDevice *fb_dev,
+                       SimpleFBDrawFunc *redraw_func, void *opaque,
+                       PhysMemoryRange *mem_range,
+diff --git a/simplefb.c b/simplefb.c
+index 5664cea..75f0a5c 100644
+--- a/simplefb.c
++++ b/simplefb.c
+@@ -103,6 +103,25 @@ static void simplefb_refresh1(FBDevice *fb_dev,
+                      s->fb_page_count);
+ }
+ 
++/* Return (and clear) whether any framebuffer page was written since the last
++   call. The AgentVM host uses this to fetch only changed frames. */
++int simplefb_take_dirty(FBDevice *fb_dev)
++{
++    SimpleFBState *s = fb_dev->device_opaque;
++    const uint32_t *dirty_bits;
++    int i, nwords;
++
++    if (!s)
++        return 0;
++    dirty_bits = phys_mem_get_dirty_bits(s->mem_range);
++    nwords = (s->fb_page_count + 31) >> 5;
++    for (i = 0; i < nwords; i++) {
++        if (dirty_bits[i] != 0)
++            return 1;
++    }
++    return 0;
++}
++
+ SimpleFBState *simplefb_init(PhysMemoryMap *map, uint64_t phys_addr,
+                              FBDevice *fb_dev, int width, int height)
+ {
+diff --git a/temu.c b/temu.c
+index 92cb196..5cf7087 100644
+--- a/temu.c
++++ b/temu.c
+@@ -1003,6 +1003,38 @@ static BOOL net_poll_cb(void *arg)
+ FSVirtFile *info;
+ int initialized = FALSE;
+ VirtMachine *s;
++
++/* Host framebuffer access (AgentVM). fb_dev is created by virt_machine_init
++   only when the config has a display0 device; these return 0 without one. */
++__attribute__((export_name("fb_ptr")))
++uint32_t fb_ptr(void)
++{
++    return (s && s->fb_dev) ? (uint32_t)(uintptr_t)s->fb_dev->fb_data : 0;
++}
++
++__attribute__((export_name("fb_width")))
++int fb_width(void)
++{
++    return (s && s->fb_dev) ? s->fb_dev->width : 0;
++}
++
++__attribute__((export_name("fb_height")))
++int fb_height(void)
++{
++    return (s && s->fb_dev) ? s->fb_dev->height : 0;
++}
++
++__attribute__((export_name("fb_stride")))
++int fb_stride(void)
++{
++    return (s && s->fb_dev) ? s->fb_dev->stride : 0;
++}
++
++__attribute__((export_name("fb_dirty")))
++int fb_dirty(void)
++{
++    return (s && s->fb_dev) ? simplefb_take_dirty(s->fb_dev) : 0;
++}
+ VirtMachineParams p_s, *p = &p_s;
+ 
+ void init_func_args(char *net)
