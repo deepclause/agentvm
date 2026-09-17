@@ -46,7 +46,19 @@ This is a monkey-patch of the `jiti` package, not of pi:
   and only adds `transform`. If esbuild is missing, or a caller already passed
   a transform, it defers to real jiti/Babel.
 
-Result: cold **27.9 s → 5.0 s**, warm unchanged. Babel is never loaded.
+Result: cold **27.9 s → 5.0 s**, warm unchanged.
+
+Caveat: esbuild cannot emit top-level `await` as CommonJS (it errors with
+`Top-level await is currently not supported with the "cjs" output format`).
+Extensions that use it (e.g. `pi-subagents`) therefore fall back to the real
+Babel transform, which is imported lazily on first failure — so the common path
+still never loads Babel. A TLA extension loads in ~14 s cold (Babel load +
+transform) and ~0.14 s once warm; without the fallback it fails outright and pi
+exits, which surfaced as pi-box reconnecting in a loop.
+
+`static.mjs` imports `jiti-real/dist/jiti.cjs` directly instead of
+`jiti-real/lib/jiti-static.mjs`, because the latter eagerly imports
+`dist/babel.cjs` (~4 s) even when no file needs it.
 
 ### B. Warm / persist the fsCache
 
@@ -78,8 +90,8 @@ makes this unnecessary for now, since riscv64 esbuild is available in-guest.
 
 Shipped (A): `image/pi-jiti-shim` + `Dockerfile.pi` swap + rebuilt default
 image. Guarded by `test/pi-jiti-shim.test.js` (resolves to the shim, loads a TS
-extension, asserts the cold load is far below the Babel path). Commit on
-`perf/pi-jiti-fast`.
+extension, loads a top-level-await extension through `jiti/static`, asserts the
+cold load is far below the Babel path). Commit on `perf/pi-jiti-fast`.
 
 Follow-ups if more is needed: warm the fsCache in the image (B), or the pi
 loader patch (C).
