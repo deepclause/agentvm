@@ -51,6 +51,23 @@ Known limits: full-frame reassembly on the host (rects are not delta-blitted
 into the app's surfaces), and input is delivered when the worker next reaches a
 WASI `poll` (a blocking non-polling guest would see latency).
 
+## Polish (M3)
+
+- **Zero-reassembly delta path.** `new AgentVM({ framebufferFull: false })`
+  delivers only damaged rects (no main-thread full-frame copy;
+  `getFramebuffer()` returns null). Apply them straight to a canvas/texture/
+  WebGL surface with the exported helper:
+  ```js
+  const { AgentVM, blitFrame } = require('deepclause-agentvm');
+  const vm = new AgentVM({ framebufferFull: false });
+  const surface = new Uint8Array(width * height * 4);
+  vm.onFramebuffer((frame) => { blitFrame(surface, width * 4, frame); ctx.putImageData(new ImageData(new Uint8ClampedArray(surface.buffer), width, height), 0, 0); });
+  ```
+- **Lower input latency.** The worker now drains the input queue immediately
+after `waitForIO` returns (both the `poll_oneoff` sleep path and the blocking
+stdin read), instead of waiting for the next `poll`, so a `sendKey` is delivered
+to the guest on the same wake.
+
 ## What we already have
 
 TinyEMU is much closer than it looks:

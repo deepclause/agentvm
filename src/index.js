@@ -11,6 +11,27 @@ const { normalizeFirewall, matchFirewall, remoteMatches, isHostname, portMatches
 const GATEWAY_IP = '192.168.127.1';
 const GUEST_IP = '192.168.127.3';
 
+/**
+ * Blit a framebuffer frame's damaged rects into a caller-provided RGBA surface.
+ * This is the zero-reassembly path: pass `framebufferFull: false` to AgentVM and
+ * apply the deltas straight to your canvas/WebGL/texture buffer.
+ * @param {Uint8Array} target - surface bytes, length >= targetStride * height
+ * @param {number} targetStride - bytes per row of the target surface
+ * @param {{rects: Array<{x:number,y:number,w:number,h:number,data:Uint8Array}>}} frame
+ */
+function blitFrame(target, targetStride, frame) {
+    if (!frame || !frame.rects) return;
+    for (const r of frame.rects) {
+        const rowBytes = r.w * 4;
+        for (let j = 0; j < r.h; j++) {
+            target.set(
+                r.data.subarray(j * rowBytes, (j + 1) * rowBytes),
+                (r.y + j) * targetStride + r.x * 4
+            );
+        }
+    }
+}
+
 // Linux evdev keycodes for sendKey() names.
 const KEY_CODES = {
     esc: 1, escape: 1, '1': 2, '2': 3, '3': 4, '4': 5, '5': 6, '6': 7, '7': 8,
@@ -80,6 +101,9 @@ class AgentVM {
         // Virtual framebuffer (simplefb): the latest frame pushed by the worker.
         this.lastFrame = null;
         this.framebuffer = null;
+        // When false, damage rects are delivered but not reassembled into a
+        // full frame (no main-thread copy, getFramebuffer() returns null).
+        this.framebufferFull = options.framebufferFull !== false;
         this.framebufferCallbacks = new Set();
         this.destroyed = false;
         
@@ -1211,7 +1235,7 @@ class AgentVM {
      * @returns {{width:number,height:number,stride:number,data:Uint8Array}|null}
      */
     getFramebuffer() {
-        if (!this.lastFrame) return null;
+        if (!this.lastFrame || !this.lastFrame.data) return null;
         return {
             width: this.lastFrame.width,
             height: this.lastFrame.height,
@@ -1227,26 +1251,26 @@ class AgentVM {
      */
     _applyFrame(msg) {
         const { width, height, stride, rects } = msg;
-        if (!this.framebuffer || this.framebuffer.width !== width ||
-            this.framebuffer.height !== height || this.framebuffer.stride !== stride) {
-            this.framebuffer = { width, height, stride, data: new Uint8Array(stride * height) };
-        }
-        if (rects) {
-            for (const r of rects) {
-                const rowBytes = r.w * 4;
-                for (let j = 0; j < r.h; j++) {
-                    this.framebuffer.data.set(
-                        r.data.subarray(j * rowBytes, (j + 1) * rowBytes),
-                        (r.y + j) * stride + r.x * 4
-                    );
+        let fullData = null;
+        if (this.framebufferFull) {
+            if (!this.framebuffer || this.framebuffer.width !== width ||
+                this.framebuffer.height !== height || this.framebuffer.stride !== stride) {
+                this.framebuffer = { width, height, stride, data: new Uint8Array(stride * height) };
+            }
+            if (rects) {
+                for (const r of rects) {
+                    const rowBytes = r.w * 4;
+                    for (let j = 0; j < r.h; j++) {
+                        this.framebuffer.data.set(
+                            r.data.subarray(j * rowBytes, (j + 1) * rowBytes),
+                            (r.y + j) * stride + r.x * 4
+                        );
+                    }
                 }
             }
+            fullData = this.framebuffer.data;
         }
-        this.lastFrame = {
-            width, height, stride,
-            data: this.framebuffer.data,
-            rects: rects || null,
-        };
+        this.lastFrame = { width, height, stride, data: fullData, rects: rects || null };
         for (const cb of this.framebufferCallbacks) {
             try { cb(this.lastFrame); } catch (err) { console.warn('framebuffer callback error:', err.message); }
         }
@@ -1610,4 +1634,4 @@ class AgentVM {
     }
 }
 
-module.exports = { AgentVM };
+module.exports = { AgentVM, blitFrame };

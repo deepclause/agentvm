@@ -1260,7 +1260,7 @@ async function start() {
             if (localBuffer.length === 0) {
                  // Wait for stdin data using ring buffer
                  ringReader.waitForIO(-1); // Block until I/O ready
-                 
+                 drainInput();
                  const stdinData = ringReader.readStdin();
                  if (stdinData && stdinData.length > 0) {
                      localBuffer = stdinData;
@@ -1418,6 +1418,7 @@ async function start() {
             }
         }
         
+        drainInput();
         // 4. Populate Events
         let eventsWritten = 0;
         
