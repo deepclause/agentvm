@@ -75,10 +75,10 @@ index 46be473..57e2580 100644
  
  static void riscv_vm_send_key_event(VirtMachine *s1, BOOL is_down,
 diff --git a/virtio.c b/virtio.c
-index b6b5aab..feace24 100644
+index b6b5aab..cc09fe8 100644
 --- a/virtio.c
 +++ b/virtio.c
-@@ -2648,3 +2648,270 @@ VIRTIODevice *virtio_9p_init(VIRTIOBusDef *bus, FSDevice *fs,
+@@ -2648,3 +2648,296 @@ VIRTIODevice *virtio_9p_init(VIRTIOBusDef *bus, FSDevice *fs,
      return (VIRTIODevice *)s;
  }
  
@@ -186,6 +186,29 @@ index b6b5aab..feace24 100644
 +    info->channels_max = 2;
 +}
 +
++/* Complete all held TX messages for the (single) stream. The spec requires
++   this on RELEASE; the Linux driver waits for msg_empty and a leftover queue
++   wedges the stream until reboot. */
++static void virtio_snd_flush_pending(VIRTIOSndDevice *s)
++{
++    VIRTIODevice *dev = &s->common;
++
++    while (s->pending_count > 0) {
++        int slot = s->pending_head;
++        uint32_t st[2];
++
++        st[0] = VIRTIO_SND_S_OK;
++        st[1] = 0;
++        memcpy_to_queue(dev, VIRTIO_SND_VQ_TX, s->pending[slot].desc_idx, 0,
++                        st, 8);
++        virtio_consume_desc(dev, VIRTIO_SND_VQ_TX,
++                            s->pending[slot].desc_idx,
++                            s->pending[slot].write_size);
++        s->pending_head = (s->pending_head + 1) % 64;
++        s->pending_count--;
++    }
++}
++
 +static int virtio_snd_recv_request(VIRTIODevice *dev, int queue_idx,
 +                                   int desc_idx, int read_size, int write_size)
 +{
@@ -245,8 +268,11 @@ index b6b5aab..feace24 100644
 +            s->next_period_rtc = s->last_rtc + s->period_rtc;
 +            break;
 +        case VIRTIO_SND_R_PCM_STOP:
++            s->started &= ~1u;
++            break;
 +        case VIRTIO_SND_R_PCM_RELEASE:
 +            s->started &= ~1u;
++            virtio_snd_flush_pending(s);
 +            break;
 +        case VIRTIO_SND_R_JACK_INFO:
 +        case VIRTIO_SND_R_JACK_REMAP:

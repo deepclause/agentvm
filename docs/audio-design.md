@@ -14,6 +14,12 @@ the guest, Electron example). Capture (RX/mic) is not implemented.
   to the host via the `host_audio_write` import, and **paces TX-message
   completion** at the real period rate (the Linux driver immediately re-submits
   each completed message, so completing too early floods the host).
+- **`RELEASE` completes all pending I/O messages.** The spec requires it and the
+  Linux driver's `virtsnd_pcm_sync_stop` waits (`msg_timeout_ms`, default 1000)
+  for `msg_empty`. Without it the stream wedges: `failed to flush I/O queue`, then
+  every later `snd_pcm_open` returns `-ETIMEDOUT` until reboot (the driver calls
+  `sync_stop` from `virtsnd_pcm_open` too). `STOP` keeps pending messages
+  (pause/resume); only `RELEASE` flushes.
 - `image/build.sh` (`AUDIO=1`, default) enables `SOUND`/`SND`/`SND_VIRTIO` and
   emits `audio_device: "virtio"`; the image gains `alsa-utils`/`alsa-lib`.
 - `src/index.js` creates `/dev/snd/*` from `/sys/class/sound/*/dev` at boot and

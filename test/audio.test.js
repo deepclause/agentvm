@@ -52,6 +52,13 @@ async function test() {
         check('getAudioFormat matches', af && af.sampleRate === 48000 && af.channels === 2, JSON.stringify(af));
         check('PCM is S16_LE (non-empty, even length)', bytes % 4 === 0 && sample && sample.length > 0, `bytes=${bytes}`);
         console.log(`      (aplay took ${ms} ms for ~200 ms of audio)`);
+
+        // Regression: closing a stream releases it; the device must complete
+        // pending TX on RELEASE or the next open times out ("failed to flush").
+        const r2 = await withTimeout(vm.exec('aplay -D plughw:0,1 /tmp/tone.wav 2>&1'), 90000);
+        check('aplay reopens after release (no wedge)', r2.exitCode === 0, JSON.stringify(r2.stdout.trim().slice(0, 80)));
+        const dm = await withTimeout(vm.exec('dmesg 2>/dev/null | grep -c "failed to flush" || true'), 20000);
+        check('no "failed to flush" in dmesg', dm.stdout.trim() === '0', dm.stdout.trim());
     } catch (e) {
         console.error('TEST ERROR:', e);
         failures++;
