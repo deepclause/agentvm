@@ -32,6 +32,24 @@ function blitFrame(target, targetStride, frame) {
     }
 }
 
+// The container /dev is a tmpfs populated without udev, so the framebuffer,
+// input and sound device nodes must be created by hand. Harmless when the image
+// has none.
+const DEVICE_NODES_CMD =
+    'mknod /dev/fb0 c 29 0 2>/dev/null; ' +
+    'mkdir -p /dev/input; ' +
+    'for d in /sys/class/input/event*; do [ -e "$d/dev" ] || continue; ' +
+    'v=$(cat "$d/dev"); mka=${v%:*}; min=${v##*:}; ' +
+    'mknod "/dev/input/${d##*/}" c "$mka" "$min" 2>/dev/null; done; ' +
+    'mkdir -p /dev/snd; ' +
+    'for d in /sys/class/sound/*; do [ -e "$d/dev" ] || continue; ' +
+    'v=$(cat "$d/dev"); mka=${v%:*}; min=${v##*:}; ' +
+    'mknod "/dev/snd/${d##*/}" c "$mka" "$min" 2>/dev/null; done';
+// busybox ash queries the cursor position once its prompt is interactive; we
+// answer it so the shell finishes that read before we type anything else.
+const SHELL_READY_MARKER = '\x1b[6n';
+const DSR_RESPONSE = '\x1b[1;1R';
+
 // Linux evdev keycodes for sendKey() names.
 const KEY_CODES = {
     esc: 1, escape: 1, '1': 2, '2': 3, '3': 4, '4': 5, '5': 6, '6': 7, '7': 8,
@@ -98,6 +116,10 @@ class AgentVM {
         this.pendingInternal = null; // internal shell command output capture (both modes)
         this.pendingBootstrap = null; // pivot/chroot bootstrap output capture
         this.isReady = false;
+        // Interactive consoles create the framebuffer/input nodes themselves.
+        this._devicesCreated = false;
+        this._virtualDevicesTimer = null;
+        this._deviceScan = '';
         // Virtual framebuffer (simplefb): the latest frame pushed by the worker.
         this.lastFrame = null;
         this.framebuffer = null;
@@ -338,22 +360,18 @@ class AgentVM {
             }
         }
 
-        if (this.interactive) return;
+        if (this.interactive) {
+            // The exec-mode setup below is skipped for interactive consoles, but
+            // the device nodes are still needed (framebuffer, input). Create them
+            // once the shell answers with its cursor-position query; fall back to
+            // a plain write if the marker never shows up.
+            this._virtualDevicesTimer = setTimeout(() => this._createVirtualDevicesInteractive(), 5000);
+            return;
+        }
         // The container /dev is a tmpfs populated without udev; create the
         // optional simple-framebuffer node (major 29, minor 0) and the
         // virtio-input evdev nodes. Harmless when the image has neither.
-        await this.exec(
-            'mknod /dev/fb0 c 29 0 2>/dev/null; ' +
-            'mkdir -p /dev/input; ' +
-            'for d in /sys/class/input/event*; do [ -e "$d/dev" ] || continue; ' +
-            'v=$(cat "$d/dev"); mka=${v%:*}; min=${v##*:}; ' +
-            'mknod "/dev/input/${d##*/}" c "$mka" "$min" 2>/dev/null; done; ' +
-            'mkdir -p /dev/snd; ' +
-            'for d in /sys/class/sound/*; do [ -e "$d/dev" ] || continue; ' +
-            'v=$(cat "$d/dev"); mka=${v%:*}; min=${v##*:}; ' +
-            'mknod "/dev/snd/${d##*/}" c "$mka" "$min" 2>/dev/null; done; ' +
-            "stty -echo; export PS1=''"
-        );
+        await this.exec(`${DEVICE_NODES_CMD}; stty -echo; export PS1=''`);
 
         // Auto-setup network if the VM has a NIC and the runtime network
         // toggle is currently enabled.
@@ -413,6 +431,22 @@ class AgentVM {
      * @returns {Promise<{stdout: string, stderr: string, exitCode: number}>}
      * @private
      */
+    /**
+     * Create the guest's framebuffer/input device nodes from an interactive
+     * console: answer the shell's cursor-position query, then type the mknod
+     * commands. Runs at most once.
+     * @private
+     */
+    _createVirtualDevicesInteractive() {
+        if (this._devicesCreated) return;
+        this._devicesCreated = true;
+        if (this._virtualDevicesTimer) {
+            clearTimeout(this._virtualDevicesTimer);
+            this._virtualDevicesTimer = null;
+        }
+        this.writeToStdin(`${DSR_RESPONSE}\n${DEVICE_NODES_CMD}\n`).catch(() => {});
+    }
+
     _execInternal(command, timeoutMs = 30000) {
         const id = randomUUID();
         const marker = `__AGENTVM_INTERNAL:${id}`;
@@ -679,7 +713,11 @@ class AgentVM {
         }
 
         this.destroyed = true;
-        
+        if (this._virtualDevicesTimer) {
+            clearTimeout(this._virtualDevicesTimer);
+            this._virtualDevicesTimer = null;
+        }
+
         // Close all port-forward listeners
         for (const forward of this.portForwards.values()) {
             if (forward.server) {
@@ -1596,6 +1634,17 @@ class AgentVM {
                 bootstrap.stderrStr += text;
             }
             return;
+        }
+
+        // Interactive consoles never run the exec-mode device setup, so create
+        // the framebuffer/input nodes as soon as the shell is ready.
+        if (this.interactive && !this._devicesCreated && type === 'stdout') {
+            this._deviceScan = (this._deviceScan || '') + text;
+            if (this._deviceScan.includes(SHELL_READY_MARKER)) {
+                this._createVirtualDevicesInteractive();
+            } else if (this._deviceScan.length > 64) {
+                this._deviceScan = this._deviceScan.slice(-64);
+            }
         }
 
         // Internal commands run in both exec and interactive modes, so
