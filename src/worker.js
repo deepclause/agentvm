@@ -112,6 +112,17 @@ function postFramesIfDue() {
     );
 }
 
+// host_audio_write import: PCM produced by the guest's virtio-snd device.
+// Copy it out of WASM memory and hand it to the main thread / embedding app.
+function hostAudioWrite(sampleRate, channels, ptr, len) {
+    if (!instance || len <= 0) return;
+    const data = new Uint8Array(instance.exports.memory.buffer, ptr, len).slice();
+    parentPort.postMessage(
+        { type: 'audio', sampleRate, channels, format: 's16le', data },
+        [data.buffer]
+    );
+}
+
 // Drain host input events (sendKey/sendMouse) and feed the virtio-input devices.
 function drainInput() {
     if (!instance || !instance.exports.input_key) return;
@@ -1660,6 +1671,7 @@ async function start() {
             // import the old JS hook. Unused by the current image.
             jit_try_block: () => 0,
             host_fb_draw: hostFbDraw,
+            host_audio_write: hostAudioWrite,
         },
         wasi_snapshot_preview1: {
             ...wasiImport,

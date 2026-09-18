@@ -1,0 +1,11 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>AgentVM audio</title></head>
+<body style="font: 14px system-ui; margin: 0; padding: 12px; background: #12141f; color: #ddd">
+  <h3>AgentVM → Electron audio</h3>
+  <p>Play a WAV in the guest, hear it here. Try: <code>aplay -D plughw:0,1 /tmp/tone.wav</code></p>
+  <p><input id="cmd" size="60" value="aplay -D plughw:0,1 /tmp/tone.wav"> <button id="run">Run in VM</button></p>
+  <pre id="log" style="height: 420px; overflow: auto; background: #0b0d15; padding: 10px; border-radius: 6px"></pre>
+  <script src="renderer.js"></script>
+</body>
+</html>

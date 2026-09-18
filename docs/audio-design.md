@@ -3,18 +3,36 @@
 Goal: code inside the guest (games, music, notifications) can play sound, and an
 app embedding AgentVM can hear it (and optionally feed a microphone in).
 
-Status: design. Nothing implemented.
+Status: **implemented** (virtio-snd playback, `onAudio`/`getAudioFormat`, ALSA in
+the guest, Electron example). Capture (RX/mic) is not implemented.
 
-## Current state
+## Implemented
 
-- **TinyEMU has no audio device at all.** The WASI build's SDL path has no
-  `SDL_OpenAudio` either; the only "audio" hit is unrelated x86 machine code.
-- The guest kernel is built with **`CONFIG_SOUND` off**, so there is no ALSA
-  subsystem, no `/dev/snd/*`, and no card.
-- The image ships no ALSA packages (`alsa-lib`, `alsa-utils`).
+- `image/patches/tinyemu-virtio-snd.patch` adds a virtio-snd device (id 25, one
+  playback stream, S16_LE 48 kHz stereo). It answers the control queue
+  (`PCM_INFO`/`SET_PARAMS`/`PREPARE`/`START`/`STOP`/`RELEASE`), copies TX frames
+  to the host via the `host_audio_write` import, and **paces TX-message
+  completion** at the real period rate (the Linux driver immediately re-submits
+  each completed message, so completing too early floods the host).
+- `image/build.sh` (`AUDIO=1`, default) enables `SOUND`/`SND`/`SND_VIRTIO` and
+  emits `audio_device: "virtio"`; the image gains `alsa-utils`/`alsa-lib`.
+- `src/index.js` creates `/dev/snd/*` from `/sys/class/sound/*/dev` at boot and
+  exposes `onAudio(cb)` / `getAudioFormat()`.
+- `src/worker.js` handles `host_audio_write` and posts
+  `{ sampleRate, channels, format:'s16le', data }`.
+- `test/audio.test.js` and `examples/electron/` (Web Audio playback).
 
-So this is greenfield, like the framebuffer was — but unlike simplefb there is
-no existing device to lean on.
+```js
+vm.onAudio(({ sampleRate, channels, data }) => { /* S16_LE interleaved */ });
+```
+
+Guest: `aplay -l` shows `card 0: VirtIO SoundCard, device 1`; play with
+`aplay -D plughw:0,1 file.wav`.
+
+## Original design notes
+
+Goal: code inside the guest (games, music, notifications) can play sound, and an
+app embedding AgentVM can hear it (and optionally feed a microphone in).
 
 ## Options
 

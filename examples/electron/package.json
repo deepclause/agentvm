@@ -1,0 +1,7 @@
+{
+  "name": "agentvm-electron-audio-example",
+  "private": true,
+  "main": "main.js",
+  "scripts": { "start": "electron ." },
+  "devDependencies": { "electron": "^33.0.0" }
+}

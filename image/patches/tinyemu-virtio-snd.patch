@@ -1,0 +1,366 @@
+diff --git a/machine.c b/machine.c
+index 09c7940..1173fb2 100644
+--- a/machine.c
++++ b/machine.c
+@@ -373,6 +373,10 @@ static int virt_machine_parse_config(VirtMachineParams *p,
+         goto tag_fail;
+     p->input_device = strdup_null(str);
+ 
++    if (vm_get_str_opt(cfg, "audio_device", &str) < 0)
++        goto tag_fail;
++    p->audio_device = strdup_null(str);
++
+     if (vm_get_str_opt(cfg, "accel", &str) < 0)
+         goto tag_fail;
+     if (str) {
+@@ -619,6 +623,7 @@ void virt_machine_free_config(VirtMachineParams *p)
+         free(p->tab_eth[i].ifname);
+     }
+     free(p->input_device);
++    free(p->audio_device);
+     free(p->display_device);
+     free(p->cfg_filename);
+ }
+diff --git a/machine.h b/machine.h
+index cb630b5..ad4028f 100644
+--- a/machine.h
++++ b/machine.h
+@@ -102,6 +102,7 @@ typedef struct {
+     char *cmdline; /* bios or kernel command line */
+     BOOL accel_enable; /* enable acceleration (KVM) */
+     char *input_device; /* NULL means no input */
++    char *audio_device; /* NULL means no audio */
+     
+     /* kernel, bios and other auxiliary files */
+     VMFileEntry files[VM_FILE_COUNT];
+diff --git a/riscv_machine.c b/riscv_machine.c
+index 46be473..57e2580 100644
+--- a/riscv_machine.c
++++ b/riscv_machine.c
+@@ -58,6 +58,7 @@ typedef struct RISCVMachine {
+ 
+     VIRTIODevice *keyboard_dev;
+     VIRTIODevice *mouse_dev;
++    VIRTIODevice *snd_dev;
+ 
+     int virtio_count;
+ } RISCVMachine;
+@@ -981,6 +982,19 @@ static VirtMachine *riscv_machine_init(const VirtMachineParams *p)
+             exit(1);
+         }
+     }
++
++    if (p->audio_device) {
++        if (!strcmp(p->audio_device, "virtio")) {
++            vbus->irq = &s->plic_irq[irq_num];
++            s->snd_dev = virtio_snd_init(vbus);
++            vbus->addr += VIRTIO_SIZE;
++            irq_num++;
++            s->virtio_count++;
++        } else {
++            vm_error("unsupported audio device: %s\n", p->audio_device);
++            exit(1);
++        }
++    }
+     
+     if (!p->files[VM_FILE_BIOS].buf) {
+         vm_error("No bios found");
+@@ -1032,6 +1046,8 @@ static void riscv_machine_interp(VirtMachine *s1, int max_exec_cycle)
+ {
+     RISCVMachine *s = (RISCVMachine *)s1;
+     riscv_cpu_interp(s->cpu_state, max_exec_cycle);
++    if (s->snd_dev)
++        virtio_snd_tick(s->snd_dev, rtc_get_time(s));
+ }
+ 
+ static void riscv_vm_send_key_event(VirtMachine *s1, BOOL is_down,
+diff --git a/virtio.c b/virtio.c
+index b6b5aab..feace24 100644
+--- a/virtio.c
++++ b/virtio.c
+@@ -2648,3 +2648,270 @@ VIRTIODevice *virtio_9p_init(VIRTIOBusDef *bus, FSDevice *fs,
+     return (VIRTIODevice *)s;
+ }
+ 
++
++/*********************************************************************/
++/* virtio sound device (single playback stream) */
++
++#define VIRTIO_SND_RTC_FREQ 10000000
++
++enum {
++    VIRTIO_SND_VQ_CONTROL = 0,
++    VIRTIO_SND_VQ_EVENT,
++    VIRTIO_SND_VQ_TX,
++    VIRTIO_SND_VQ_RX,
++};
++
++#define VIRTIO_SND_D_OUTPUT          0
++#define VIRTIO_SND_D_INPUT           1
++#define VIRTIO_SND_R_JACK_INFO       1
++#define VIRTIO_SND_R_JACK_REMAP      2
++#define VIRTIO_SND_R_PCM_INFO        0x0100
++#define VIRTIO_SND_R_PCM_SET_PARAMS  0x0101
++#define VIRTIO_SND_R_PCM_PREPARE     0x0102
++#define VIRTIO_SND_R_PCM_RELEASE     0x0103
++#define VIRTIO_SND_R_PCM_START       0x0104
++#define VIRTIO_SND_R_PCM_STOP        0x0105
++#define VIRTIO_SND_R_CHMAP_INFO      0x0200
++#define VIRTIO_SND_EVT_PCM_PERIOD_ELAPSED 0x1100
++#define VIRTIO_SND_S_OK       0x8000
++#define VIRTIO_SND_S_BAD_MSG  0x8001
++#define VIRTIO_SND_S_NOT_SUPP 0x8002
++#define VIRTIO_SND_S_IO_ERR   0x8003
++#define VIRTIO_SND_PCM_FMT_S16     5
++#define VIRTIO_SND_PCM_RATE_44100  6
++#define VIRTIO_SND_PCM_RATE_48000  7
++
++typedef struct {
++    uint32_t hda_fn_nid;
++    uint32_t features;
++    uint64_t formats;
++    uint64_t rates;
++    uint8_t direction;
++    uint8_t channels_min;
++    uint8_t channels_max;
++    uint8_t padding[5];
++} VIRTIOSndPCMInfo;
++
++typedef struct {
++    VIRTIODevice common;
++    uint32_t jacks, streams, chmaps;
++    uint32_t started;        /* bit 0: output stream running */
++    uint32_t buffer_bytes;
++    uint32_t period_bytes;
++    uint64_t period_rtc;     /* period duration in RTC ticks */
++    uint32_t rate;
++    uint8_t channels;
++    uint8_t format;
++    uint64_t periods_written;
++    uint64_t periods_played;
++    uint64_t next_period_rtc;
++    uint64_t last_rtc;
++    /* TX descriptors held until their period is "played". */
++    struct { int desc_idx; int write_size; } pending[64];
++    int pending_head;
++    int pending_count;
++} VIRTIOSndDevice;
++
++/* Host sink: interleaved S16_LE PCM at ptr (guest/WASM memory). */
++__attribute__((import_module("env"), import_name("host_audio_write")))
++void host_audio_write(uint32_t sample_rate, uint32_t channels,
++                      uint32_t ptr, uint32_t len);
++
++static void __attribute__((unused)) virtio_snd_send_event(VIRTIOSndDevice *s, uint32_t code,
++                                  uint32_t data)
++{
++    VIRTIODevice *dev = &s->common;
++    QueueState *qs = &dev->queue[VIRTIO_SND_VQ_EVENT];
++    uint32_t avail_idx, buf[2];
++    int desc_idx;
++
++    if (!qs->ready)
++        return;
++    avail_idx = virtio_read16(dev, qs->avail_addr + 2);
++    if (qs->last_avail_idx == avail_idx)
++        return;
++    desc_idx = virtio_read16(dev, qs->avail_addr + 4 +
++                             (qs->last_avail_idx & (qs->num - 1)) * 2);
++    buf[0] = code;
++    buf[1] = data;
++    memcpy_to_queue(dev, VIRTIO_SND_VQ_EVENT, desc_idx, 0, buf, 8);
++    virtio_consume_desc(dev, VIRTIO_SND_VQ_EVENT, desc_idx, 8);
++    qs->last_avail_idx++;
++}
++
++static void virtio_snd_fill_pcm_info(VIRTIOSndDevice *s, uint32_t sid,
++                                     VIRTIOSndPCMInfo *info)
++{
++    memset(info, 0, sizeof(*info));
++    info->hda_fn_nid = 1;
++    info->formats = 1ULL << VIRTIO_SND_PCM_FMT_S16;
++    info->rates = (1ULL << VIRTIO_SND_PCM_RATE_44100) |
++                  (1ULL << VIRTIO_SND_PCM_RATE_48000);
++    info->direction = (sid == 0) ? VIRTIO_SND_D_OUTPUT : VIRTIO_SND_D_INPUT;
++    info->channels_min = 1;
++    info->channels_max = 2;
++}
++
++static int virtio_snd_recv_request(VIRTIODevice *dev, int queue_idx,
++                                   int desc_idx, int read_size, int write_size)
++{
++    VIRTIOSndDevice *s = (VIRTIOSndDevice *)dev;
++
++    if (queue_idx == VIRTIO_SND_VQ_CONTROL) {
++        uint32_t req[4];
++        uint32_t status = VIRTIO_SND_S_OK;
++
++        if (read_size < 4)
++            return -1;
++        memcpy_from_queue(dev, req, queue_idx, desc_idx, 0, 4);
++        switch (req[0]) {
++        case VIRTIO_SND_R_PCM_INFO: {
++            uint32_t i, start, count, size;
++            if (read_size < 16)
++                break;
++            memcpy_from_queue(dev, req, queue_idx, desc_idx, 0, 16);
++            start = req[1];
++            count = req[2];
++            size = req[3];
++            for (i = 0; i < count; i++) {
++                VIRTIOSndPCMInfo info;
++                uint32_t sid = start + i;
++                if (sid >= s->streams)
++                    break;
++                virtio_snd_fill_pcm_info(s, sid, &info);
++                memcpy_to_queue(dev, queue_idx, desc_idx, 4 + i * size,
++                                &info, min_int(size, sizeof(info)));
++            }
++            break;
++        }
++        case VIRTIO_SND_R_PCM_SET_PARAMS: {
++            /* struct virtio_snd_pcm_set_params: code, sid, buffer, period,
++               features (5*4) + channels, format, rate, pad (4) = 24 */
++            uint8_t p[24];
++            if (read_size >= 24) {
++                memcpy_from_queue(dev, p, queue_idx, desc_idx, 0, 24);
++                s->buffer_bytes = get_le32(p + 8);
++                s->period_bytes = get_le32(p + 12);
++                s->channels = p[20];
++                s->format = p[21];
++                s->rate = (p[22] == VIRTIO_SND_PCM_RATE_44100) ? 44100 : 48000;
++                if (!s->channels)
++                    s->channels = 2;
++                if (s->period_bytes)
++                    s->period_rtc = (uint64_t)s->period_bytes * VIRTIO_SND_RTC_FREQ /
++                                    ((uint64_t)s->rate * s->channels * 2);
++            }
++            break;
++        }
++        case VIRTIO_SND_R_PCM_PREPARE:
++            break;
++        case VIRTIO_SND_R_PCM_START:
++            s->started |= 1;
++            s->periods_played = s->periods_written;
++            s->next_period_rtc = s->last_rtc + s->period_rtc;
++            break;
++        case VIRTIO_SND_R_PCM_STOP:
++        case VIRTIO_SND_R_PCM_RELEASE:
++            s->started &= ~1u;
++            break;
++        case VIRTIO_SND_R_JACK_INFO:
++        case VIRTIO_SND_R_JACK_REMAP:
++        case VIRTIO_SND_R_CHMAP_INFO:
++            break;
++        default:
++            status = VIRTIO_SND_S_NOT_SUPP;
++            break;
++        }
++        memcpy_to_queue(dev, queue_idx, desc_idx, 0, &status, 4);
++        virtio_consume_desc(dev, queue_idx, desc_idx, write_size);
++        return 0;
++    }
++
++    if (queue_idx == VIRTIO_SND_VQ_TX) {
++        uint32_t sid = 0, st[2];
++        int data_len;
++
++        if (read_size < 4)
++            return -1;
++        memcpy_from_queue(dev, &sid, queue_idx, desc_idx, 0, 4);
++        data_len = read_size - 4;
++        if (data_len > 0) {
++            uint8_t *tmp = malloc(data_len);
++            if (tmp) {
++                memcpy_from_queue(dev, tmp, queue_idx, desc_idx, 4, data_len);
++                host_audio_write(s->rate ? s->rate : 48000,
++                                 s->channels ? s->channels : 2,
++                                 (uint32_t)(uintptr_t)tmp, data_len);
++                free(tmp);
++            }
++        }
++        if (s->pending_count < 64) {
++            int slot = (s->pending_head + s->pending_count) % 64;
++            s->pending[slot].desc_idx = desc_idx;
++            s->pending[slot].write_size = write_size;
++            s->pending_count++;
++        } else {
++            st[0] = VIRTIO_SND_S_OK;
++            st[1] = 0;
++            memcpy_to_queue(dev, queue_idx, desc_idx, 0, st, 8);
++            virtio_consume_desc(dev, queue_idx, desc_idx, write_size);
++        }
++        (void)sid;
++        return 0;
++    }
++
++    /* EVENT / RX are device->guest queues (manual_recv). */
++    return 0;
++}
++
++VIRTIODevice *virtio_snd_init(VIRTIOBusDef *bus)
++{
++    VIRTIOSndDevice *s;
++
++    s = mallocz(sizeof(*s));
++    virtio_init(&s->common, bus, 25, 12, virtio_snd_recv_request);
++    s->common.queue[VIRTIO_SND_VQ_EVENT].manual_recv = TRUE;
++    s->common.queue[VIRTIO_SND_VQ_RX].manual_recv = TRUE;
++    s->jacks = 0;
++    s->streams = 1;
++    s->chmaps = 0;
++    s->rate = 48000;
++    s->channels = 2;
++    s->format = VIRTIO_SND_PCM_FMT_S16;
++    s->period_bytes = 4096;
++    s->period_rtc = (uint64_t)s->period_bytes * VIRTIO_SND_RTC_FREQ /
++                    (48000ULL * 2 * 2);
++    put_le32(s->common.config_space, s->jacks);
++    put_le32(s->common.config_space + 4, s->streams);
++    put_le32(s->common.config_space + 8, s->chmaps);
++    return (VIRTIODevice *)s;
++}
++
++/* Pace PCM_PERIOD_ELAPSED events to real time (now_rtc from the guest RTC). */
++void virtio_snd_tick(VIRTIODevice *dev, uint64_t now_rtc)
++{
++    VIRTIOSndDevice *s = (VIRTIOSndDevice *)dev;
++
++    s->last_rtc = now_rtc;
++    if (!(s->started & 1) || !s->period_rtc)
++        return;
++
++    /* Completing a TX message is what advances the guest's ALSA pointer and
++       makes the driver re-submit the period, so playback is paced here: at
++       most one held period per period_rtc. */
++    while (s->pending_count > 0 && now_rtc >= s->next_period_rtc) {
++        int slot = s->pending_head;
++        uint32_t st[2];
++        st[0] = VIRTIO_SND_S_OK;
++        st[1] = (uint32_t)(s->pending_count * s->period_bytes);
++        memcpy_to_queue(dev, VIRTIO_SND_VQ_TX, s->pending[slot].desc_idx, 0,
++                        st, 8);
++        virtio_consume_desc(dev, VIRTIO_SND_VQ_TX, s->pending[slot].desc_idx,
++                            s->pending[slot].write_size);
++        s->pending_head = (s->pending_head + 1) % 64;
++        s->pending_count--;
++        s->next_period_rtc += s->period_rtc;
++    }
++    if (s->pending_count == 0 && s->next_period_rtc < now_rtc)
++        s->next_period_rtc = now_rtc + s->period_rtc;
++}
+diff --git a/virtio.h b/virtio.h
+index 0664b95..faeb2bc 100644
+--- a/virtio.h
++++ b/virtio.h
+@@ -137,6 +137,10 @@ int virtio_input_send_mouse_event(VIRTIODevice *s, int dx, int dy, int dz,
+ 
+ VIRTIODevice *virtio_input_init(VIRTIOBusDef *bus, VirtioInputTypeEnum type);
+ 
++/* sound device */
++VIRTIODevice *virtio_snd_init(VIRTIOBusDef *bus);
++void virtio_snd_tick(VIRTIODevice *dev, uint64_t now_rtc);
++
+ /* 9p filesystem device */
+ 
+ #include "fs.h"

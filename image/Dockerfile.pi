@@ -13,6 +13,7 @@ RUN apk add --no-cache \
         coreutils \
         tmux \
         e2fsprogs \
+        alsa-utils alsa-lib \
         jansson fzf
 
 # Build hax (https://usehax.dev) from source; there are no riscv64 binaries.

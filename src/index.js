@@ -105,6 +105,9 @@ class AgentVM {
         // full frame (no main-thread copy, getFramebuffer() returns null).
         this.framebufferFull = options.framebufferFull !== false;
         this.framebufferCallbacks = new Set();
+        // Audio (virtio-snd): PCM delivered by the worker.
+        this.audioCallbacks = new Set();
+        this.audioFormat = null;
         this.destroyed = false;
         
         // Callbacks for raw/interactive mode
@@ -275,6 +278,11 @@ class AgentVM {
                     this.handleOutput('stderr', msg.data);
                 } else if (msg.type === 'framebuffer') {
                     this._applyFrame(msg);
+                } else if (msg.type === 'audio') {
+                    this.audioFormat = { sampleRate: msg.sampleRate, channels: msg.channels, format: msg.format };
+                    for (const cb of this.audioCallbacks) {
+                        try { cb(msg); } catch (err) { console.warn('audio callback error:', err.message); }
+                    }
                 } else if (msg.type === 'debug') {
                     // Worker debug messages
                     if (this.debug) console.log('[Worker]', msg.msg);
@@ -340,6 +348,10 @@ class AgentVM {
             'for d in /sys/class/input/event*; do [ -e "$d/dev" ] || continue; ' +
             'v=$(cat "$d/dev"); mka=${v%:*}; min=${v##*:}; ' +
             'mknod "/dev/input/${d##*/}" c "$mka" "$min" 2>/dev/null; done; ' +
+            'mkdir -p /dev/snd; ' +
+            'for d in /sys/class/sound/*; do [ -e "$d/dev" ] || continue; ' +
+            'v=$(cat "$d/dev"); mka=${v%:*}; min=${v##*:}; ' +
+            'mknod "/dev/snd/${d##*/}" c "$mka" "$min" 2>/dev/null; done; ' +
             "stty -echo; export PS1=''"
         );
 
@@ -1306,6 +1318,25 @@ class AgentVM {
         buf.writeInt32LE(y | 0, 5);
         buf.writeInt32LE(buttons | 0, 9);
         if (!this.ringWriter.writeInput(buf)) throw new Error('input queue full');
+    }
+
+    /**
+     * Subscribe to PCM produced by the guest's virtio-snd device. The callback
+     * receives { sampleRate, channels, format: 's16le', data: Uint8Array }.
+     * Returns an unsubscribe function.
+     * @param {(audio: {sampleRate:number,channels:number,format:string,data:Uint8Array}) => void} callback
+     */
+    onAudio(callback) {
+        this.audioCallbacks.add(callback);
+        return () => this.audioCallbacks.delete(callback);
+    }
+
+    /**
+     * The negotiated audio format ({ sampleRate, channels, format }), or null
+     * until the guest first plays something.
+     */
+    getAudioFormat() {
+        return this.audioFormat ? { ...this.audioFormat } : null;
     }
 
     /**
