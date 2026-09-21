@@ -1,6 +1,8 @@
 # DeepClause - AgentVM
 
-AgentVM is a lightweight Node.js library that runs a WASM-based Linux virtual machine (Alpine Linux) in a worker thread. It allows you to execute shell commands and capture their output, making it an ideal sandbox for AI agents. It is developed as part of the [DeepClause project](https://github.com/deepclause/deepclause-desktop). 
+News (09/2026): Network more stable now, framebuffer and sound support working, and [it runs Doom!](https://deepclause.substack.com/p/running-doom-on-risk-v-linux-inside). 
+
+AgentVM is a lightweight Node.js library that runs a WASM-based Linux virtual machine (Alpine Linux) in a worker thread. It allows you to execute shell commands and capture their output, making it an ideal sandbox for AI agents. It is developed as part of the [DeepClause project](https://github.com/deepclause/deepclause-sdk). 
 
 
 The virtual machine was created using the [container2wasm (c2w)](https://github.com/container2wasm/container2wasm) project.
