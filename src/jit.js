@@ -2,6 +2,16 @@
 
 const { decodeRiscV } = require('./riscv-c');
 
+// High bit of the i64 returned by a direct-TLB block means "bail at this PC".
+// The low 63 bits are the guest PC to resume the interpreter at.
+const BAIL_BIT = -(1n << 63n);
+const BAIL_MASK = (1n << 63n) - 1n;
+
+// Maximum iterations a self-loop block executes per host call. This amortizes
+// the JavaScript dispatch across many guest iterations; the interpreter is
+// re-entered periodically so timers and interrupts still fire.
+const LOOP_BUDGET = Number(process.env.AGENTVM_JIT_LOOP_BUDGET || 64);
+
 // Minimal RISC-V (RV64) integer block translator -> WebAssembly.
 //
 // This is the first JIT milestone. It translates straight-line sequences of
@@ -68,18 +78,51 @@ function sext(value, bits) {
     return (value << shift) >> shift;
 }
 
+// Branch/jump offsets, shared by the translator and the trace decoder.
+function branchOffset(insn) {
+    return sext(
+        (((insn >>> 31) & 1) << 12) | (((insn >>> 7) & 1) << 11) |
+        (((insn >>> 25) & 0x3f) << 5) | (((insn >>> 8) & 0xf) << 1), 13);
+}
+
+function jalOffset(insn) {
+    return sext(
+        (((insn >>> 31) & 1) << 20) | (((insn >>> 12) & 0xff) << 12) |
+        (((insn >>> 20) & 1) << 11) | (((insn >>> 21) & 0x3ff) << 1), 21);
+}
+
 class RiscVBlockJit {
     constructor(instructions, sizes = null, options = {}) {
         this.instructions = instructions;
         this.sizes = sizes || instructions.map(() => 4);
         this.externalMemory = !!options.externalMemory;
+        // directTlb: import the emulator's linear memory and do guest accesses
+        // by checking TinyEMU's TLB in generated WASM. This avoids a JS
+        // callback per load/store, which is what makes the JS-callback mode
+        // unusable. Params: (regs, tlbRead, pc:i64, statePtr, tlbWrite).
+        this.directTlb = !!options.directTlb;
+        // registerLocals: keep guest registers in WASM locals within the block
+        // instead of reloading them from memory for every instruction. This is
+        // what lets the generated code approach the interpreter's optimized
+        // register allocation.
+        this.registerLocals = !!options.registerLocals;
+        // Per-instruction guest offsets from the trace start. Needed when call
+        // inlining makes the instruction stream non-contiguous.
+        this.offsets = options.offsets || null;
+        // Set of instruction indices that are inlined calls (emit only the link).
+        this.inline = options.inline || null;
     }
 
     _typeSection() {
         const parts = [];
-        const runParams = this.externalMemory
-            ? [0x7f, 0x7f, 0x7e, 0x7f] // regs, mem, pc (i64), statePtr
-            : [0x7f, 0x7f, 0x7e];
+        let runParams;
+        if (this.directTlb) {
+            runParams = [0x7f, 0x7f, 0x7e, 0x7f, 0x7f]; // regs, tlbRead, pc(i64), statePtr, tlbWrite
+        } else if (this.externalMemory) {
+            runParams = [0x7f, 0x7f, 0x7e, 0x7f]; // regs, mem, pc(i64), statePtr
+        } else {
+            runParams = [0x7f, 0x7f, 0x7e];
+        }
         parts.push(Buffer.concat([
             Buffer.from([0x60]), u32leb(runParams.length), Buffer.from(runParams),
             u32leb(1), Buffer.from([0x7e]),
@@ -100,34 +143,22 @@ class RiscVBlockJit {
     }
 
     _importSection() {
-        if (!this.externalMemory) {
-            return section(2, Buffer.concat([
-                u32leb(1),
-                stringBytes('env'),
-                stringBytes('memory'),
-                Buffer.from([0x02, 0x00, 0x01]), // memory, min 1 page
-            ]));
-        }
         const envMemory = Buffer.concat([
             stringBytes('env'),
             stringBytes('memory'),
-            Buffer.from([0x02, 0x00, 0x01]),
+            Buffer.from([0x02, 0x00, 0x01]), // memory, min 1 page
         ]);
-        const envLoad = Buffer.concat([
-            stringBytes('env'),
-            stringBytes('load'),
-            Buffer.from([0x00]), u32leb(1),
-        ]);
-        const envStore = Buffer.concat([
-            stringBytes('env'),
-            stringBytes('store'),
-            Buffer.from([0x00]), u32leb(2),
+        if (!this.externalMemory) {
+            return section(2, Buffer.concat([u32leb(1), envMemory]));
+        }
+        const fn = (mod, name, type) => Buffer.concat([
+            stringBytes(mod), stringBytes(name), Buffer.from([0x00]), u32leb(type),
         ]);
         return section(2, Buffer.concat([
             u32leb(3),
             envMemory,
-            envLoad,
-            envStore,
+            fn('env', 'load', 1),
+            fn('env', 'store', 2),
         ]));
     }
 
@@ -183,21 +214,106 @@ class RiscVBlockJit {
         return instance._buildModule(bodies, blocks.map((_, i) => `run_${i}`));
     }
 
-    _emitBody(instructions, sizes) {
-        const out = [];
-        out.push(Buffer.from([0x00])); // zero locals
+    _branchImm(insn) {
+        return branchOffset(insn);
+    }
 
-        let pc = 0;
-        for (let i = 0; i < instructions.length; i++) {
-            this._emitInstruction(out, instructions[i], pc);
-            pc += sizes[i];
+    _jalImm(insn) {
+        return jalOffset(insn);
+    }
+
+    _emitBody(instructions, sizes) {
+        const n = instructions.length;
+        const offsets = new Array(n);
+        let total = 0;
+        if (this.offsets && this.offsets.length === n) {
+            for (let i = 0; i < n; i++) offsets[i] = this.offsets[i];
+            total = offsets[n - 1] + sizes[n - 1];
+        } else {
+            for (let i = 0; i < n; i++) {
+                offsets[i] = total;
+                total += sizes[i];
+            }
         }
 
-        // Fall through: return startPc + 4 * instruction count.
-        out.push(Buffer.from([0x20, 0x02])); // local.get 2 (start pc, i64)
-        this._const64(out, pc);
-        out.push(Buffer.from([0x7c])); // i64.add
-        out.push(Buffer.from([0x0f])); // return
+        // A block whose terminal branch/jump targets its own start is a
+        // bottom-tested loop. Run it internally so a hot loop pays the host
+        // dispatch once per LOOP_BUDGET iterations instead of once per
+        // iteration.
+        this.selfLoop = null;
+        if (n > 0) {
+            const last = instructions[n - 1];
+            const op = last & 0x7f;
+            const lastOff = offsets[n - 1];
+            if (op === 0x63 && lastOff + this._branchImm(last) === 0) {
+                this.selfLoop = {
+                    cond: true,
+                    opcode: { 0: 0x51, 1: 0x52, 4: 0x53, 5: 0x59, 6: 0x54, 7: 0x5a }[(last >>> 12) & 7],
+                    rs1: (last >>> 15) & 0x1f,
+                    rs2: (last >>> 20) & 0x1f,
+                    exit: total,
+                };
+            } else if (op === 0x6f && ((last >>> 7) & 0x1f) === 0 && lastOff + this._jalImm(last) === 0) {
+                this.selfLoop = { cond: false, exit: total };
+            }
+        }
+
+        const budgetLocal = this.directTlb ? 8 : 3;
+        const out = [];
+        if (this.directTlb) {
+            const groups = [];
+            const add = (count, type) => { groups.push(count, type); };
+            add(1, 0x7e); // 5: vaddr
+            add(1, 0x7f); // 6: TLB entry
+            add(1, 0x7e); // 7: val / JALR target
+            add(1, 0x7f); // 8: loop budget
+            if (this.registerLocals) add(31, 0x7e); // 9..39: x1..x31
+            out.push(Buffer.from([groups.length / 2, ...groups]));
+        } else if (this.selfLoop) {
+            out.push(Buffer.from([0x01, 0x01, 0x7f])); // local 3 = budget (i32)
+        } else {
+            out.push(Buffer.from([0x00])); // zero locals
+        }
+        this._emitRegisterPrologue(out);
+
+        if (this.selfLoop) {
+            const sl = this.selfLoop;
+            out.push(Buffer.from([0x41]));
+            out.push(s32leb(LOOP_BUDGET));
+            out.push(Buffer.from([0x21, budgetLocal]));
+            out.push(Buffer.from([0x03, 0x40])); // loop
+            // if (budget == 0) return startPc  (interpreter services IRQs)
+            out.push(Buffer.from([0x20, budgetLocal, 0x45, 0x04, 0x40]));
+            this._emitReturnRel(out, 0);
+            out.push(Buffer.from([0x0b])); // end if
+            // budget -= 1
+            out.push(Buffer.from([0x20, budgetLocal, 0x41, 0x01, 0x6b, 0x21, budgetLocal]));
+            for (let i = 0; i < n - 1; i++) {
+                this._emitInstruction(out, instructions[i], offsets[i], sizes[i],
+                    this.inline ? this.inline.has(i) : false);
+            }
+            if (sl.cond) {
+                this._emitBranchCondition(out, sl.opcode, sl.rs1, sl.rs2);
+                out.push(Buffer.from([0x04, 0x40])); // if
+                out.push(Buffer.from([0x0c, 0x01])); // br 1 -> loop
+                out.push(Buffer.from([0x0b])); // end if
+                this._emitReturnRel(out, sl.exit); // not taken: exit the loop
+            } else {
+                out.push(Buffer.from([0x0c, 0x00])); // br 0 -> loop
+            }
+            out.push(Buffer.from([0x0b])); // end loop
+            this._emitReturnRel(out, 0); // unreachable fallback
+            out.push(Buffer.from([0x0b])); // end function
+            return Buffer.concat(out);
+        }
+
+        for (let i = 0; i < n; i++) {
+            this._emitInstruction(out, instructions[i], offsets[i], sizes[i],
+                this.inline ? this.inline.has(i) : false);
+        }
+
+        // Fall through: return startPc + total size.
+        this._emitReturnRel(out, total);
         out.push(Buffer.from([0x0b])); // end
         return Buffer.concat(out);
     }
@@ -210,20 +326,51 @@ class RiscVBlockJit {
     }
 
     _loadReg(out, reg) {
+        if (this.registerLocals) {
+            if (reg === 0) this._const64(out, 0n);
+            else out.push(Buffer.from([0x20, 8 + reg])); // local.get xN
+            return;
+        }
         this._regAddr(out, reg);
         out.push(Buffer.from([0x29, 0x03, 0x00])); // i64.load align=3 offset=0
     }
 
     _beginStore(out, reg) {
+        if (this.registerLocals) return; // _endStore writes the local
         this._regAddr(out, reg);
     }
 
     _endStore(out, reg) {
+        if (this.registerLocals) {
+            if (reg === 0) out.push(Buffer.from([0x1a]));     // drop value
+            else out.push(Buffer.from([0x21, 8 + reg]));      // local.set xN
+            return;
+        }
         if (reg === 0) {
             // Writes to x0 are discarded; drop both address and value.
             out.push(Buffer.from([0x1a, 0x1a]));
         } else {
             out.push(Buffer.from([0x37, 0x03, 0x00])); // i64.store align=3 offset=0
+        }
+    }
+
+    _emitRegisterPrologue(out) {
+        if (!this.registerLocals) return;
+        for (let i = 1; i < 32; i++) {
+            out.push(Buffer.from([0x20, 0x00])); // local.get 0 (regs)
+            out.push(Buffer.from([0x41])); out.push(s32leb(i * 8)); out.push(Buffer.from([0x6a])); // i32.add
+            out.push(Buffer.from([0x29, 0x03, 0x00])); // i64.load
+            out.push(Buffer.from([0x21, 8 + i])); // local.set xN
+        }
+    }
+
+    _emitRegisterStoreBack(out) {
+        if (!this.registerLocals) return;
+        for (let i = 1; i < 32; i++) {
+            out.push(Buffer.from([0x20, 0x00]));
+            out.push(Buffer.from([0x41])); out.push(s32leb(i * 8)); out.push(Buffer.from([0x6a]));
+            out.push(Buffer.from([0x20, 8 + i]));
+            out.push(Buffer.from([0x37, 0x03, 0x00])); // i64.store
         }
     }
 
@@ -256,11 +403,24 @@ class RiscVBlockJit {
         out.push(Buffer.from([0xac])); // i64.extend_i32_s
     }
 
+    // Zero-extend the low 32 bits of the current i64 value. This is needed
+    // before a *32-bit logical/arithmetic right shift: shifting the full 64-bit
+    // register would shift high bits into the low 32.
+    _emitZeroExtend32(out) {
+        out.push(Buffer.from([0xa7])); // i32.wrap_i64
+        out.push(Buffer.from([0xad])); // i64.extend_i32_u
+    }
+
     // Return startPc + offset. startPc is local 2.
     _emitReturnRel(out, offset) {
         out.push(Buffer.from([0x20, 0x02])); // local.get 2 (start pc, i64)
         this._const64(out, offset);
         out.push(Buffer.from([0x7c])); // i64.add
+        if (this.registerLocals) {
+            out.push(Buffer.from([0x21, 0x07])); // local.set 7 (result)
+            this._emitRegisterStoreBack(out);
+            out.push(Buffer.from([0x20, 0x07])); // local.get 7
+        }
         out.push(Buffer.from([0x0f])); // return
     }
 
@@ -272,12 +432,18 @@ class RiscVBlockJit {
     }
 
     _emitConditionalBranch(out, opcode, rs1, rs2, target) {
-        this._loadReg(out, rs1);
-        this._loadReg(out, rs2);
-        out.push(Buffer.from([opcode])); // i64 comparison -> i32
+        this._emitBranchCondition(out, opcode, rs1, rs2);
         out.push(Buffer.from([0x04, 0x40])); // if (empty block type)
         this._emitReturnRel(out, target);
         out.push(Buffer.from([0x0b])); // end if
+    }
+
+    // Push the i32 condition for a branch whose taken target is handled by the
+    // caller. `opcode` is the i64 comparison opcode.
+    _emitBranchCondition(out, opcode, rs1, rs2) {
+        this._loadReg(out, rs1);
+        this._loadReg(out, rs2);
+        out.push(Buffer.from([opcode])); // i64 comparison -> i32
     }
 
     _emitAddress(out, rs1, imm) {
@@ -290,7 +456,84 @@ class RiscVBlockJit {
         out.push(Buffer.from([0x6a])); // i32.add
     }
 
-    _emitLoad(out, rd, rs1, imm, opcode, size) {
+    // --- direct-TLB memory model (see constructor comment) ----------------
+    // vaddr = reg[rs1] + imm (i64, local 5)
+    // entry = tlb<tlbLocal> + ((vaddr >> 12) & 255) * 16 (i32, local 6)
+    // tlbLocal is 1 (read) for loads and 4 (write) for stores, so a store
+    // always re-checks the write TLB and cannot bypass write protection.
+    _emitTlbEntry(out, rs1, imm, tlbLocal) {
+        this._loadReg(out, rs1);
+        if (imm) {
+            this._const64(out, imm);
+            out.push(Buffer.from([0x7c])); // i64.add
+        }
+        out.push(Buffer.from([0x21, 0x05])); // local.set 5
+        out.push(Buffer.from([0x20, 0x05])); // local.get 5
+        this._const64(out, 12n);
+        out.push(Buffer.from([0x88])); // i64.shr_u
+        this._const64(out, 255n);
+        out.push(Buffer.from([0x83])); // i64.and
+        out.push(Buffer.from([0xa7])); // i32.wrap_i64
+        out.push(Buffer.from([0x41]));
+        out.push(s32leb(4));
+        out.push(Buffer.from([0x74])); // i32.shl  (idx * 16)
+        out.push(Buffer.from([0x20, tlbLocal])); // local.get tlb ptr
+        out.push(Buffer.from([0x6a])); // i32.add
+        out.push(Buffer.from([0x21, 0x06])); // local.set 6
+    }
+
+    // i64.load(entry) == (vaddr & mask), where mask allows the low size-1 bits.
+    _emitTlbHit(out, size) {
+        out.push(Buffer.from([0x20, 0x06]));
+        out.push(Buffer.from([0x29, 0x03, 0x00])); // i64.load
+        out.push(Buffer.from([0x20, 0x05]));
+        this._const64(out, BigInt(-4096 + (size - 1)));
+        out.push(Buffer.from([0x83])); // i64.and
+        out.push(Buffer.from([0x51])); // i64.eq
+    }
+
+    // host = i32.wrap(vaddr) + i32.load(entry + 8)
+    _emitHostAddr(out) {
+        out.push(Buffer.from([0x20, 0x05]));
+        out.push(Buffer.from([0xa7])); // i32.wrap_i64
+        out.push(Buffer.from([0x20, 0x06]));
+        out.push(Buffer.from([0x28, 0x02, 0x08])); // i32.load offset=8
+        out.push(Buffer.from([0x6a])); // i32.add
+    }
+
+    // Bail out of the block: return (startPc + offset) with the high bit set.
+    // The host hands control back to the interpreter at that exact PC; all
+    // earlier instructions have already committed, so this is precise.
+    _emitBail(out, offset) {
+        out.push(Buffer.from([0x20, 0x02])); // local.get 2 (start pc)
+        this._const64(out, offset);
+        out.push(Buffer.from([0x7c])); // i64.add
+        this._const64(out, BAIL_BIT);
+        out.push(Buffer.from([0x84])); // i64.or
+        if (this.registerLocals) {
+            out.push(Buffer.from([0x21, 0x07])); // local.set 7
+            this._emitRegisterStoreBack(out);
+            out.push(Buffer.from([0x20, 0x07]));
+        }
+        out.push(Buffer.from([0x0f])); // return
+    }
+
+    _emitLoad(out, rd, rs1, imm, opcode, size, pc = 0) {
+        if (this.directTlb) {
+            this._beginStore(out, rd);
+            this._emitTlbEntry(out, rs1, imm, 1);
+            this._emitTlbHit(out, size);
+            out.push(Buffer.from([0x04, 0x40])); // if (void)
+            this._emitHostAddr(out);
+            out.push(Buffer.from([opcode, 0x00, 0x00])); // direct load
+            out.push(Buffer.from([0x21, 0x07])); // local.set 7 (val)
+            out.push(Buffer.from([0x05])); // else
+            this._emitBail(out, pc);
+            out.push(Buffer.from([0x0b])); // end if
+            out.push(Buffer.from([0x20, 0x07])); // local.get 7 (val)
+            this._endStore(out, rd);
+            return;
+        }
         if (this.externalMemory) {
             this._beginStore(out, rd);
             out.push(Buffer.from([0x20, 0x03])); // local.get 3 (statePtr)
@@ -309,7 +552,19 @@ class RiscVBlockJit {
         this._endStore(out, rd);
     }
 
-    _emitStore(out, rs1, rs2, imm, opcode, size) {
+    _emitStore(out, rs1, rs2, imm, opcode, size, pc = 0) {
+        if (this.directTlb) {
+            this._emitTlbEntry(out, rs1, imm, 4);
+            this._emitTlbHit(out, size);
+            out.push(Buffer.from([0x04, 0x40])); // if (void)
+            this._emitHostAddr(out);
+            this._loadReg(out, rs2);
+            out.push(Buffer.from([opcode, 0x00, 0x00])); // direct store
+            out.push(Buffer.from([0x05])); // else
+            this._emitBail(out, pc);
+            out.push(Buffer.from([0x0b])); // end if
+            return;
+        }
         if (this.externalMemory) {
             out.push(Buffer.from([0x20, 0x03])); // local.get 3 (statePtr)
             this._loadReg(out, rs1);
@@ -327,7 +582,7 @@ class RiscVBlockJit {
         out.push(Buffer.from([opcode, 0x00, 0x00])); // store, align=0 offset=0
     }
 
-    _emitInstruction(out, insn, pc) {
+    _emitInstruction(out, insn, pc, size = 4, inlineCall = false) {
         const opcode = insn & 0x7f;
         const rd = (insn >>> 7) & 0x1f;
         const rs1 = (insn >>> 15) & 0x1f;
@@ -389,9 +644,11 @@ class RiscVBlockJit {
                         break;
                     }
                     case 5: { // SRLIW / SRAIW
-                        const isArithmetic = (insn >>> 25) & 1;
+                        const isArithmetic = (insn >>> 30) & 1;
                         this._beginStore(out, rd);
                         this._loadReg(out, rs1);
+                        if (isArithmetic) this._emitSignExtend32(out);
+                        else this._emitZeroExtend32(out);
                         this._const64(out, immI & 0x1f);
                         out.push(Buffer.from([isArithmetic ? 0x87 : 0x88]));
                         this._emitSignExtend32(out);
@@ -429,6 +686,8 @@ class RiscVBlockJit {
                         const isArithmetic = funct7 === 0x20;
                         this._beginStore(out, rd);
                         this._loadReg(out, rs1);
+                        if (isArithmetic) this._emitSignExtend32(out);
+                        else this._emitZeroExtend32(out);
                         this._loadReg(out, rs2);
                         this._const64(out, 0x1fn);
                         out.push(Buffer.from([0x83])); // i64.and
@@ -479,20 +738,27 @@ class RiscVBlockJit {
                     21,
                 );
                 this._beginStore(out, rd);
-                this._emitPcConst(out, pc + 4);
+                this._emitPcConst(out, pc + size);
                 this._endStore(out, rd);
-                this._emitReturnRel(out, pc + imm);
+                // An inlined call keeps only the link write; the callee body
+                // follows inline in the trace and returns to pc + size.
+                if (!inlineCall) this._emitReturnRel(out, pc + imm);
                 break;
             }
             case 0x67: { // JALR
                 this._beginStore(out, rd);
-                this._emitPcConst(out, pc + 4);
+                this._emitPcConst(out, pc + size);
                 this._endStore(out, rd);
                 this._loadReg(out, rs1);
                 this._const64(out, immI);
                 out.push(Buffer.from([0x7c])); // i64.add
                 this._const64(out, -2n);
                 out.push(Buffer.from([0x83])); // i64.and (mask ~1)
+                if (this.registerLocals) {
+                    out.push(Buffer.from([0x21, 0x07])); // local.set 7 (target)
+                    this._emitRegisterStoreBack(out);
+                    out.push(Buffer.from([0x20, 0x07])); // local.get 7
+                }
                 out.push(Buffer.from([0x0f])); // return
                 break;
             }
@@ -509,7 +775,7 @@ class RiscVBlockJit {
                 const loadOpcode = loads[funct3];
                 if (loadOpcode === undefined) throw new Error(`unsupported LOAD funct3=${funct3}`);
                 const loadSize = [1, 2, 4, 8, 1, 2, 4][funct3];
-                this._emitLoad(out, rd, rs1, immI, loadOpcode, loadSize);
+                this._emitLoad(out, rd, rs1, immI, loadOpcode, loadSize, pc);
                 break;
             }
             case 0x23: { // STORE
@@ -522,7 +788,7 @@ class RiscVBlockJit {
                 const storeOpcode = stores[funct3];
                 if (storeOpcode === undefined) throw new Error(`unsupported STORE funct3=${funct3}`);
                 const storeSize = [1, 2, 4, 8][funct3];
-                this._emitStore(out, rs1, rs2, immS, storeOpcode, storeSize);
+                this._emitStore(out, rs1, rs2, immS, storeOpcode, storeSize, pc);
                 break;
             }
             case 0x63: { // BRANCH
@@ -552,10 +818,51 @@ class RiscVBlockJit {
     }
 }
 
+// Strictly validate the integer instructions the direct-TLB translator
+// actually implements. In particular the M extension shares opcodes with the
+// base ISA (funct7 0x01) and must be rejected, not silently treated as add.
+function isSupportedInstruction(insn) {
+    const opcode = insn & 0x7f;
+    const funct3 = (insn >>> 12) & 7;
+    const funct7 = (insn >>> 25) & 0x7f;
+    switch (opcode) {
+        case 0x13: // OP-IMM: funct7 is part of the immediate except for shifts
+            if (funct3 === 1) return funct7 === 0x00; // slli
+            if (funct3 === 5) return funct7 === 0x00 || funct7 === 0x20; // srli/srai
+            return funct3 === 0 || funct3 === 2 || funct3 === 3 || funct3 === 4 ||
+                funct3 === 6 || funct3 === 7;
+        case 0x1b: // OP-IMM-32
+            if (funct3 === 1) return funct7 === 0x00; // slliw
+            if (funct3 === 5) return funct7 === 0x00 || funct7 === 0x20; // srliw/sraiw
+            return funct3 === 0; // addiw (funct7 is immediate)
+        case 0x33: // OP
+            if (funct3 === 0) return funct7 === 0x00 || funct7 === 0x20; // add/sub
+            if (funct3 === 5) return funct7 === 0x00 || funct7 === 0x20; // srl/sra
+            return funct7 === 0x00; // sll/slt/sltu/xor/or/and
+        case 0x3b: // OP-32
+            if (funct3 === 0) return funct7 === 0x00 || funct7 === 0x20; // addw/subw
+            if (funct3 === 1) return funct7 === 0x00; // sllw
+            if (funct3 === 5) return funct7 === 0x00 || funct7 === 0x20; // srlw/sraw
+            return false;
+        case 0x03: // LOAD
+            return funct3 <= 6;
+        case 0x23: // STORE
+            return funct3 <= 3;
+        case 0x37: // LUI
+        case 0x17: // AUIPC
+        case 0x6f: // JAL
+        case 0x67: // JALR
+            return true;
+        case 0x63: // BRANCH
+            return funct3 !== 2 && funct3 !== 3; // no reserved encodings
+        default:
+            return false;
+    }
+}
+
 function decodeBlock(code, pc) {
     const instructions = [];
     const sizes = [];
-    const supported = new Set([0x13, 0x33, 0x1b, 0x3b, 0x03, 0x23, 0x37, 0x17, 0x6f, 0x67, 0x63]);
     let cursor = pc;
     while (cursor < code.length) {
         const decoded = decodeRiscV(code, cursor);
@@ -564,7 +871,7 @@ function decodeBlock(code, pc) {
         }
         const insn = decoded.word >>> 0;
         const opcode = insn & 0x7f;
-        if (!supported.has(opcode)) {
+        if (!isSupportedInstruction(insn)) {
             return { instructions, sizes, terminal: 'unsupported', nextPc: cursor };
         }
         instructions.push(insn);
@@ -577,4 +884,4 @@ function decodeBlock(code, pc) {
     return { instructions, sizes, terminal: 'fallthrough', nextPc: cursor };
 }
 
-module.exports = { RiscVBlockJit, decodeBlock, u32leb, s32leb, s64leb, sext };
+module.exports = { RiscVBlockJit, decodeBlock, isSupportedInstruction, branchOffset, jalOffset, u32leb, s32leb, s64leb, sext, BAIL_BIT, BAIL_MASK, LOOP_BUDGET };

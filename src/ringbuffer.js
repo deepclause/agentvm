@@ -38,12 +38,17 @@ const NET_TAIL_INDEX = 4;      // Network ring buffer tail (read position)
 const HEADER_SIZE = 32;        // 8 Int32s = 32 bytes
 const STDIN_AREA_SIZE = 4096;  // 4KB for stdin
 const STDIN_OFFSET = HEADER_SIZE;
-const NET_RING_OFFSET = HEADER_SIZE + STDIN_AREA_SIZE;
+// Host -> guest input event queue (length-prefixed events).
+const INPUT_HEAD_INDEX = 5;    // Write position (main thread updates)
+const INPUT_TAIL_INDEX = 6;    // Read position (worker updates)
+const INPUT_AREA_SIZE = 4096;
+const INPUT_OFFSET = STDIN_OFFSET + STDIN_AREA_SIZE;
+const NET_RING_OFFSET = INPUT_OFFSET + INPUT_AREA_SIZE;
 
 // Total buffer size: 32 + 4096 + 1MB = ~1MB
 const NET_RING_SIZE = 1024 * 1024;  // 1MB ring buffer for larger transfers
 const NET_CONTROL_RESERVE = 16 * 1024; // Data cannot starve FIN/error/DNS events
-const TOTAL_BUFFER_SIZE = HEADER_SIZE + STDIN_AREA_SIZE + NET_RING_SIZE;
+const TOTAL_BUFFER_SIZE = HEADER_SIZE + STDIN_AREA_SIZE + INPUT_AREA_SIZE + NET_RING_SIZE;
 
 // Network message types
 const NET_MSG_TCP_CONNECTED = 1;
@@ -53,6 +58,7 @@ const NET_MSG_TCP_ERROR = 4;
 const NET_MSG_TCP_CLOSE = 5;
 const NET_MSG_UDP_RECV = 6;
 const NET_MSG_DNS_RESULT = 7;
+const NET_MSG_TCP_INCOMING_CONNECT = 8;
 
 /**
  * Ring buffer writer (used by main thread)
@@ -131,6 +137,36 @@ class RingBufferWriter {
         Atomics.add(this.int32, IO_READY_INDEX, 1);
         Atomics.notify(this.int32, IO_READY_INDEX);
         
+        return true;
+    }
+
+    /**
+     * Enqueue a host input event for the guest.
+     * Event format: [u8 kind][i32 a][i32 b][i32 c]
+     *   kind 0 key  : a=down(0/1), b=evdev keycode
+     *   kind 1 mouse: a=x, b=y, c=buttons (1=left 2=right 4=middle)
+     * @param {Uint8Array} bytes
+     * @returns {boolean} true if enqueued
+     */
+    writeInput(bytes) {
+        const frameLen = 4 + bytes.length;
+        if (frameLen > INPUT_AREA_SIZE) return false;
+        const head = Atomics.load(this.int32, INPUT_HEAD_INDEX);
+        const tail = Atomics.load(this.int32, INPUT_TAIL_INDEX);
+        const free = (tail - head - 1 + INPUT_AREA_SIZE) % INPUT_AREA_SIZE;
+        if (free < frameLen) return false;
+        const put = (pos, buf) => {
+            const first = Math.min(buf.length, INPUT_AREA_SIZE - pos);
+            this.uint8.set(buf.subarray(0, first), INPUT_OFFSET + pos);
+            if (buf.length > first) this.uint8.set(buf.subarray(first), INPUT_OFFSET);
+            return (pos + buf.length) % INPUT_AREA_SIZE;
+        };
+        const lenBuf = new Uint8Array(4);
+        new DataView(lenBuf.buffer).setUint32(0, bytes.length, true);
+        let h = put(head, lenBuf);
+        h = put(h, bytes);
+        Atomics.store(this.int32, INPUT_HEAD_INDEX, h);
+        this.signalWorker();
         return true;
     }
     
@@ -261,6 +297,27 @@ class RingBufferWriter {
     }
 
     /**
+     * Write an inbound (port-forwarded) TCP connection request.
+     * @param {Object} msg - { key, guestHost, guestPort, srcPort }
+     */
+    writeTcpIncomingConnect(msg) {
+        // Format: keyLen(1) + key + guestHostLen(1) + guestHost
+        //         + guestPort(2) + srcPort(2)
+        const keyBytes = Buffer.from(String(msg.key || ''), 'utf8');
+        const hostBytes = Buffer.from(String(msg.guestHost || ''), 'utf8');
+        if (keyBytes.length > 255 || hostBytes.length > 255) return false;
+        const payload = Buffer.alloc(1 + keyBytes.length + 1 + hostBytes.length + 2 + 2);
+        let o = 0;
+        payload[o++] = keyBytes.length;
+        keyBytes.copy(payload, o); o += keyBytes.length;
+        payload[o++] = hostBytes.length;
+        hostBytes.copy(payload, o); o += hostBytes.length;
+        payload.writeUInt16LE(Number(msg.guestPort) || 0, o); o += 2;
+        payload.writeUInt16LE(Number(msg.srcPort) || 0, o); o += 2;
+        return this.writeMessage(NET_MSG_TCP_INCOMING_CONNECT, payload);
+    }
+
+    /**
      * Write a UDP datagram received by an existing NAT flow.
      * @param {Object} msg - { key, data }
      */
@@ -347,6 +404,40 @@ class RingBufferReader {
         Atomics.notify(this.int32, STDIN_FLAG_INDEX);
         
         return data;
+    }
+
+    /**
+     * Check if a host input event is queued.
+     */
+    hasInputData() {
+        return Atomics.load(this.int32, INPUT_HEAD_INDEX) !== Atomics.load(this.int32, INPUT_TAIL_INDEX);
+    }
+
+    /**
+     * Read the next host input event, or null if none.
+     * @returns {Uint8Array|null}
+     */
+    readInput() {
+        const head = Atomics.load(this.int32, INPUT_HEAD_INDEX);
+        let tail = Atomics.load(this.int32, INPUT_TAIL_INDEX);
+        if (tail === head) return null;
+        const take = (pos, n) => {
+            const out = new Uint8Array(n);
+            const first = Math.min(n, INPUT_AREA_SIZE - pos);
+            out.set(this.uint8.subarray(INPUT_OFFSET + pos, INPUT_OFFSET + pos + first), 0);
+            if (n > first) out.set(this.uint8.subarray(INPUT_OFFSET, INPUT_OFFSET + (n - first)), first);
+            return [(pos + n) % INPUT_AREA_SIZE, out];
+        };
+        let lenBuf, ev;
+        [tail, lenBuf] = take(tail, 4);
+        const len = new DataView(lenBuf.buffer).getUint32(0, true);
+        if (len > INPUT_AREA_SIZE) {
+            Atomics.store(this.int32, INPUT_TAIL_INDEX, head);
+            return null;
+        }
+        [tail, ev] = take(tail, len);
+        Atomics.store(this.int32, INPUT_TAIL_INDEX, tail);
+        return ev;
     }
     
     /**
@@ -458,6 +549,18 @@ class RingBufferReader {
         return { key, name, qtype, ips, error };
     }
 
+    /** Parse an inbound TCP connection request: { key, guestHost, guestPort, srcPort }. */
+    parseTcpIncomingConnect(payload) {
+        let o = 0;
+        const keyLen = payload[o++];
+        const key = payload.slice(o, o + keyLen).toString('utf8'); o += keyLen;
+        const hostLen = payload[o++];
+        const guestHost = payload.slice(o, o + hostLen).toString('utf8'); o += hostLen;
+        const guestPort = payload.readUInt16LE(o); o += 2;
+        const srcPort = payload.readUInt16LE(o); o += 2;
+        return { key, guestHost, guestPort, srcPort };
+    }
+
     /** Parse a UDP receive message: { key, data }. */
     parseUdpRecv(payload) {
         const keyLen = payload[0];
@@ -514,5 +617,6 @@ module.exports = {
     NET_MSG_TCP_ERROR,
     NET_MSG_TCP_CLOSE,
     NET_MSG_UDP_RECV,
-    NET_MSG_DNS_RESULT
+    NET_MSG_DNS_RESULT,
+    NET_MSG_TCP_INCOMING_CONNECT
 };

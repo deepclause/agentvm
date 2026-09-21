@@ -2,11 +2,12 @@ const { parentPort, workerData } = require('node:worker_threads');
 const { WASI } = require('node:wasi');
 const fs = require('node:fs');
 const { NetworkStack } = require('./network');
-const { RiscVBlockJit } = require('./jit');
+const { RiscVBlockJit, BAIL_BIT, BAIL_MASK, isSupportedInstruction, branchOffset, jalOffset, LOOP_BUDGET } = require('./jit');
+const refRun = require('./riscv-ref').run;
 const { expandCompressed } = require('./riscv-c');
 const { RingBufferReader } = require('./ringbuffer');
 
-const { wasmPath, sharedBuffer, mounts, network, mac, netPort } = workerData;
+const { wasmPath, sharedBuffer, mounts, network, mac, netPort, persistentRootHostDir } = workerData;
 
 // Initialize ring buffer reader for shared memory IPC (main → worker data)
 const ringReader = new RingBufferReader(sharedBuffer);
@@ -70,18 +71,93 @@ function writeIOVs(view, iovs_ptr, iovs_len, data) {
 }
 
 let instance = null;
+
+// Optional virtual framebuffer (simplefb). Populated after instantiation from
+// the fb_* exports. Frames are pushed to the main thread from poll_oneoff (the
+// guest's sleep/select path), throttled to AGENTVM_FB_FPS.
+let fbInfo = null;
+let fbLastPostAt = 0;
+let fbRects = [];
+const FB_MAX_FPS = Number(process.env.AGENTVM_FB_FPS || '20');
+
+// host_fb_draw import: called from the emulator's fb_refresh() for each
+// damaged rectangle. Copy the rows out of WASM memory now (stride != w*4).
+function hostFbDraw(x, y, w, h) {
+    if (!fbInfo || !instance) return;
+    const stride = fbInfo.stride;
+    const rowBytes = w * 4;
+    const data = new Uint8Array(rowBytes * h);
+    const mem = new Uint8Array(instance.exports.memory.buffer);
+    for (let j = 0; j < h; j++) {
+        const off = fbInfo.ptr + (y + j) * stride + x * 4;
+        data.set(mem.subarray(off, off + rowBytes), j * rowBytes);
+    }
+    fbRects.push({ x, y, w, h, data });
+}
+
+function postFramesIfDue() {
+    if (!fbInfo || !instance || !instance.exports.fb_refresh) return;
+    const now = Date.now();
+    const minInterval = FB_MAX_FPS > 0 ? 1000 / FB_MAX_FPS : 0;
+    if (now - fbLastPostAt < minInterval) return;
+    fbRects = [];
+    instance.exports.fb_refresh(); // emits hostFbDraw per damaged rect
+    if (fbRects.length === 0) return;
+    fbLastPostAt = now;
+    const rects = fbRects;
+    fbRects = [];
+    parentPort.postMessage(
+        { type: 'framebuffer', width: fbInfo.width, height: fbInfo.height, stride: fbInfo.stride, rects },
+        rects.map((r) => r.data.buffer)
+    );
+}
+
+// host_audio_write import: PCM produced by the guest's virtio-snd device.
+// Copy it out of WASM memory and hand it to the main thread / embedding app.
+function hostAudioWrite(sampleRate, channels, ptr, len) {
+    if (!instance || len <= 0) return;
+    const data = new Uint8Array(instance.exports.memory.buffer, ptr, len).slice();
+    parentPort.postMessage(
+        { type: 'audio', sampleRate, channels, format: 's16le', data },
+        [data.buffer]
+    );
+}
+
+// Drain host input events (sendKey/sendMouse) and feed the virtio-input devices.
+function drainInput() {
+    if (!instance || !instance.exports.input_key) return;
+    while (ringReader.hasInputData()) {
+        const ev = ringReader.readInput();
+        if (!ev) break;
+        const dv = new DataView(ev.buffer, ev.byteOffset, ev.byteLength);
+        const kind = dv.getUint8(0);
+        if (process.env.DEBUG_FB === '1') {
+            parentPort.postMessage({ type: 'debug', msg: `input kind=${kind} a=${dv.getInt32(1, true)} b=${dv.getInt32(5, true)}` });
+        }
+        if (kind === 0) instance.exports.input_key(dv.getInt32(1, true), dv.getInt32(5, true));
+        else if (kind === 1) instance.exports.input_mouse(dv.getInt32(1, true), dv.getInt32(5, true), dv.getInt32(9, true));
+    }
+}
 const JIT_ENABLED = process.env.AGENTVM_JIT === '1';
 const DEBUG_JIT = process.env.DEBUG_JIT === '1';
-const JIT_HIT_THRESHOLD = 50;
-const jitHitCounts = new Map();
-const jitBlockCache = new Map();
-const jitUnsupported = new Set();
-const jitPageCompiled = new Set();
-const JIT_TERMINAL = new Set([0x63, 0x6f, 0x67]);
-const JIT_SUPPORTED = new Set([0x13, 0x33, 0x1b, 0x3b, 0x03, 0x23, 0x37, 0x17, 0x6f, 0x67, 0x63]);
-const aotWasmPath = process.env.AGENTVM_AOT_WASM || null;
-const aotIndexPath = process.env.AGENTVM_AOT_INDEX || null;
-const aotSigMap = new Map();
+// The hot threshold now lives in the emulator (JIT_HOT_THRESHOLD in
+// riscv_cpu.c): the C dispatcher only calls jit_compile after that many hits.
+// Only translate guest PCs in [MIN, MAX). Defaults cover all of SV39. Restricting
+// to low addresses is a debugging aid that keeps the JIT out of early-boot and
+// kernel code.
+const JIT_PC_MIN = Number(process.env.AGENTVM_JIT_PC_MIN || '0');
+const JIT_PC_MAX = Number(process.env.AGENTVM_JIT_PC_MAX || '0x4000000000');
+const JIT_ALLOW_COMPRESSED = process.env.AGENTVM_JIT_NO_C !== '1';
+const JIT_ONLY_LOOPS = process.env.AGENTVM_JIT_ALL_BLOCKS !== '1';
+// Even without a back edge, a sufficiently long straight-line trace can amortize
+// the host dispatch. 0 keeps the loops-only default.
+const JIT_MIN_BLOCK = Number(process.env.AGENTVM_JIT_MIN_BLOCK || 0);
+const JIT_INLINE = process.env.AGENTVM_JIT_NO_INLINE !== '1';
+// Only inline small leaf callees: larger ones tend to make the trace slower
+// than the interpreter on memory-heavy code.
+const JIT_INLINE_MAX = Number(process.env.AGENTVM_JIT_INLINE_MAX || 6);
+// Differential verification against src/riscv-ref.js (debug only, slow).
+let jitFixed = null;
 
 async function start() {
     const wasmBuffer = fs.readFileSync(wasmPath);
@@ -100,6 +176,12 @@ async function start() {
     
     // Store preopens for our custom path_open implementation
     const preopenPaths = mounts || {};
+    if (persistentRootHostDir) {
+        // A dedicated preopen for the persistent overlay image, kept separate
+        // from the live /workspace 9p share. TinyEMU's drive1 file opens
+        // through this path.
+        preopenPaths['/agentvm-persist'] = persistentRootHostDir;
+    }
     // Map wasi fd to host path (fd 3 onwards)
     const fdToHostPath = new Map();
     let preopen_fd = 3;
@@ -249,32 +331,30 @@ async function start() {
                     return 44; // WASI_ERRNO_NOENT
                 }
                 
-                // Determine open flags
-                let fsFlags = 'r'; // Default read-only
-                
-                if (oflags & O_CREAT) {
-                    if (oflags & O_TRUNC) {
-                        fsFlags = 'w+'; // Create/truncate, read/write
-                    } else if (fileExists) {
-                        fsFlags = 'r+'; // Existing file, read/write
-                    } else {
-                        fsFlags = 'w+'; // Create new, read/write
-                    }
-                } else if (oflags & O_TRUNC) {
-                    fsFlags = 'r+'; // Truncate existing (we'll truncate separately)
+                // Determine open flags. WASI oflags carry no read/write bits;
+                // access is expressed via fs_rights_base, so we must consult it
+                // (otherwise write-only opens degrade to read-only).
+                const FD_READ = 2;   // 1 << 1
+                const FD_WRITE = 64; // 1 << 6
+                const rightsBase = typeof fs_rights_base === 'bigint' ? Number(fs_rights_base) : fs_rights_base;
+                const canRead = (rightsBase & FD_READ) !== 0;
+                const canWrite = (rightsBase & FD_WRITE) !== 0;
+
+                let openFlags;
+                if (canRead && canWrite) {
+                    openFlags = fs.constants.O_RDWR;
+                } else if (canWrite) {
+                    openFlags = fs.constants.O_WRONLY;
+                } else {
+                    openFlags = fs.constants.O_RDONLY;
                 }
-                
-                if (fdflags & FDFLAG_APPEND) {
-                    fsFlags = fileExists ? 'a+' : 'a+'; // Append mode
-                }
-                
-                // Open the file synchronously
-                const nodeFd = fs.openSync(hostFilePath, fsFlags);
-                
-                // Handle O_TRUNC separately to ensure truncation
-                if ((oflags & O_TRUNC) && fileExists) {
-                    fs.ftruncateSync(nodeFd, 0);
-                }
+
+                if (oflags & O_CREAT) openFlags |= fs.constants.O_CREAT;
+                if (oflags & O_TRUNC) openFlags |= fs.constants.O_TRUNC;
+                if (fdflags & FDFLAG_APPEND) openFlags |= fs.constants.O_APPEND;
+
+                // Open the file synchronously (mode only matters with O_CREAT).
+                const nodeFd = fs.openSync(hostFilePath, openFlags, 0o666);
                 
                 // Get stat if we didn't already
                 if (!stat) {
@@ -741,7 +821,78 @@ async function start() {
         return result;
     };
     
-    wasiImport.fd_filestat_get = wrapFdOp('fd_filestat_get', wasiImport.fd_filestat_get);
+    // Custom fd_filestat_get (fstat) for our custom file handles. Node's WASI
+    // doesn't know about the fds we synthesize in path_open.
+    const origFdFilestatGet = wasiImport.fd_filestat_get;
+    wasiImport.fd_filestat_get = (fd, filestat_ptr) => {
+        if (customFdHandles.has(fd)) {
+            const handle = customFdHandles.get(fd);
+            if (!instance) return 8; // WASI_ERRNO_BADF
+
+            try {
+                const stat = handle.type === 'file' && handle.nodeFd !== undefined
+                    ? fs.fstatSync(handle.nodeFd)
+                    : fs.statSync(handle.hostPath);
+                const view = new DataView(instance.exports.memory.buffer);
+
+                // WASI filestat structure (64 bytes):
+                // 0: dev (u64), 8: ino (u64), 16: filetype (u8), 24: nlink (u64),
+                // 32: size (u64), 40: atim (u64), 48: mtim (u64), 56: ctim (u64)
+                view.setBigUint64(filestat_ptr, BigInt(0), true); // dev
+                view.setBigUint64(filestat_ptr + 8, BigInt(stat.ino || 0), true); // ino
+
+                let filetype = 0;
+                if (stat.isFile()) filetype = 4;
+                else if (stat.isDirectory()) filetype = 3;
+                else if (stat.isSymbolicLink()) filetype = 7;
+                view.setUint8(filestat_ptr + 16, filetype);
+
+                view.setBigUint64(filestat_ptr + 24, BigInt(stat.nlink || 1), true); // nlink
+                view.setBigUint64(filestat_ptr + 32, BigInt(stat.size), true); // size
+                view.setBigUint64(filestat_ptr + 40, BigInt(Math.floor(stat.atimeMs * 1000000)), true); // atim (ns)
+                view.setBigUint64(filestat_ptr + 48, BigInt(Math.floor(stat.mtimeMs * 1000000)), true); // mtim (ns)
+                view.setBigUint64(filestat_ptr + 56, BigInt(Math.floor(stat.ctimeMs * 1000000)), true); // ctim (ns)
+
+                return 0;
+            } catch (err) {
+                if (err.code === 'ENOENT') return 44; // WASI_ERRNO_NOENT
+                return 29; // WASI_ERRNO_IO
+            }
+        }
+
+        if (fakeFdMap.has(fd)) {
+            return origFdFilestatGet(fakeFdMap.get(fd), filestat_ptr);
+        }
+        return origFdFilestatGet(fd, filestat_ptr);
+    };
+
+    // Custom fd_filestat_set_size (truncate) for our custom file handles.
+    // TinyEMU's 9p server calls this after path_open with O_TRUNC and the guest
+    // uses it for ftruncate(); Node's WASI doesn't know about our fds.
+    const origFdFilestatSetSize = wasiImport.fd_filestat_set_size;
+    wasiImport.fd_filestat_set_size = (fd, size) => {
+        if (customFdHandles.has(fd)) {
+            const handle = customFdHandles.get(fd);
+            if (!instance) return 8; // WASI_ERRNO_BADF
+            if (handle.type !== 'file' || handle.nodeFd === undefined) return 8;
+            try {
+                fs.ftruncateSync(handle.nodeFd, typeof size === 'bigint' ? Number(size) : size);
+                return 0;
+            } catch (err) {
+                if (process.env.DEBUG_WASI_PATH === '1') {
+                    parentPort.postMessage({
+                        type: 'debug',
+                        msg: `WASI fd_filestat_set_size CUSTOM ERROR: fd=${fd}, err=${err.message}`
+                    });
+                }
+                return 29; // WASI_ERRNO_IO
+            }
+        }
+        if (fakeFdMap.has(fd)) {
+            return origFdFilestatSetSize(fakeFdMap.get(fd), size);
+        }
+        return origFdFilestatSetSize(fd, size);
+    };
     
     // Custom path_filestat_get for our directory handles
     const origPathFilestatGet = wasiImport.path_filestat_get;
@@ -801,7 +952,204 @@ async function start() {
         }
         return origPathFilestatGet(fd, flags, path_ptr, path_len, filestat_ptr);
     };
-    
+
+    // Map Node.js errno codes to WASI preview1 errno values. Used by the
+    // custom path_* handlers below so the guest sees meaningful errors.
+    const nodeErrnoToWasi = (code) => {
+        switch (code) {
+            case 'EACCES': return 2;
+            case 'EAGAIN': return 6;
+            case 'EBADF': return 8;
+            case 'EBUSY': return 16;
+            case 'EEXIST': return 20;
+            case 'EINVAL': return 28;
+            case 'EIO': return 29;
+            case 'EISDIR': return 31;
+            case 'ELOOP': return 32;
+            case 'ENAMETOOLONG': return 37;
+            case 'ENOENT': return 44;
+            case 'ENOMEM': return 48;
+            case 'ENOSPC': return 51;
+            case 'ENOTDIR': return 54;
+            case 'ENOTEMPTY': return 55;
+            case 'ENOTSUP': return 58;
+            case 'EPERM': return 63;
+            case 'EROFS': return 69;
+            case 'EXDEV': return 75;
+            default: return 29; // WASI_ERRNO_IO
+        }
+    };
+
+    // Read a WASI path string out of guest memory. Returns null when the
+    // instance isn't ready, so callers can fall back to the native handler.
+    const readWasiPath = (path_ptr, path_len) => {
+        if (!instance) return null;
+        const mem = new Uint8Array(instance.exports.memory.buffer);
+        return new TextDecoder().decode(mem.slice(path_ptr, path_ptr + path_len));
+    };
+
+    // Resolve a (directory fd, relative path) pair to a host path, mirroring
+    // the resolution path_open already does. Returns:
+    //   { fullPath }   - resolved host path inside a mounted root
+    //   { fallback: true } - fd is not a mount/custom dir fd (call native)
+    //   { errno: 76 }  - resolved path escapes the mounted roots (NOTCAPABLE)
+    const resolveMountHostPath = (fd, pathStr) => {
+        let hostDir = null;
+
+        if (customFdHandles.has(fd)) {
+            const handle = customFdHandles.get(fd);
+            if (handle.type === 'directory') hostDir = handle.hostPath;
+        }
+
+        if (hostDir == null) {
+            const actualFd = fakeFdMap.has(fd) ? fakeFdMap.get(fd) : fd;
+            const preopenInfo = fdToHostPath.get(actualFd);
+            if (preopenInfo) hostDir = preopenInfo.hostPath;
+        }
+
+        if (hostDir == null) return { fallback: true };
+
+        const p = require('path');
+        const rel = (pathStr || '').replace(/^\/+/, '');
+        const fullPath = rel === '' || rel === '.' ? hostDir : p.resolve(hostDir, rel);
+
+        // Keep destructive operations inside the mounted host roots. uvwasi
+        // applies the same sandbox check natively; mirror it so a `..` in the
+        // relative path cannot escape the mount.
+        for (const info of fdToHostPath.values()) {
+            const rel2 = p.relative(info.hostPath, fullPath);
+            if (rel2 === '' ||
+                (rel2 !== '..' && !rel2.startsWith('..' + p.sep) && !p.isAbsolute(rel2))) {
+                return { fullPath };
+            }
+        }
+        return { errno: 76 }; // WASI_ERRNO_NOTCAPABLE
+    };
+
+    // path_create_directory (mkdir) — Node's WASI cannot create directories
+    // through our synthesized directory fds, so route it to fs directly.
+    const origPathCreateDirectory = wasiImport.path_create_directory;
+    wasiImport.path_create_directory = (fd, path_ptr, path_len) => {
+        const pathStr = readWasiPath(path_ptr, path_len);
+        if (pathStr === null) return origPathCreateDirectory(fd, path_ptr, path_len);
+        const resolved = resolveMountHostPath(fd, pathStr);
+        if (resolved.fallback) return origPathCreateDirectory(fd, path_ptr, path_len);
+        if (resolved.errno) return resolved.errno;
+        try {
+            fs.mkdirSync(resolved.fullPath);
+            return 0;
+        } catch (err) {
+            if (process.env.DEBUG_WASI_PATH === '1') {
+                parentPort.postMessage({ type: 'debug', msg: `WASI path_create_directory CUSTOM FAIL: fd=${fd}, path="${pathStr}" => ${err.code} ${err.message}` });
+            }
+            return nodeErrnoToWasi(err.code);
+        }
+    };
+
+    // path_remove_directory (rmdir) — same routing as above. On macOS the
+    // native uvwasi path can fail with EPERM for mounted directories.
+    const origPathRemoveDirectory = wasiImport.path_remove_directory;
+    wasiImport.path_remove_directory = (fd, path_ptr, path_len) => {
+        const pathStr = readWasiPath(path_ptr, path_len);
+        if (pathStr === null) return origPathRemoveDirectory(fd, path_ptr, path_len);
+        const resolved = resolveMountHostPath(fd, pathStr);
+        if (resolved.fallback) return origPathRemoveDirectory(fd, path_ptr, path_len);
+        if (resolved.errno) return resolved.errno;
+        try {
+            fs.rmdirSync(resolved.fullPath);
+            return 0;
+        } catch (err) {
+            if (process.env.DEBUG_WASI_PATH === '1') {
+                parentPort.postMessage({ type: 'debug', msg: `WASI path_remove_directory CUSTOM FAIL: fd=${fd}, path="${pathStr}" => ${err.code} ${err.message}` });
+            }
+            return nodeErrnoToWasi(err.code);
+        }
+    };
+
+    // path_unlink_file (unlink) — same routing as above. On macOS
+    // fs.unlinkSync() on a directory returns EPERM instead of EISDIR, which
+    // makes the guest's rmdir() abort with "Operation not permitted" instead
+    // of falling back to the rmdir syscall. Detect that case and report EISDIR
+    // so the guest behaves the same as it does on Linux.
+    const origPathUnlinkFile = wasiImport.path_unlink_file;
+    wasiImport.path_unlink_file = (fd, path_ptr, path_len) => {
+        const pathStr = readWasiPath(path_ptr, path_len);
+        if (pathStr === null) return origPathUnlinkFile(fd, path_ptr, path_len);
+        const resolved = resolveMountHostPath(fd, pathStr);
+        if (resolved.fallback) return origPathUnlinkFile(fd, path_ptr, path_len);
+        if (resolved.errno) return resolved.errno;
+        try {
+            fs.unlinkSync(resolved.fullPath);
+            return 0;
+        } catch (err) {
+            // macOS reports EPERM (not EISDIR) when unlinking a directory.
+            // Translate it so guest rmdir() can fall back to path_remove_directory.
+            if (err.code === 'EPERM') {
+                try {
+                    if (fs.statSync(resolved.fullPath).isDirectory()) {
+                        return 31; // WASI_ERRNO_ISDIR
+                    }
+                } catch {
+                    // fall through to the normal errno mapping below
+                }
+            }
+            if (process.env.DEBUG_WASI_PATH === '1') {
+                parentPort.postMessage({ type: 'debug', msg: `WASI path_unlink_file CUSTOM FAIL: fd=${fd}, path="${pathStr}" => ${err.code} ${err.message}` });
+            }
+            return nodeErrnoToWasi(err.code);
+        }
+    };
+
+    // path_rename (rename) — same routing as above.
+    const origPathRename = wasiImport.path_rename;
+    wasiImport.path_rename = (old_fd, old_path_ptr, old_path_len, new_fd, new_path_ptr, new_path_len) => {
+        const oldPathStr = readWasiPath(old_path_ptr, old_path_len);
+        if (oldPathStr === null) return origPathRename(old_fd, old_path_ptr, old_path_len, new_fd, new_path_ptr, new_path_len);
+        const newPathStr = readWasiPath(new_path_ptr, new_path_len);
+        if (newPathStr === null) return origPathRename(old_fd, old_path_ptr, old_path_len, new_fd, new_path_ptr, new_path_len);
+        const oldResolved = resolveMountHostPath(old_fd, oldPathStr);
+        if (oldResolved.fallback) return origPathRename(old_fd, old_path_ptr, old_path_len, new_fd, new_path_ptr, new_path_len);
+        if (oldResolved.errno) return oldResolved.errno;
+        const newResolved = resolveMountHostPath(new_fd, newPathStr);
+        if (newResolved.fallback) return origPathRename(old_fd, old_path_ptr, old_path_len, new_fd, new_path_ptr, new_path_len);
+        if (newResolved.errno) return newResolved.errno;
+        try {
+            fs.renameSync(oldResolved.fullPath, newResolved.fullPath);
+            return 0;
+        } catch (err) {
+            if (process.env.DEBUG_WASI_PATH === '1') {
+                parentPort.postMessage({ type: 'debug', msg: `WASI path_rename CUSTOM FAIL: old="${oldPathStr}", new="${newPathStr}" => ${err.code} ${err.message}` });
+            }
+            return nodeErrnoToWasi(err.code);
+        }
+    };
+
+    // path_symlink — uvwasi validates the symlink *target*, rejecting any
+    // relative target that escapes with ".." (EINVAL) and absolute targets
+    // (EPERM). That breaks ordinary package managers: npm's
+    // node_modules/.bin/* links target "../pkg/bin/cli.js". Route it to
+    // fs.symlinkSync with the target verbatim; only the link location is
+    // resolved (and sandboxed) within the mount.
+    const origPathSymlink = wasiImport.path_symlink;
+    wasiImport.path_symlink = (old_path_ptr, old_path_len, fd, new_path_ptr, new_path_len) => {
+        const target = readWasiPath(old_path_ptr, old_path_len);
+        if (target === null) return origPathSymlink(old_path_ptr, old_path_len, fd, new_path_ptr, new_path_len);
+        const newPathStr = readWasiPath(new_path_ptr, new_path_len);
+        if (newPathStr === null) return origPathSymlink(old_path_ptr, old_path_len, fd, new_path_ptr, new_path_len);
+        const resolved = resolveMountHostPath(fd, newPathStr);
+        if (resolved.fallback) return origPathSymlink(old_path_ptr, old_path_len, fd, new_path_ptr, new_path_len);
+        if (resolved.errno) return resolved.errno;
+        try {
+            fs.symlinkSync(target, resolved.fullPath);
+            return 0;
+        } catch (err) {
+            if (process.env.DEBUG_WASI_PATH === '1') {
+                parentPort.postMessage({ type: 'debug', msg: `WASI path_symlink CUSTOM FAIL: target="${target}", new="${newPathStr}" => ${err.code} ${err.message}` });
+            }
+            return nodeErrnoToWasi(err.code);
+        }
+    };
+
     // Debug: trace path operations for mount debugging
     const DEBUG_WASI_PATH = process.env.DEBUG_WASI_PATH === '1';
     if (DEBUG_WASI_PATH) {
@@ -923,7 +1271,7 @@ async function start() {
             if (localBuffer.length === 0) {
                  // Wait for stdin data using ring buffer
                  ringReader.waitForIO(-1); // Block until I/O ready
-                 
+                 drainInput();
                  const stdinData = ringReader.readStdin();
                  if (stdinData && stdinData.length > 0) {
                      localBuffer = stdinData;
@@ -973,6 +1321,7 @@ async function start() {
     const originalPollOneoff = wasiImport.poll_oneoff;
     wasiImport.poll_oneoff = (in_ptr, out_ptr, nsubscriptions, nevents_ptr) => {
         if (!instance) return originalPollOneoff(in_ptr, out_ptr, nsubscriptions, nevents_ptr);
+        drainInput();
         const view = new DataView(instance.exports.memory.buffer);
         
         let hasStdin = false;
@@ -1080,6 +1429,7 @@ async function start() {
             }
         }
         
+        drainInput();
         // 4. Populate Events
         let eventsWritten = 0;
         
@@ -1139,6 +1489,7 @@ async function start() {
         }
         
         view.setUint32(nevents_ptr, eventsWritten, true);
+        postFramesIfDue();
         return 0; // Success
     };
 
@@ -1147,148 +1498,180 @@ async function start() {
     const readGuestInsn = (exports, statePtr, addr) => {
         const first = Number(exports.jit_read_u16(statePtr, addr));
         if ((first & 3) !== 3) {
+            if (!JIT_ALLOW_COMPRESSED) return null;
             const expanded = expandCompressed(first);
             return expanded === null ? null : { word: expanded, size: 2n };
         }
         return { word: Number(exports.jit_read_u32(statePtr, addr)), size: 4n };
     };
 
-    const jitLoad = (statePtr, addr, size) => {
-        const e = instance.exports;
-        switch (size) {
-            case 1: return e.jit_read_u8(statePtr, addr);
-            case 2: return e.jit_read_u16(statePtr, addr);
-            case 4: return e.jit_read_u32(statePtr, addr);
-            case 8: return e.jit_read_u64(statePtr, addr);
-            default: return 0n;
-        }
-    };
-
-    const jitStore = (statePtr, addr, size, val) => {
-        const e = instance.exports;
-        switch (size) {
-            case 1: e.jit_write_u8(statePtr, addr, val); break;
-            case 2: e.jit_write_u16(statePtr, addr, val); break;
-            case 4: e.jit_write_u32(statePtr, addr, val); break;
-            case 8: e.jit_write_u64(statePtr, addr, val); break;
-        }
-        return 0;
-    };
-
-    const compileJitBlock = (instructions, sizes) => {
-        const module = new RiscVBlockJit(instructions, sizes, { externalMemory: true }).compile();
-        const jitInstance = new WebAssembly.Instance(module, {
-            env: { memory: instance.exports.memory, load: jitLoad, store: jitStore },
+    const compileJitBlock = (instructions, sizes, offsets, inline) => {
+        const jit = new RiscVBlockJit(instructions, sizes, {
+            directTlb: true, registerLocals: true, offsets, inline,
         });
-        return jitInstance.exports.run;
+        const module = jit.compile();
+        const jitInstance = new WebAssembly.Instance(module, {
+            env: { memory: instance.exports.memory },
+        });
+        // Self-loop blocks execute up to LOOP_BUDGET iterations per call; the
+        // emulator subtracts this many cycles so it still checks interrupts.
+        const cycles = instructions.length * (jit.selfLoop ? LOOP_BUDGET : 1);
+        return { run: jitInstance.exports.run, cycles, selfLoop: !!jit.selfLoop };
     };
 
-    const precompileJitPage = (exports, statePtr, pageStart) => {
-        const pageEnd = pageStart + 0x1000n;
-        let cursor = pageStart;
-        while (cursor < pageEnd) {
-            const first = readGuestInsn(exports, statePtr, cursor);
-            if (!first) { cursor += 2n; continue; }
-            const opcode = first.word & 0x7f;
-            if (!JIT_SUPPORTED.has(opcode)) { cursor += first.size; continue; }
+    // In-WASM dispatch. riscv_cpu.c keeps a direct-mapped {pc, tableIndex,
+    // cycles} table and calls the compiled function with call_indirect. The
+    // host only installs traces (and only after the C hot counter fires), so
+    // the steady-state execution never returns to JavaScript. Values must
+    // match riscv_cpu.c.
+    const JIT_MAP_BITS = 19;
+    const JIT_MAP_SIZE = 1 << JIT_MAP_BITS;
+    const JIT_MAP_MASK = JIT_MAP_SIZE - 1;
+    const JIT_MAP_BYTES = JIT_MAP_SIZE * 16;
+    const JIT_UNSUPPORTED = 0xFFFFFFFF;
+    const JIT_MAX_SLOTS = 1 << 16;
+    let jitTable = null;
+    let jitTableBase = 0;
+    let jitNextSlot = 0;
+    let jitMapPtr = 0;
+
+    const jitCompile = (statePtr) => {
+        if (!JIT_ENABLED || !jitTable) return 0;
+        const exports = instance.exports;
+        try {
+            if (jitFixed === null) {
+                jitFixed = {
+                    regsPtr: Number(exports.jit_regs_ptr(statePtr)),
+                    pcLo: null,
+                    pcHi: null,
+                };
+                jitTableBase = jitTable.length;
+                jitTable.grow(JIT_MAX_SLOTS);
+                jitMapPtr = Number(exports.jit_map_ptr());
+            }
+            const buf = exports.memory.buffer;
+            if (jitFixed.pcLo === null || jitFixed.pcLo.length === 0) {
+                const p = jitFixed.regsPtr - 8; // s->pc is before s->reg[32]
+                jitFixed.pcLo = new Int32Array(buf, p, 1);
+                jitFixed.pcHi = new Int32Array(buf, p + 4, 1);
+            }
+            const pcNum = jitFixed.pcHi[0] * 0x100000000 + (jitFixed.pcLo[0] >>> 0);
+            const pc = BigInt(pcNum);
+            const slot = Number(((pc >> 1n) ^ (pc >> 13n)) & BigInt(JIT_MAP_MASK));
+            const entryOff = slot * 16;
+            const mdv = new DataView(buf, jitMapPtr, JIT_MAP_BYTES);
+            const mark = (index, cycles) => {
+                mdv.setBigUint64(entryOff, pc, true);
+                mdv.setUint32(entryOff + 8, index, true);
+                mdv.setUint32(entryOff + 12, cycles, true);
+            };
+
+            if (pcNum < JIT_PC_MIN || pcNum >= JIT_PC_MAX) { mark(JIT_UNSUPPORTED, 0); return 0; }
 
             const instructions = [];
             const sizes = [];
-            const blockStart = cursor;
-            let blockCursor = cursor;
-            for (;;) {
-                const insn = readGuestInsn(exports, statePtr, blockCursor);
-                if (!insn) break;
-                const op = insn.word & 0x7f;
-                if (!JIT_SUPPORTED.has(op)) break;
-                instructions.push(insn.word >>> 0);
-                sizes.push(Number(insn.size));
-                blockCursor += insn.size;
-                if (JIT_TERMINAL.has(op)) break;
-            }
-            if (instructions.length > 0) {
-                const key = `${blockStart.toString(16)}:${instructions.map((n) => n.toString(16)).join(',')}`;
-                if (!jitBlockCache.has(key)) {
-                    try {
-                        jitBlockCache.set(key, compileJitBlock(instructions, sizes));
-                    } catch (err) {
-                        // Leave this block to the interpreter.
+            const offsets = [];
+            const inline = new Set();
+            let cursor = pc;
+            let ok = true;
+            let isLoop = false;
+            // A straight-line leaf callee (no branch/call, does not write ra,
+            // ends in `ret`) can be inlined so a loop body containing a small
+            // helper still forms a self-loop trace.
+            const readLeafCallee = (target) => {
+                const callee = [];
+                let c = target;
+                for (let guard = 0; guard < 64; guard++) {
+                    const ci = readGuestInsn(exports, statePtr, c);
+                    if (!ci || !isSupportedInstruction(ci.word)) return null;
+                    const w = ci.word >>> 0;
+                    const cop = w & 0x7f;
+                    const crd = (w >>> 7) & 0x1f;
+                    if (cop === 0x67) {
+                        const crs1 = (w >>> 15) & 0x1f;
+                        const cimm = (w >>> 20) & 0xfff;
+                        if (!(crd === 0 && crs1 === 1 && cimm === 0)) return null;
+                        return callee.length > JIT_INLINE_MAX ? null : callee;
                     }
+                    if (cop === 0x6f || cop === 0x63) return null;
+                    if (crd === 1) return null;
+                    callee.push({ word: w, size: Number(ci.size), addr: c });
+                    c += ci.size;
                 }
+                return null;
+            };
+            for (;;) {
+                if (instructions.length >= 512) { ok = false; break; }
+                const insn = readGuestInsn(exports, statePtr, cursor);
+                if (!insn || !isSupportedInstruction(insn.word)) { ok = false; break; }
+                const word = insn.word >>> 0;
+                const op = word & 0x7f;
+                instructions.push(word);
+                sizes.push(Number(insn.size));
+                offsets.push(Number(cursor - pc));
+                if (op === 0x63) {
+                    const target = cursor + BigInt(branchOffset(word));
+                    if (target === pc) { isLoop = true; break; }
+                    if (target > cursor) { cursor += insn.size; continue; }
+                    ok = false; break;
+                }
+                if (op === 0x6f) {
+                    const rd = (word >>> 7) & 0x1f;
+                    const target = cursor + BigInt(jalOffset(word));
+                    if (rd === 0) {
+                        if (target === pc) isLoop = true;
+                        break;
+                    }
+                    const callee = JIT_INLINE ? readLeafCallee(target) : null;
+                    if (callee) {
+                        inline.add(instructions.length - 1);
+                        for (const ci of callee) {
+                            instructions.push(ci.word);
+                            sizes.push(ci.size);
+                            offsets.push(Number(ci.addr - pc));
+                        }
+                        cursor += insn.size; // continue after the call returns
+                        continue;
+                    }
+                    break;
+                }
+                if (op === 0x67) break;
+                cursor += insn.size;
             }
-            cursor = blockCursor;
+            const allowedNonLoop = JIT_MIN_BLOCK > 0 && instructions.length >= JIT_MIN_BLOCK;
+            if (!ok || instructions.length === 0 || (JIT_ONLY_LOOPS && !isLoop && !allowedNonLoop)) {
+                mark(JIT_UNSUPPORTED, 0);
+                return 0;
+            }
+            let compiled;
+            try {
+                compiled = compileJitBlock(instructions, sizes, offsets, inline);
+            } catch (err) {
+                mark(JIT_UNSUPPORTED, 0);
+                return 0;
+            }
+            if (jitNextSlot >= JIT_MAX_SLOTS) { mark(JIT_UNSUPPORTED, 0); return 0; }
+            const tableIndex = jitTableBase + jitNextSlot++;
+            jitTable.set(tableIndex, compiled.run);
+            mark(tableIndex, compiled.cycles);
+            if (DEBUG_JIT) {
+                parentPort.postMessage({ type: 'debug', msg: `JIT install pc=0x${pc.toString(16)} -> table ${tableIndex} (${instructions.length} insns)` });
+            }
+            return 1;
+        } catch (err) {
+            if (DEBUG_JIT) parentPort.postMessage({ type: 'debug', msg: `JIT compile error: ${err.message}` });
+            return 0;
         }
     };
 
     const { instance: inst } = await WebAssembly.instantiate(wasmBuffer, {
         env: {
-            jit_try_block: (statePtr) => {
-                if (!JIT_ENABLED || !instance) return 0;
-                const exports = instance.exports;
-                if (!exports.jit_get_pc || !exports.jit_read_u16 || !exports.jit_read_u32 || !exports.jit_regs_ptr) return 0;
-
-                try {
-                    const pc = exports.jit_get_pc(statePtr);
-                    const pcKey = pc.toString(16);
-                    if (jitUnsupported.has(pcKey)) return 0;
-
-                    const hits = (jitHitCounts.get(pcKey) || 0) + 1;
-                    jitHitCounts.set(pcKey, hits);
-                    if (hits < JIT_HIT_THRESHOLD) return 0;
-
-                    const pageStart = pc & ~0xfffn;
-                    if (!jitPageCompiled.has(pageStart.toString(16))) {
-                        precompileJitPage(exports, statePtr, pageStart);
-                        jitPageCompiled.add(pageStart.toString(16));
-                    }
-
-                    const instructions = [];
-                    const sizes = [];
-                    let cursor = pc;
-                    for (;;) {
-                        const insn = readGuestInsn(exports, statePtr, cursor);
-                        if (!insn) return 0;
-                        const opcode = insn.word & 0x7f;
-                        if (!JIT_SUPPORTED.has(opcode)) {
-                            jitUnsupported.add(pcKey);
-                            return 0;
-                        }
-                        instructions.push(insn.word >>> 0);
-                        sizes.push(Number(insn.size));
-                        cursor += insn.size;
-                        if (JIT_TERMINAL.has(opcode)) break;
-                    }
-
-                    const sig = instructions.map((n) => n.toString(16)).join(',');
-                    const aotRun = aotSigMap.get(sig);
-                    if (aotRun) {
-                        const regsPtr = Number(exports.jit_regs_ptr(statePtr));
-                        const nextPc = aotRun(regsPtr, 0, pc, statePtr);
-                        exports.jit_sub_cycles(statePtr, instructions.length);
-                        exports.jit_set_pc(statePtr, nextPc);
-                        return 1;
-                    }
-
-                    const key = `${pcKey}:${sig}`;
-                    let run = jitBlockCache.get(key);
-                    if (!run) {
-                        run = compileJitBlock(instructions, sizes);
-                        jitBlockCache.set(key, run);
-                    }
-
-                    const regsPtr = Number(exports.jit_regs_ptr(statePtr));
-                    const nextPc = run(regsPtr, 0, pc, statePtr);
-                    exports.jit_sub_cycles(statePtr, instructions.length);
-                    exports.jit_set_pc(statePtr, nextPc);
-                    if (DEBUG_JIT) {
-                        parentPort.postMessage({ type: 'debug', msg: `JIT block pc=0x${pcKey} -> 0x${nextPc.toString(16)} (${instructions.length} insns, hits=${hits})` });
-                    }
-                    return 1;
-                } catch (err) {
-                    if (DEBUG_JIT) parentPort.postMessage({ type: 'debug', msg: `JIT fallback: ${err.message}` });
-                    return 0;
-                }
-            },
+            jit_compile: (statePtr) => jitCompile(statePtr),
+            // Compatibility with images built before in-WASM dispatch, which
+            // import the old JS hook. Unused by the current image.
+            jit_try_block: () => 0,
+            host_fb_draw: hostFbDraw,
+            host_audio_write: hostAudioWrite,
         },
         wasi_snapshot_preview1: {
             ...wasiImport,
@@ -1377,21 +1760,20 @@ async function start() {
     });
     
     instance = inst;
-
-    if (JIT_ENABLED && aotWasmPath && aotIndexPath) {
-        try {
-            const aotBytes = fs.readFileSync(aotWasmPath);
-            const aotModule = new WebAssembly.Module(aotBytes);
-            const aotInstance = new WebAssembly.Instance(aotModule, {
-                env: { memory: instance.exports.memory, load: jitLoad, store: jitStore },
-            });
-            const index = JSON.parse(fs.readFileSync(aotIndexPath, 'utf8'));
-            for (const entry of index) {
-                aotSigMap.set(entry.sig, aotInstance.exports[entry.export]);
+    if (JIT_ENABLED && instance.exports.__indirect_function_table) {
+        jitTable = instance.exports.__indirect_function_table;
+        if (instance.exports.jit_set_enabled) instance.exports.jit_set_enabled(1);
+    }
+    if (instance.exports.fb_ptr) {
+        const ptr = instance.exports.fb_ptr() >>> 0;
+        const width = instance.exports.fb_width() | 0;
+        const height = instance.exports.fb_height() | 0;
+        const stride = instance.exports.fb_stride() | 0;
+        if (ptr && width > 0 && height > 0 && stride > 0) {
+            fbInfo = { ptr, width, height, stride };
+            if (process.env.DEBUG_FB === '1') {
+                parentPort.postMessage({ type: 'debug', msg: `framebuffer ${width}x${height} stride=${stride} ptr=0x${ptr.toString(16)}` });
             }
-            if (DEBUG_JIT) parentPort.postMessage({ type: 'debug', msg: `AOT loaded: ${aotSigMap.size} blocks` });
-        } catch (err) {
-            parentPort.postMessage({ type: 'debug', msg: `AOT load failed: ${err.message}` });
         }
     }
 

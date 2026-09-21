@@ -8,6 +8,7 @@ const {
     NET_MSG_TCP_CLOSE,
     NET_MSG_UDP_RECV,
     NET_MSG_DNS_RESULT,
+    NET_MSG_TCP_INCOMING_CONNECT,
 } = require('./ringbuffer');
 
 const ETH_P_IP = 0x0800;
@@ -287,6 +288,9 @@ class NetworkStack extends EventEmitter {
                     break;
                 case NET_MSG_DNS_RESULT:
                     this._handleDnsResult(this.ringReader.parseDnsResult(message.payload));
+                    break;
+                case NET_MSG_TCP_INCOMING_CONNECT:
+                    this._handleTcpIncomingConnect(this.ringReader.parseTcpIncomingConnect(message.payload));
                     break;
             }
         }
@@ -599,6 +603,37 @@ class NetworkStack extends EventEmitter {
         // SYN-ACK exists, retransmit it immediately instead of opening a new
         // host socket or treating the SYN as guest data.
         if (flags & TCP_SYN) {
+            // A retransmitted SYN-ACK after the active-open flow is already
+            // established just needs another ACK, not a new handshake.
+            if (flow.activeOpen && flow.state === 'ESTABLISHED' && (flags & TCP_ACK)) {
+                flow.lastActivity = Date.now();
+                this._sendTcp(flow, flow.sendNext, flow.guestNext, TCP_ACK);
+                return;
+            }
+            // An active-open (port-forwarded) flow completes its handshake when
+            // the guest answers our SYN with SYN-ACK. This is the mirror image
+            // of `_handleTcpConnected`, which answers a guest SYN for outbound
+            // flows.
+            if (flow.activeOpen && flow.state === 'SYN_SENT') {
+                if (!(flags & TCP_ACK)) {
+                    // Not a SYN-ACK: the guest is trying a simultaneous open or
+                    // the segment is malformed. Reset the flow.
+                    this._sendTcp(flow, flow.sendNext, flow.guestNext, TCP_RST);
+                    this._destroyHost(flow.key, true);
+                    this.tcpFlows.delete(flow.key);
+                    return;
+                }
+                const options = this._parseTcpOptions(segment, headerLength);
+                flow.guestNext = wrap32(seq + 1);
+                flow.windowScale = options.windowScale;
+                flow.peerMss = options.mss;
+                flow.guestWindow = Math.min(0x7fffffff, rawWindow * (2 ** flow.windowScale));
+                flow.state = 'ESTABLISHED';
+                flow.lastActivity = Date.now();
+                this._acknowledge(flow, ack);
+                this._maybeSend(flow);
+                return;
+            }
             if (flow.state === 'SYN_RECEIVED' && flow.unacked.length > 0) {
                 const syn = flow.unacked[0];
                 this._sendTcp(flow, syn.seq, flow.guestNext, syn.flags, syn.data, syn.options);
@@ -687,7 +722,14 @@ class NetworkStack extends EventEmitter {
     }
 
     _maybeSend(flow) {
-        if (flow.state === 'SYN_SENT' || flow.state === 'SYN_RECEIVED') return;
+        if (flow.state === 'SYN_SENT' || flow.state === 'SYN_RECEIVED') {
+            // No data can be transmitted until the handshake completes, but the
+            // host socket may still be pushing bytes (especially for inbound
+            // port-forwarded flows). Keep backpressure active so `pending`
+            // cannot grow without bound while we wait for the guest.
+            this._updateBackpressure(flow);
+            return;
+        }
         const sendWindow = Math.min(flow.guestWindow, TCP_MAX_IN_FLIGHT);
         let available = Math.max(0, sendWindow - seqDistance(flow.sendUna, flow.sendNext));
 
@@ -758,6 +800,56 @@ class NetworkStack extends EventEmitter {
         // window at the advertised 65535 bytes.
         this._sendTracked(flow, TCP_SYN | TCP_ACK, EMPTY,
             Buffer.from([2, 4, 0x05, 0xb4, 1, 3, 3, 0]));
+    }
+
+    /**
+     * Handle a port-forwarded (host -> guest) connection request from the main
+     * thread. Performs an active TCP open: craft a SYN from the gateway to
+     * `guestHost:guestPort`, then reuse the existing flow state machine once
+     * the guest answers with SYN-ACK.
+     */
+    _handleTcpIncomingConnect({ key, guestHost, guestPort, srcPort }) {
+        if (this.tcpFlows.has(key)) return;
+        const srcIP = ipToBuf(this.gatewayIP);
+        const dstIP = ipToBuf(guestHost);
+        if (!srcIP || !dstIP || !Number.isInteger(guestPort) || !Number.isInteger(srcPort)) return;
+
+        const initialSequence = randomBytes(4).readUInt32BE(0);
+        // `srcIP/srcPort` describe the guest endpoint (as in every other flow),
+        // and `dstIP/dstPort` describe the gateway endpoint. `_sendTcp` then
+        // writes gateway -> guest packets, which is exactly what an active
+        // open requires.
+        const flow = {
+            key,
+            srcIP: dstIP,
+            srcPort: guestPort,
+            dstIP: srcIP,
+            dstPort: srcPort,
+            state: 'SYN_SENT',
+            activeOpen: true,
+            guestNext: 0,
+            windowScale: 0,
+            peerMss: MSS,
+            guestWindow: INITIAL_WINDOW,
+            sendUna: initialSequence,
+            sendNext: initialSequence,
+            pending: [],
+            pendingBytes: 0,
+            unacked: [],
+            hostClosed: false,
+            guestClosed: false,
+            finSent: false,
+            finAcked: false,
+            hostCloseRequested: false,
+            hostPaused: false,
+            retransmits: 0,
+            retransmitTimeout: TCP_INITIAL_RTO_MS,
+            lastActivity: Date.now(),
+        };
+        this.tcpFlows.set(key, flow);
+        // Advertise an Ethernet-sized MSS and a scale factor of zero.
+        this._sendTracked(flow, TCP_SYN, EMPTY,
+            Buffer.from([2, 4, 0x05, 0xb4, 3, 3, 0]));
     }
 
     _handleTcpData({ key, data }) {

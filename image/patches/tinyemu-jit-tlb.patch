@@ -1,0 +1,28 @@
+diff --git a/riscv_cpu.c b/riscv_cpu.c
+index 4386ce4..c999e1b 100644
+--- a/riscv_cpu.c
++++ b/riscv_cpu.c
+@@ -143,6 +143,23 @@ void jit_sub_cycles(uint32_t state_ptr, uint32_t cycles)
+ {
+     ((RISCVCPUState *)(uintptr_t)state_ptr)->n_cycles -= cycles;
+ }
++
++/* TLB pointers, for a host translator that wants to inline the address
++   translation fast path exactly like target_read_uN/target_write_uN do.
++   which: 0 = read, 1 = write, 2 = code. */
++__attribute__((export_name("jit_tlb_ptr")))
++uint32_t jit_tlb_ptr(uint32_t state_ptr, uint32_t which)
++{
++    RISCVCPUState *s = (RISCVCPUState *)(uintptr_t)state_ptr;
++    switch (which) {
++    case 0:
++        return (uint32_t)(uintptr_t)s->tlb_read;
++    case 1:
++        return (uint32_t)(uintptr_t)s->tlb_write;
++    default:
++        return (uint32_t)(uintptr_t)s->tlb_code;
++    }
++}
+ #endif
+ 
+ #if FLEN > 0
