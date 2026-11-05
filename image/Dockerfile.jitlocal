@@ -1,0 +1,10 @@
+# Minimal riscv64 test image for the region-JIT bring-up.
+FROM alpine:3.21
+RUN apk add --no-cache \
+        python3 py3-pip python3-tests \
+        nodejs npm \
+        bash curl \
+        coreutils \
+        tmux \
+        e2fsprogs
+CMD ["/bin/sh"]

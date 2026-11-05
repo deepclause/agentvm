@@ -1,0 +1,1645 @@
+diff --git a/iomem.c b/iomem.c
+index c63ada0..79fec69 100644
+--- a/iomem.c
++++ b/iomem.c
+@@ -249,8 +249,11 @@ uint8_t *phys_mem_get_ram_ptr(PhysMemoryMap *map, uint64_t paddr, BOOL is_rw)
+     if (!pr || !pr->is_ram)
+         return NULL;
+     offset = paddr - pr->addr;
+-    if (is_rw)
++    if (is_rw) {
+         phys_mem_set_dirty_bit(pr, offset);
++        if (map->notify_ram_write)
++            map->notify_ram_write(map->opaque, paddr, 1);
++    }
+     return pr->phys_mem + (uintptr_t)offset;
+ }
+ 
+diff --git a/iomem.h b/iomem.h
+index cc561b4..8f2ea8b 100644
+--- a/iomem.h
++++ b/iomem.h
+@@ -77,6 +77,9 @@ struct PhysMemoryMap {
+     void *opaque;
+     void (*flush_tlb_write_range)(void *opaque, uint8_t *ram_addr,
+                                   size_t ram_size);
++    /* Notify the JIT about a guest-RAM write performed outside the CPU
++       (virtio DMA, PV bulk memops, ...). Optional. */
++    void (*notify_ram_write)(void *opaque, uint64_t paddr, size_t len);
+ };
+ 
+ 
+diff --git a/riscv_cpu.c b/riscv_cpu.c
+index 07ddfc6..3cad744 100644
+--- a/riscv_cpu.c
++++ b/riscv_cpu.c
+@@ -22,6 +22,7 @@
+  * THE SOFTWARE.
+  */
+ #include <stdlib.h>
++#include <stddef.h>
+ #include <stdio.h>
+ #include <stdarg.h>
+ #include <string.h>
+@@ -51,103 +52,19 @@
+ #include "riscv_cpu_priv.h"
+ 
+ #ifdef CONFIG_JIT
+-extern int initialized;
+-
+-/*
+- * In-WASM dispatch.
+- *
+- * The host compiles guest traces into WASM modules and installs each compiled
+- * function into this module's indirect function table (exported as
+- * __indirect_function_table). jit_map is a host-populated direct-mapped table
+- * from guest PC to {table index, cycle cost}, so the interpreter can call a
+- * translated block with call_indirect without returning to JavaScript.
+- *
+- * A zero index means the slot is empty; collisions only cost a recompile.
+- */
+-#define JIT_MAP_BITS 19
+-#define JIT_MAP_SIZE (1u << JIT_MAP_BITS)
+-#define JIT_MAP_MASK (JIT_MAP_SIZE - 1)
+-#define JIT_UNSUPPORTED 0xFFFFFFFFu
+-
+-typedef struct {
+-    uint64_t pc;
+-    uint32_t index;
+-    uint32_t cycles;
+-} JITMapEntry;
+-
+-static JITMapEntry jit_map[JIT_MAP_SIZE];
+-
+-/* Hot counter per map slot; the JS compile hook is only invoked once a PC has
+-   been hit JIT_HOT_THRESHOLD times, so the steady-state dispatch stays in WASM. */
+-#define JIT_HOT_THRESHOLD 50
+-static uint16_t jit_hits[JIT_MAP_SIZE];
+-
+-__attribute__((export_name("jit_map_ptr")))
+-uint32_t jit_map_ptr(void)
+-{
+-    return (uint32_t)(uintptr_t)jit_map;
+-}
+-
+-__attribute__((import_module("env"), import_name("jit_compile")))
+-int32_t jit_compile(uint32_t state_ptr);
+-
+-static int32_t jit_enabled = 0;
+-
+-__attribute__((export_name("jit_set_enabled")))
+-void jit_set_enabled(int32_t v)
+-{
+-    jit_enabled = v;
+-}
+-
+-typedef int64_t (*jit_block_fn_t)(uint32_t regs, uint32_t tlb_read,
+-                                  uint64_t pc, uint32_t state, uint32_t tlb_write);
+-
+-static int32_t jit_try_block(uint32_t state_ptr)
+-{
+-    RISCVCPUState *s = (RISCVCPUState *)(uintptr_t)state_ptr;
+-    target_ulong pc;
+-    uint32_t slot;
+-    JITMapEntry *e;
+-    jit_block_fn_t fn;
+-    uint64_t next;
+-
+-    if (!jit_enabled)
+-        return 0;
+-
+-    pc = s->pc;
+-    slot = (uint32_t)((pc >> 1) ^ (pc >> 13)) & JIT_MAP_MASK;
+-    e = &jit_map[slot];
+-
+-    if (e->index == JIT_UNSUPPORTED)
+-        return 0;
+-    if (e->index == 0 || e->pc != (uint64_t)pc) {
+-        if (++jit_hits[slot] < JIT_HOT_THRESHOLD)
+-            return 0;
+-        jit_hits[slot] = 0;
+-        if (!jit_compile(state_ptr))
+-            return 0;
+-        e = &jit_map[slot];
+-        if (e->index == 0 || e->index == JIT_UNSUPPORTED || e->pc != (uint64_t)pc)
+-            return 0;
+-    }
+-
+-    fn = (jit_block_fn_t)(uintptr_t)e->index;
+-    next = (uint64_t)fn((uint32_t)(uintptr_t)s->reg,
+-                        (uint32_t)(uintptr_t)s->tlb_read,
+-                        (uint64_t)pc,
+-                        0,
+-                        (uint32_t)(uintptr_t)s->tlb_write);
+-    s->n_cycles -= (int32_t)e->cycles;
+-    if (next & (UINT64_C(1) << 63)) {
+-        /* Precise bail: resume the interpreter at the faulting instruction. */
+-        s->pc = next & ~(UINT64_C(1) << 63);
+-        return 0;
+-    }
+-    s->pc = next;
+-    return 1;
+-}
++/* Region-JIT hooks used by the code paths defined before the implementation. */
++static void jit_note_write_paddr(uint64_t paddr, size_t size);
++static void jit_note_write_range(uint64_t paddr, size_t size);
++static BOOL jit_page_watched(uint64_t paddr);
++void jit_flush_jump_cache(void);
++void jit_epoch_flush(void);
+ #endif
+ 
++/* The loop-only JIT (jit_map/jit_hits/jit_try_block, 9 MB of static tables
++   and a probe at every block boundary) was replaced by the region JIT below
++   (see "Region-JIT infrastructure (v2)"). The accessor exports that follow
++   are still used by the region JIT. */
++
+ #ifdef CONFIG_JIT
+ static int csr_read(RISCVCPUState *s, target_ulong *pval, uint32_t csr, BOOL will_write);
+ static int csr_write(RISCVCPUState *s, uint32_t csr, target_ulong val);
+@@ -587,7 +504,7 @@ int target_read_slow(RISCVCPUState *s, mem_uint_t *pval,
+         } else if (pr->is_ram) {
+             tlb_idx = (addr >> PG_SHIFT) & (TLB_SIZE - 1);
+             ptr = pr->phys_mem + (uintptr_t)(paddr - pr->addr);
+-            s->tlb_read[tlb_idx].vaddr = addr & ~PG_MASK;
++            s->tlb_read[tlb_idx].vaddr = (addr & ~PG_MASK) ^ s->tlb_data_tag;
+             s->tlb_read[tlb_idx].mem_addend = (uintptr_t)ptr - addr;
+             switch(size_log2) {
+             case 0:
+@@ -671,11 +588,26 @@ int target_write_slow(RISCVCPUState *s, target_ulong addr,
+             printf("\n");
+ #endif
+         } else if (pr->is_ram) {
++#ifdef CONFIG_JIT
++            BOOL jit_watched_page = jit_page_watched(paddr);
++            jit_note_write_paddr(paddr, size);
++#endif
+             phys_mem_set_dirty_bit(pr, paddr - pr->addr);
+             tlb_idx = (addr >> PG_SHIFT) & (TLB_SIZE - 1);
+             ptr = pr->phys_mem + (uintptr_t)(paddr - pr->addr);
+-            s->tlb_write[tlb_idx].vaddr = addr & ~PG_MASK;
++#ifdef CONFIG_JIT
++            /* A watched page must never enter the write TLB: every store has
++               to reach this slow path so the generation is bumped. */
++            if (!jit_watched_page) {
++                s->tlb_write[tlb_idx].vaddr = (addr & ~PG_MASK) ^ s->tlb_data_tag;
++                s->tlb_write[tlb_idx].mem_addend = (uintptr_t)ptr - addr;
++            } else {
++                s->tlb_write[tlb_idx].vaddr = -1;
++            }
++#else
++            s->tlb_write[tlb_idx].vaddr = (addr & ~PG_MASK) ^ s->tlb_data_tag;
+             s->tlb_write[tlb_idx].mem_addend = (uintptr_t)ptr - addr;
++#endif
+             switch(size_log2) {
+             case 0:
+                 *(uint8_t *)ptr = val;
+@@ -763,7 +695,7 @@ static no_inline __exception int target_read_insn_slow(RISCVCPUState *s,
+     }
+     tlb_idx = (addr >> PG_SHIFT) & (TLB_SIZE - 1);
+     ptr = pr->phys_mem + (uintptr_t)(paddr - pr->addr);
+-    s->tlb_code[tlb_idx].vaddr = addr & ~PG_MASK;
++    s->tlb_code[tlb_idx].vaddr = (addr & ~PG_MASK) ^ s->tlb_code_tag;
+     s->tlb_code[tlb_idx].mem_addend = (uintptr_t)ptr - addr;
+     *pptr = ptr;
+     return 0;
+@@ -777,7 +709,7 @@ static inline __exception int target_read_insn_u16(RISCVCPUState *s, uint16_t *p
+     uint8_t *ptr;
+     
+     tlb_idx = (addr >> PG_SHIFT) & (TLB_SIZE - 1);
+-    if (likely(s->tlb_code[tlb_idx].vaddr == (addr & ~PG_MASK))) {
++    if (likely(s->tlb_code[tlb_idx].vaddr == ((addr & ~PG_MASK) ^ s->tlb_code_tag))) {
+         ptr = (uint8_t *)(s->tlb_code[tlb_idx].mem_addend +
+                           (uintptr_t)addr);
+     } else {
+@@ -788,6 +720,787 @@ static inline __exception int target_read_insn_u16(RISCVCPUState *s, uint16_t *p
+     return 0;
+ }
+ 
++
++#ifdef CONFIG_JIT
++/* ================================================================== */
++/* Region-JIT infrastructure (v2)                                     */
++/*                                                                    */
++/* The emulator keeps a jump cache (vPC -> region table index), a      */
++/* physical map (pPC + mode -> table index + generation) and a        */
++/* generation word per guest physical page for self-modifying code.    */
++/* The translator worker only installs finished regions.              */
++/* ================================================================== */
++
++#define JIT_STATUS_CONTINUE  0
++#define JIT_STATUS_EXCEPTION 1
++#define JIT_STATUS_BUDGET    2
++#define JIT_STATUS_INTERP    3
++
++#define JIT_STORE_OK         0
++#define JIT_STORE_FAULT      1
++#define JIT_STORE_INVALID    2
++#define JIT_STORE_SLOW       3
++
++#define JIT_PAGE_SHIFT       12
++#define JIT_PAGE_GEN_BITS    20
++#define JIT_PAGE_GEN_SIZE    (1u << JIT_PAGE_GEN_BITS)
++#define JIT_PAGE_GEN_MASK    (JIT_PAGE_GEN_SIZE - 1)
++#define JIT_WATCH_BYTES      (JIT_PAGE_GEN_SIZE / 8)
++
++#define JIT_JC_ENTRIES       (1u << 16)
++#define JIT_JC_BUCKETS       (1u << 10)
++#define JIT_JC_BUCKET_ENTRIES 64
++#define JIT_HOT_SIZE         (1u << 16)
++#define JIT_REGION_HOT_THRESHOLD 128
++/* Runtime value (jit_set_hot_threshold); tests use 1 to translate every
++   dispatched PC. */
++static uint32_t jit_hot_threshold = JIT_REGION_HOT_THRESHOLD;
++#define JIT_PHYS_SIZE        (1u << 16)
++/* Bounded linear probing: a lookup miss must stay cheap even when the map is
++   nearly full, because it runs on every jump-cache miss. An insert that finds
++   no free slot within the bound fails, and the host then starts a new epoch. */
++#define JIT_PHYS_MAX_PROBE   16
++
++typedef int32_t (*jit_region_fn_t)(uint32_t state_ptr, uint64_t pc,
++                                   uint32_t ppage, uint32_t expected_gen);
++
++typedef struct {
++    uint64_t vpc;
++    uint32_t table_idx;
++    uint32_t ppage;
++    uint32_t expected_gen;
++    uint16_t jc_gen;
++    uint8_t priv;
++    uint8_t fsbit;
++} JITJumpEntry;
++
++typedef struct {
++    uint64_t paddr;
++    uint32_t table_idx;
++    uint32_t gen;
++    uint8_t priv;
++    uint8_t fsbit;
++    uint8_t valid;
++    uint8_t pad;
++} JITPhysEntry;
++
++typedef struct {
++    uint64_t pc;
++    uint16_t hits;
++    uint16_t crossings; /* threshold crossings without a region (backoff) */
++} JITHotEntry;
++
++typedef struct {
++    uint64_t dispatches;
++    uint64_t jump_hits;
++    uint64_t jump_misses;
++    uint64_t region_calls;
++    uint64_t exits_continue;
++    uint64_t exits_exception;
++    uint64_t exits_budget;
++    uint64_t exits_interp;
++    uint64_t requests;
++    uint64_t installs;
++    uint64_t install_rejects;
++    uint64_t invalidations;
++    uint64_t watch_marks;
++    uint64_t flush_all;
++    uint64_t chained;   /* region-to-region transfers done in wasm */
++} JITStats;
++
++static uint32_t jit_page_gen[JIT_PAGE_GEN_SIZE];
++static uint8_t jit_watched[JIT_WATCH_BYTES];
++static JITJumpEntry jit_jump_cache[JIT_JC_ENTRIES];
++static JITPhysEntry jit_phys_map[JIT_PHYS_SIZE];
++static JITHotEntry jit_hot[JIT_HOT_SIZE];
++static JITStats jit_stats;
++static uint32_t jit_jump_gen = 1;
++static RISCVCPUState *jit_cpu_state;
++static int32_t jit_region_enabled;
++static int32_t jit_step_active;
++static uint32_t jit_region_count;
++/* Bumped on every install: negative jump-cache entries (table_idx == 0,
++   "no region for this PC") are only valid while it is unchanged. */
++static uint32_t jit_install_seq = 1;
++static int32_t jit_diag_enabled; /* defined with the diagnostics below */
++
++__attribute__((import_module("env"), import_name("jit_request_region")))
++int32_t jit_request_region(uint32_t state_ptr, uint64_t paddr,
++                           uint32_t entry_off, uint32_t priv, uint32_t fs,
++                           uint32_t expected_gen);
++__attribute__((import_module("env"), import_name("jit_poll")))
++void jit_poll_import(void);
++
++static inline uint32_t jit_page_index(uint64_t paddr)
++{
++    return (uint32_t)((paddr >> JIT_PAGE_SHIFT) & JIT_PAGE_GEN_MASK);
++}
++
++static BOOL jit_page_watched(uint64_t paddr)
++{
++    uint32_t pg = jit_page_index(paddr);
++    return (jit_watched[pg >> 3] >> (pg & 7)) & 1;
++}
++
++void jit_flush_jump_cache(void)
++{
++    jit_jump_gen++;
++    if (jit_jump_gen == 0)
++        jit_jump_gen = 1;
++    if ((jit_jump_gen & 0xffff) == 0) {
++        /* The tag stores the low 16 bits of the generation. Clear the cache
++           before the tag wraps so an old entry cannot compare equal. */
++        memset(jit_jump_cache, 0, sizeof(jit_jump_cache));
++    }
++    jit_stats.flush_all++;
++}
++
++/* Watch a page before requesting a translation. Existing write-TLB entries
++   for the page could otherwise bypass the invalidation hook, so drop the
++   write TLB once when a page becomes watched. */
++static uint32_t jit_watch_page(RISCVCPUState *s, uint64_t paddr)
++{
++    uint32_t pg = jit_page_index(paddr);
++    int i;
++
++    if (!(jit_watched[pg >> 3] & (uint8_t)(1u << (pg & 7)))) {
++        PhysMemoryRange *pr = get_phys_mem_range(s->mem_map, paddr);
++        jit_watched[pg >> 3] |= (uint8_t)(1u << (pg & 7));
++        jit_stats.watch_marks++;
++        if (pr && pr->is_ram) {
++            /* Drop only the write-TLB entries that map this physical page
++               (any virtual alias); flushing the whole write TLB made every
++               other page take the slow store path again. */
++            uintptr_t host = (uintptr_t)(pr->phys_mem +
++                                         ((paddr & ~(uint64_t)PG_MASK) - pr->addr));
++            for (i = 0; i < TLB_SIZE; i++) {
++                if (s->tlb_write[i].vaddr != (target_ulong)-1 &&
++                    s->tlb_write[i].mem_addend +
++                    (uintptr_t)(s->tlb_write[i].vaddr & ~(target_ulong)PG_MASK) == host)
++                    s->tlb_write[i].vaddr = -1;
++            }
++        } else {
++            for (i = 0; i < TLB_SIZE; i++)
++                s->tlb_write[i].vaddr = -1;
++        }
++    }
++    return jit_page_gen[pg];
++}
++
++static void jit_invalidate_paddr(uint64_t paddr)
++{
++    uint32_t pg = jit_page_index(paddr);
++    uint8_t mask = (uint8_t)(1u << (pg & 7));
++    if (jit_watched[pg >> 3] & mask) {
++        jit_watched[pg >> 3] &= (uint8_t)~mask;
++        jit_page_gen[pg]++;
++        if (jit_page_gen[pg] == 0)
++            jit_page_gen[pg] = 1;
++        jit_stats.invalidations++;
++    }
++}
++
++static void jit_note_write_paddr(uint64_t paddr, size_t size)
++{
++    uint64_t last;
++    if (!jit_region_enabled || size == 0)
++        return;
++    last = paddr + (uint64_t)size - 1;
++    for (;;) {
++        jit_invalidate_paddr(paddr);
++        if ((paddr & ~(uint64_t)PG_MASK) == (last & ~(uint64_t)PG_MASK))
++            break;
++        paddr = (paddr & ~(uint64_t)PG_MASK) + (1u << JIT_PAGE_SHIFT);
++    }
++}
++
++static void jit_note_write_range(uint64_t paddr, size_t size)
++{
++    jit_note_write_paddr(paddr, size);
++}
++
++/* Called by the WASM code paths that write guest RAM (virtio DMA and the PV
++   bulk memops) through the memory map callback. */
++void riscv_cpu_jit_note_write(uint64_t paddr, size_t size)
++{
++    jit_note_write_range(paddr, size);
++}
++
++/* Map a host (linear-memory) pointer back to a guest physical address. */
++static uint64_t jit_host_to_paddr(RISCVCPUState *s, const uint8_t *host)
++{
++    PhysMemoryMap *map = s->mem_map;
++    int i;
++    for (i = 0; i < map->n_phys_mem_range; i++) {
++        PhysMemoryRange *pr = &map->phys_mem_range[i];
++        if (pr->is_ram && pr->size != 0 &&
++            host >= pr->phys_mem && host < pr->phys_mem + pr->size) {
++            return pr->addr + (uint64_t)(host - pr->phys_mem);
++        }
++    }
++    return UINT64_MAX;
++}
++
++static uint64_t jit_vpc_to_paddr(RISCVCPUState *s, target_ulong pc)
++{
++    uint32_t tlb_idx = (uint32_t)((pc >> PG_SHIFT) & (TLB_SIZE - 1));
++    uint8_t *host;
++    if (s->tlb_code[tlb_idx].vaddr == ((pc & ~(target_ulong)PG_MASK) ^ s->tlb_code_tag)) {
++        host = (uint8_t *)(s->tlb_code[tlb_idx].mem_addend + (uintptr_t)pc);
++    } else {
++        int saved = s->pending_exception;
++        uint8_t *ptr;
++        if (target_read_insn_slow(s, &ptr, pc)) {
++            s->pending_exception = saved;
++            return UINT64_MAX;
++        }
++        s->pending_exception = saved;
++        host = ptr;
++    }
++    return jit_host_to_paddr(s, host);
++}
++
++static inline uint32_t jit_jc_index(target_ulong pc)
++{
++    uint32_t vpn = (uint32_t)(pc >> PG_SHIFT);
++    uint32_t bucket = (vpn * 2654435761u) & (JIT_JC_BUCKETS - 1);
++    uint32_t slot = (uint32_t)((pc >> 1) & (JIT_JC_BUCKET_ENTRIES - 1));
++    return bucket * JIT_JC_BUCKET_ENTRIES + slot;
++}
++
++static JITPhysEntry *jit_phys_find(uint64_t paddr, int priv, int fsbit,
++                                   BOOL create)
++{
++    uint32_t h = (uint32_t)((paddr >> 3) ^ (paddr >> 19) ^
++                            ((uint32_t)priv * 0x9e3779b1u) ^
++                            ((uint32_t)fsbit << 15));
++    uint32_t i;
++    h ^= h >> 16;
++    h *= 0x45d9f3bu;
++    h ^= h >> 16;
++    for (i = 0; i < JIT_PHYS_MAX_PROBE; i++) {
++        JITPhysEntry *e = &jit_phys_map[(h + i) & (JIT_PHYS_SIZE - 1)];
++        if (!e->valid)
++            return create ? e : NULL;
++        if (e->paddr == paddr && e->priv == priv && e->fsbit == fsbit)
++            return e;
++    }
++    return NULL;
++}
++
++
++static void jit_fill_jump(RISCVCPUState *s, JITJumpEntry *e, target_ulong pc,
++                          uint64_t paddr, uint32_t table_idx, uint32_t gen)
++{
++    e->vpc = (uint64_t)pc;
++    e->table_idx = table_idx;
++    e->ppage = (uint32_t)(paddr >> PG_SHIFT);
++    e->expected_gen = gen;
++    e->jc_gen = (uint16_t)jit_jump_gen;
++    e->priv = s->priv;
++    e->fsbit = (s->fs != 0);
++}
++
++/* Hotness gate shared by the taken-branch probe and the block-boundary
++   dispatcher. Resolution is only attempted at the threshold, so unsupported
++   PCs do not pay a TLB/physical-map lookup on every branch. */
++static BOOL jit_hot_probe(RISCVCPUState *s, target_ulong pc)
++{
++    JITHotEntry *hot;
++    JITPhysEntry *pe;
++    uint64_t paddr, page_base;
++    uint32_t gen;
++
++    if (jit_step_active)
++        return FALSE;
++    hot = &jit_hot[(uint32_t)((pc >> 2) ^ (pc >> 13)) & (JIT_HOT_SIZE - 1)];
++    if (hot->pc != (uint64_t)pc) {
++        hot->pc = (uint64_t)pc;
++        hot->hits = 0;
++        hot->crossings = 0;
++    }
++    if (++hot->hits < jit_hot_threshold)
++        return FALSE;
++    hot->hits = 0;
++
++    paddr = jit_vpc_to_paddr(s, pc);
++    if (paddr == UINT64_MAX)
++        return FALSE;
++    pe = jit_region_count ? jit_phys_find(paddr, s->priv, s->fs != 0, FALSE) : NULL;
++    if (pe != NULL) {
++        gen = jit_page_gen[jit_page_index(paddr)];
++        if (gen == pe->gen) {
++            jit_fill_jump(s, &jit_jump_cache[jit_jc_index(pc)], pc, paddr,
++                          pe->table_idx, gen);
++            hot->crossings = 0;
++            return TRUE;
++        }
++    }
++    /* Request with exponential backoff: crossings 1, 2, 4, 8, ... A request
++       is a call into JS, and a PC that cannot be translated (or whose
++       translation is still in flight) would otherwise call again every
++       threshold crossing. The physical-map lookup above still runs every
++       time, so an installed region is found promptly. */
++    if (hot->crossings != 0xffff)
++        hot->crossings++;
++    if ((hot->crossings & (hot->crossings - 1)) != 0)
++        return FALSE;
++    page_base = paddr & ~(uint64_t)PG_MASK;
++    gen = jit_watch_page(s, page_base);
++    jit_stats.requests++;
++    jit_request_region((uint32_t)(uintptr_t)s, paddr,
++                       (uint32_t)(pc & PG_MASK), s->priv,
++                       s->fs != 0, gen);
++    /* Synchronous install: enter the new region on the next dispatch. For an
++       asynchronous worker this simply misses and retries later. */
++    pe = jit_phys_find(paddr, s->priv, s->fs != 0, FALSE);
++    if (pe != NULL && jit_page_gen[jit_page_index(paddr)] == pe->gen) {
++        jit_fill_jump(s, &jit_jump_cache[jit_jc_index(pc)], pc, paddr,
++                      pe->table_idx, pe->gen);
++        return TRUE;
++    }
++    return FALSE;
++}
++
++/* Fast probe used by the interpreter for same-page taken branches. */
++static inline BOOL jit_probe_hit(RISCVCPUState *s, target_ulong pc)
++{
++    JITJumpEntry *e;
++    if (!jit_region_enabled || jit_step_active)
++        return FALSE;
++    /* Runs on every taken in-page branch: no statistics here unless the
++       diagnostics are on (they cost several percent of interpreter time). */
++    e = &jit_jump_cache[jit_jc_index(pc)];
++    if (e->vpc == (uint64_t)pc &&
++        e->jc_gen == (uint16_t)jit_jump_gen &&
++        e->priv == s->priv && e->fsbit == (s->fs != 0) &&
++        e->table_idx != 0) {
++        if (unlikely(jit_diag_enabled))
++            jit_stats.jump_hits++;
++        return TRUE;
++    }
++    if (unlikely(jit_diag_enabled))
++        jit_stats.jump_misses++;
++    return jit_hot_probe(s, pc);
++}
++
++/* Returns a JIT_STATUS_* value, or -1 when no region handled the PC. */
++static int32_t jit_try_region(RISCVCPUState *s)
++{
++    target_ulong pc = s->pc;
++    JITJumpEntry *je;
++    JITPhysEntry *pe;
++    uint64_t paddr;
++    uint32_t ppage, expected_gen, table_idx;
++    jit_region_fn_t fn;
++    int32_t status;
++
++    if (!jit_region_enabled || jit_step_active || jit_region_count == 0)
++        return -1;
++
++    je = &jit_jump_cache[jit_jc_index(pc)];
++    if (je->vpc == (uint64_t)pc &&
++        je->jc_gen == (uint16_t)jit_jump_gen &&
++        je->priv == s->priv && je->fsbit == (s->fs != 0)) {
++        if (je->table_idx == 0) {
++            /* Negative entry: no region for this PC as of the last install. */
++            if (je->expected_gen == jit_install_seq)
++                return -1;
++            goto resolve;
++        }
++        ppage = je->ppage;
++        expected_gen = je->expected_gen;
++        table_idx = je->table_idx;
++        jit_stats.region_calls++;
++        goto call_region;
++    }
++
++resolve:
++    paddr = jit_vpc_to_paddr(s, pc);
++    if (paddr == UINT64_MAX)
++        return -1;
++    pe = jit_phys_find(paddr, s->priv, s->fs != 0, FALSE);
++    expected_gen = jit_page_gen[jit_page_index(paddr)];
++    if (pe == NULL || expected_gen != pe->gen) {
++        /* Remember the miss so the next block boundary at this PC does not
++           resolve vPC -> pPC and probe the physical map again. */
++        je->vpc = (uint64_t)pc;
++        je->table_idx = 0;
++        je->expected_gen = jit_install_seq;
++        je->jc_gen = (uint16_t)jit_jump_gen;
++        je->priv = s->priv;
++        je->fsbit = (s->fs != 0);
++        return -1;
++    }
++    ppage = (uint32_t)(paddr >> PG_SHIFT);
++    table_idx = pe->table_idx;
++    je->vpc = (uint64_t)pc;
++    je->table_idx = table_idx;
++    je->ppage = ppage;
++    je->expected_gen = expected_gen;
++    je->jc_gen = (uint16_t)jit_jump_gen;
++    je->priv = s->priv;
++    je->fsbit = (s->fs != 0);
++    jit_stats.region_calls++;
++
++call_region:
++    fn = (jit_region_fn_t)(uintptr_t)table_idx;
++    status = fn((uint32_t)(uintptr_t)s, (uint64_t)pc, ppage, expected_gen);
++    switch (status) {
++    case JIT_STATUS_CONTINUE:
++        jit_stats.exits_continue++;
++        return JIT_STATUS_CONTINUE;
++    case JIT_STATUS_EXCEPTION:
++        jit_stats.exits_exception++;
++        return JIT_STATUS_EXCEPTION;
++    case JIT_STATUS_BUDGET:
++        jit_stats.exits_budget++;
++        return JIT_STATUS_BUDGET;
++    default:
++        jit_stats.exits_interp++;
++        /* A generation mismatch invalidates both cache levels. */
++        if (expected_gen != jit_page_gen[jit_page_index((uint64_t)ppage << PG_SHIFT)]) {
++            je->vpc = 0;
++        }
++        return JIT_STATUS_INTERP;
++    }
++}
++
++/* 1 = resume interpreter loop, -1 = exception, -2 = exit interpreter,
++   0 = no region / interpreter continues at s->pc. */
++static int32_t jit_dispatch(RISCVCPUState *s)
++{
++    int32_t st;
++    if (!jit_region_enabled || jit_step_active)
++        return 0;
++    if (jit_region_count != 0) {
++        st = jit_try_region(s);
++        if (st >= 0) {
++            switch (st) {
++            case JIT_STATUS_CONTINUE:
++                return 1;
++            case JIT_STATUS_EXCEPTION:
++                return -1;
++            case JIT_STATUS_BUDGET:
++                return -2;
++            default:
++                return 0;
++            }
++        }
++    }
++    /* Cold start or a PC without a translation: hotness is also counted at
++       block boundaries so cross-page calls/jumps can seed the first region. */
++    jit_hot_probe(s, s->pc);
++    return 0;
++}
++
++void jit_poll(void)
++{
++    if (jit_cpu_state != NULL)
++        jit_poll_import();
++}
++
++/* ---- PC sampler and deterministic trace ring --------------------- */
++
++#define JIT_SAMPLE_RING_SIZE 8192
++#define JIT_TRACE_RING_SIZE  4096
++
++static uint64_t jit_sample_pcs[JIT_SAMPLE_RING_SIZE];
++static uint32_t jit_sample_head;
++static uint64_t jit_sample_interval = 1u << 16;
++static uint64_t jit_sample_next;
++static int32_t jit_sampler_enabled;
++
++static uint64_t jit_trace_hashes[JIT_TRACE_RING_SIZE];
++static uint32_t jit_trace_head_idx;
++static uint64_t jit_trace_interval = 1u << 20;
++static uint64_t jit_trace_next;
++static int32_t jit_trace_enabled;
++static int32_t jit_diag_enabled;
++
++static uint64_t jit_state_hash_impl(RISCVCPUState *s)
++{
++    uint64_t h = 1469598103934665603ULL;
++    int i;
++#define JIT_HASH_MIX(v) do { \
++        h ^= (uint64_t)(v); \
++        h *= 1099511628211ULL; \
++    } while (0)
++    JIT_HASH_MIX(s->pc);
++    for (i = 1; i < 32; i++)
++        JIT_HASH_MIX(s->reg[i]);
++    JIT_HASH_MIX(s->priv);
++    JIT_HASH_MIX(s->fs);
++    JIT_HASH_MIX(s->satp);
++#if FLEN > 0
++    JIT_HASH_MIX(s->fflags);
++    JIT_HASH_MIX(s->frm);
++    for (i = 0; i < 32; i++)
++        JIT_HASH_MIX(s->fp_reg[i]);
++#endif
++    JIT_HASH_MIX(s->load_res);
++#undef JIT_HASH_MIX
++    return h;
++}
++
++/* Called at interpreter block boundaries. `now` is the live instruction
++   counter (s->insn_counter is only flushed when the interpreter exits). */
++static inline void jit_sample_tick(RISCVCPUState *s, uint64_t now)
++{
++    if (likely(!jit_sampler_enabled && !jit_trace_enabled))
++        return;
++    if (jit_sampler_enabled && now >= jit_sample_next) {
++        jit_sample_pcs[jit_sample_head & (JIT_SAMPLE_RING_SIZE - 1)] = (uint64_t)s->pc;
++        jit_sample_head++;
++        jit_sample_next = now + jit_sample_interval;
++    }
++    if (jit_trace_enabled && now >= jit_trace_next) {
++        jit_trace_hashes[jit_trace_head_idx & (JIT_TRACE_RING_SIZE - 1)] = jit_state_hash_impl(s);
++        jit_trace_head_idx++;
++        jit_trace_next = now + jit_trace_interval;
++    }
++}
++
++__attribute__((export_name("jit_sampler_enable")))
++void jit_sampler_enable(uint32_t interval)
++{
++    jit_sample_interval = interval ? interval : (1u << 16);
++    jit_sample_head = 0;
++    jit_sample_next = jit_cpu_state ? jit_cpu_state->insn_counter + jit_sample_interval : 0;
++    jit_sampler_enabled = 1;
++    jit_diag_enabled = 1;
++}
++
++__attribute__((export_name("jit_sampler_disable")))
++void jit_sampler_disable(void)
++{
++    jit_sampler_enabled = 0;
++    jit_diag_enabled = jit_sampler_enabled || jit_trace_enabled;
++}
++
++__attribute__((export_name("jit_sampler_ptr")))
++uint32_t jit_sampler_ptr(void)
++{
++    return (uint32_t)(uintptr_t)jit_sample_pcs;
++}
++
++__attribute__((export_name("jit_sampler_head")))
++uint32_t jit_sampler_head(void)
++{
++    return jit_sample_head;
++}
++
++__attribute__((export_name("jit_trace_enable")))
++void jit_trace_enable(uint32_t interval)
++{
++    jit_trace_interval = interval ? interval : (1u << 20);
++    jit_trace_head_idx = 0;
++    jit_trace_next = jit_cpu_state ? jit_cpu_state->insn_counter + jit_trace_interval : 0;
++    jit_trace_enabled = 1;
++    jit_diag_enabled = 1;
++}
++
++__attribute__((export_name("jit_trace_disable")))
++void jit_trace_disable(void)
++{
++    jit_trace_enabled = 0;
++    jit_diag_enabled = jit_sampler_enabled || jit_trace_enabled;
++}
++
++__attribute__((export_name("jit_trace_ptr")))
++uint32_t jit_trace_ptr(void)
++{
++    return (uint32_t)(uintptr_t)jit_trace_hashes;
++}
++
++__attribute__((export_name("jit_trace_head")))
++uint32_t jit_trace_head(void)
++{
++    return jit_trace_head_idx;
++}
++
++/* ---- exports used by the host / generated code ------------------- */
++
++__attribute__((export_name("jit_region_set_enabled")))
++void jit_region_set_enabled(int32_t v)
++{
++    if (v && !jit_region_enabled)
++        jit_epoch_flush();
++    jit_region_enabled = v;
++}
++
++__attribute__((export_name("jit_region_version")))
++uint32_t jit_region_version(void)
++{
++    return 1;
++}
++
++/* Addresses used by translated code to chain regions without returning to
++   the interpreter loop: the region's exit tail probes the jump cache inline
++   and tail-calls the next region (return_call_indirect). It must stop where
++   the interpreter loop would act: budget exhausted or an interrupt pending.
++   The layout of JITJumpEntry and jit_jc_index() are mirrored in
++   src/jit/emitter.js (JC_* constants). */
++_Static_assert(sizeof(JITJumpEntry) == 24, "JITJumpEntry layout");
++_Static_assert(offsetof(JITJumpEntry, table_idx) == 8, "JITJumpEntry layout");
++_Static_assert(offsetof(JITJumpEntry, ppage) == 12, "JITJumpEntry layout");
++_Static_assert(offsetof(JITJumpEntry, expected_gen) == 16, "JITJumpEntry layout");
++_Static_assert(offsetof(JITJumpEntry, jc_gen) == 20, "JITJumpEntry layout");
++_Static_assert(offsetof(JITJumpEntry, priv) == 22, "JITJumpEntry layout");
++_Static_assert(offsetof(JITJumpEntry, fsbit) == 23, "JITJumpEntry layout");
++
++__attribute__((export_name("jit_chain_ptr")))
++uint32_t jit_chain_ptr(uint32_t state_ptr, uint32_t which)
++{
++    RISCVCPUState *s = (RISCVCPUState *)(uintptr_t)state_ptr;
++    switch (which) {
++    case 0: return (uint32_t)(uintptr_t)jit_jump_cache;
++    case 1: return (uint32_t)(uintptr_t)&jit_jump_gen;
++    case 2: return (uint32_t)(uintptr_t)&s->priv;
++    case 3: return (uint32_t)(uintptr_t)&s->fs;
++    case 4: return (uint32_t)(uintptr_t)&s->mip;
++    case 5: return (uint32_t)(uintptr_t)&s->mie;
++    case 6: return (uint32_t)(uintptr_t)&jit_stats.chained;
++    case 7: return JIT_JC_BUCKETS;
++    case 8: return JIT_JC_BUCKET_ENTRIES;
++    default: return 0;
++    }
++}
++
++/* Address of the TLB context tag the translated code must fold into its
++   inline TLB compares (0 = data, 1 = code). */
++__attribute__((export_name("jit_set_hot_threshold")))
++void jit_set_hot_threshold(uint32_t n)
++{
++    jit_hot_threshold = n == 0 ? 1 : (n > 65535 ? 65535 : n);
++}
++
++__attribute__((export_name("jit_tlb_size")))
++uint32_t jit_tlb_size(void)
++{
++    return TLB_SIZE;
++}
++
++__attribute__((export_name("jit_tlb_tag_ptr")))
++uint32_t jit_tlb_tag_ptr(uint32_t state_ptr, uint32_t which)
++{
++    RISCVCPUState *s = (RISCVCPUState *)(uintptr_t)state_ptr;
++    return (uint32_t)(uintptr_t)(which ? &s->tlb_code_tag : &s->tlb_data_tag);
++}
++
++/* Physical-map capacity, so the host can start a new epoch before the
++   bounded probes start rejecting installs. */
++__attribute__((export_name("jit_phys_capacity")))
++uint32_t jit_phys_capacity(void)
++{
++    return JIT_PHYS_SIZE;
++}
++
++__attribute__((export_name("jit_stats_ptr")))
++uint32_t jit_stats_ptr(void)
++{
++    return (uint32_t)(uintptr_t)&jit_stats;
++}
++
++__attribute__((export_name("jit_page_gen_ptr")))
++uint32_t jit_page_gen_ptr(void)
++{
++    return (uint32_t)(uintptr_t)jit_page_gen;
++}
++
++/* Host pointer for a guest physical address (0 if it is not RAM). Used by the
++   host translator to read the bytes of a page. */
++__attribute__((export_name("jit_paddr_to_host")))
++uint32_t jit_paddr_to_host(uint64_t paddr)
++{
++    PhysMemoryRange *pr = get_phys_mem_range(jit_cpu_state->mem_map, paddr);
++    if (!pr || !pr->is_ram || pr->size == 0)
++        return 0;
++    return (uint32_t)(uintptr_t)(pr->phys_mem + (uintptr_t)(paddr - pr->addr));
++}
++
++__attribute__((export_name("jit_watch_ptr")))
++uint32_t jit_watch_ptr(void)
++{
++    return (uint32_t)(uintptr_t)jit_watched;
++}
++
++__attribute__((export_name("jit_state_ptr")))
++uint32_t jit_state_ptr(void)
++{
++    return (uint32_t)(uintptr_t)jit_cpu_state;
++}
++
++__attribute__((export_name("jit_pc_ptr")))
++uint32_t jit_pc_ptr(uint32_t state_ptr)
++{
++    return (uint32_t)(uintptr_t)&((RISCVCPUState *)(uintptr_t)state_ptr)->pc;
++}
++
++__attribute__((export_name("jit_cycles_ptr")))
++uint32_t jit_cycles_ptr(uint32_t state_ptr)
++{
++    return (uint32_t)(uintptr_t)&((RISCVCPUState *)(uintptr_t)state_ptr)->n_cycles;
++}
++
++__attribute__((export_name("jit_insn_counter")))
++uint64_t jit_insn_counter(uint32_t state_ptr)
++{
++    return ((RISCVCPUState *)(uintptr_t)state_ptr)->insn_counter;
++}
++
++__attribute__((export_name("jit_install_region")))
++int32_t jit_install_region(uint64_t paddr, uint32_t table_idx,
++                           uint32_t priv, uint32_t fsbit,
++                           uint32_t expected_gen)
++{
++    JITPhysEntry *pe;
++    uint32_t pg = jit_page_index(paddr);
++
++    if (jit_page_gen[pg] != expected_gen) {
++        jit_stats.install_rejects++;
++        return -1;
++    }
++    pe = jit_phys_find(paddr, priv, fsbit, TRUE);
++    if (pe == NULL) {
++        jit_stats.install_rejects++;
++        return -2;
++    }
++    pe->paddr = paddr;
++    pe->table_idx = table_idx;
++    pe->gen = expected_gen;
++    pe->priv = (uint8_t)priv;
++    pe->fsbit = (uint8_t)fsbit;
++    pe->valid = 1;
++    jit_region_count++;
++    jit_install_seq++;
++    /* No jump-cache flush: an existing entry for the same PC points at an
++       equally valid region (the generation is checked at region entry). */
++    jit_stats.installs++;
++    return 0;
++}
++
++__attribute__((export_name("jit_epoch_flush")))
++void jit_epoch_flush(void)
++{
++    memset(jit_phys_map, 0, sizeof(jit_phys_map));
++    jit_region_count = 0;
++    jit_flush_jump_cache();
++}
++
++__attribute__((export_name("jit_watch_page")))
++uint32_t jit_watch_page_export(uint64_t paddr)
++{
++    return jit_watch_page(jit_cpu_state, paddr);
++}
++
++__attribute__((export_name("jit_state_hash")))
++uint64_t jit_state_hash(uint32_t state_ptr)
++{
++    return jit_state_hash_impl((RISCVCPUState *)(uintptr_t)state_ptr);
++}
++#endif /* CONFIG_JIT */
++
+ static void tlb_init(RISCVCPUState *s)
+ {
+     int i;
+@@ -799,9 +1512,24 @@ static void tlb_init(RISCVCPUState *s)
+     }
+ }
+ 
++static void tlb_update_tags(RISCVCPUState *s);
++
+ static void tlb_flush_all(RISCVCPUState *s)
+ {
+-    tlb_init(s);
++    /* The jump cache is tagged with privilege and FS, so ordinary
++       U<->S transitions (set_priv) do not invalidate it. Callers that
++       change the page-table root or MMU permission mode flush it
++       explicitly.
++       Entries carry the flush epoch in their tag, so advancing the epoch
++       invalidates all of them. The epoch stays below 31: with the largest
++       context (13) the tag is at most 0xfe8, so a lookup key (tag | up to 7
++       alignment bits) can never equal the empty marker -1. */
++    s->tlb_epoch++;
++    if (s->tlb_epoch >= 31) {
++        s->tlb_epoch = 0;
++        tlb_init(s);
++    }
++    tlb_update_tags(s);
+ }
+ 
+ static void tlb_flush_vaddr(RISCVCPUState *s, target_ulong vaddr)
+@@ -809,6 +1537,32 @@ static void tlb_flush_vaddr(RISCVCPUState *s, target_ulong vaddr)
+     tlb_flush_all(s);
+ }
+ 
++/* Recompute the TLB context tags. Must run after any change of priv or of
++   mstatus MPRV/MPP/SUM/MXR. The data context is what get_phys_addr() uses
++   for loads/stores: the effective privilege (MPP when MPRV is set), SUM
++   (only meaningful in S-mode) and MXR. Code fetches use the privilege only.
++   The flush epoch (see tlb_flush_all) is folded into both tags. */
++static void tlb_update_tags(RISCVCPUState *s)
++{
++    int priv = s->priv;
++    target_ulong ctx;
++
++    /* Same rule as get_phys_addr(): MPRV applies to data accesses at any
++       privilege. */
++    if (s->mstatus & MSTATUS_MPRV)
++        priv = (s->mstatus >> MSTATUS_MPP_SHIFT) & 3;
++    ctx = priv;
++    if (priv == PRV_S && (s->mstatus & MSTATUS_SUM))
++        ctx |= 4;
++    if (priv != PRV_M && (s->mstatus & MSTATUS_MXR))
++        ctx |= 8;
++    /* get_phys_addr() does not translate in M-mode: one context. */
++    if (priv == PRV_M)
++        ctx = PRV_M;
++    s->tlb_data_tag = (ctx | ((target_ulong)s->tlb_epoch << 4)) << 3;
++    s->tlb_code_tag = ((target_ulong)s->priv | ((target_ulong)s->tlb_epoch << 4)) << 3;
++}
++
+ /* XXX: inefficient but not critical as long as it is seldom used */
+ static void glue(riscv_cpu_flush_tlb_write_range_ram,
+                  MAX_XLEN)(RISCVCPUState *s,
+@@ -821,7 +1575,7 @@ static void glue(riscv_cpu_flush_tlb_write_range_ram,
+     for(i = 0; i < TLB_SIZE; i++) {
+         if (s->tlb_write[i].vaddr != -1) {
+             ptr = (uint8_t *)(s->tlb_write[i].mem_addend +
+-                              (uintptr_t)s->tlb_write[i].vaddr);
++                              (uintptr_t)(s->tlb_write[i].vaddr & ~(target_ulong)PG_MASK));
+             if (ptr >= ram_ptr && ptr < ram_end) {
+                 s->tlb_write[i].vaddr = -1;
+             }
+@@ -879,12 +1633,11 @@ static void set_mstatus(RISCVCPUState *s, target_ulong val)
+ {
+     target_ulong mod, mask;
+     
+-    /* flush the TLBs if change of MMU config */
++    /* MPRV/MPP/SUM/MXR changes select a different TLB context (see
++       tlb_update_tags) instead of flushing the TLBs. They do not affect
++       instruction fetch, so the JIT jump cache stays valid. */
+     mod = s->mstatus ^ val;
+-    if ((mod & (MSTATUS_MPRV | MSTATUS_SUM | MSTATUS_MXR)) != 0 ||
+-        ((s->mstatus & MSTATUS_MPRV) && (mod & MSTATUS_MPP) != 0)) {
+-        tlb_flush_all(s);
+-    }
++    (void)mod;
+     s->fs = (val >> MSTATUS_FS_SHIFT) & 3;
+ 
+     mask = MSTATUS_MASK & ~MSTATUS_FS;
+@@ -900,6 +1653,7 @@ static void set_mstatus(RISCVCPUState *s, target_ulong val)
+     }
+ #endif
+     s->mstatus = (s->mstatus & ~mask) | (val & mask);
++    tlb_update_tags(s);
+ }
+ 
+ /* return -1 if invalid CSR. 0 if OK. 'will_write' indicate that the
+@@ -947,6 +1701,22 @@ static int csr_read(RISCVCPUState *s, target_ulong *pval, uint32_t csr,
+         }
+         val = (int64_t)s->insn_counter;
+         break;
++    case 0xc01: /* time */
++        {
++            uint32_t counteren;
++            if (s->priv < PRV_M) {
++                if (s->priv < PRV_S)
++                    counteren = s->scounteren;
++                else
++                    counteren = s->mcounteren;
++                if (((counteren >> 1) & 1) == 0)
++                    goto invalid_csr;
++            }
++        }
++        if (!s->get_time)
++            goto invalid_csr;
++        val = (int64_t)s->get_time(s->time_opaque);
++        break;
+     case 0xc80: /* mcycleh */
+     case 0xc82: /* minstreth */
+         if (s->cur_xlen != 32)
+@@ -1157,6 +1927,9 @@ static int csr_write(RISCVCPUState *s, uint32_t csr, target_ulong val)
+         }
+ #endif
+         tlb_flush_all(s);
++#ifdef CONFIG_JIT
++        jit_flush_jump_cache();
++#endif
+         return 2;
+         
+     case 0x300:
+@@ -1225,7 +1998,7 @@ static int csr_write(RISCVCPUState *s, uint32_t csr, target_ulong val)
+ static void set_priv(RISCVCPUState *s, int priv)
+ {
+     if (s->priv != priv) {
+-        tlb_flush_all(s);
++        /* No TLB flush: entries are tagged with their context. */
+ #if MAX_XLEN >= 64
+         /* change the current xlen */
+         {
+@@ -1241,6 +2014,7 @@ static void set_priv(RISCVCPUState *s, int priv)
+ #endif
+         s->priv = priv;
+     }
++    tlb_update_tags(s);
+ }
+ 
+ static void raise_exception2(RISCVCPUState *s, uint32_t cause,
+@@ -1458,6 +2232,13 @@ static inline uint32_t remu32(uint32_t a, uint32_t b)
+ #if MAX_XLEN >= 64
+ #define XLEN 64
+ #include "riscv_cpu_template.h"
++#ifdef CONFIG_JIT
++/* Single-step copy of the interpreter for jit_step(). */
++#define JIT_STEP_VARIANT
++#define XLEN 64
++#include "riscv_cpu_template.h"
++#undef JIT_STEP_VARIANT
++#endif
+ #endif
+ 
+ #if MAX_XLEN >= 128
+@@ -1498,6 +2279,117 @@ static void glue(riscv_cpu_interp, MAX_XLEN)(RISCVCPUState *s, int n_cycles)
+     }
+ }
+ 
++#ifdef CONFIG_JIT
++/* Execute exactly one instruction at s->pc. Returns 0 on success, 1 if the
++   instruction took a trap (already applied, so s->pc is the handler). The
++   caller's cycle budget is preserved; the region accounts for the retired
++   instruction. This is both the generic fallback for rare instructions and
++   the oracle used by lockstep verification. */
++__attribute__((export_name("jit_step")))
++int32_t jit_step(uint32_t state_ptr)
++{
++    RISCVCPUState *s = (RISCVCPUState *)(uintptr_t)state_ptr;
++    int32_t saved_cycles = s->n_cycles;
++    uint64_t saved_counter = s->insn_counter;
++    int saved_pending = s->pending_exception;
++
++    jit_step_active++;
++    s->n_cycles = 1;
++    s->pending_exception = -1;
++    riscv_cpu_step_x64(s, 1);
++    jit_step_active--;
++    s->n_cycles = saved_cycles;
++    if (s->pending_exception >= 0) {
++        /* The template already applied the trap and s->pc is the handler.
++           The interpreter charges two cycles for a trapping instruction (one
++           fetch + one exception), so keep insn_counter in lockstep. Clear the
++           marker: the region returns CONTINUE at the handler. */
++        s->insn_counter = saved_counter + 2;
++        s->pending_exception = -1;
++        return 1;
++    }
++    /* Exactly one instruction retired. */
++    s->insn_counter = saved_counter + 1;
++    s->pending_exception = saved_pending;
++    return 0;
++}
++#endif
++
++#ifdef CONFIG_JIT
++/*
++ * Store helper for translated code. It uses the same write TLB fast path as
++ * the interpreter, but refuses to perform a direct store to a page that is
++ * currently watched for code invalidation. That closes the otherwise subtle
++ * hole where a region could write its own (or another region's) code page
++ * without bumping the generation. Slow-path stores report whether the page
++ * was invalidated, was MMIO, or faulted.
++ *
++ * Returns JIT_STORE_*; on FAULT pending_exception is set and the region must
++ * return JIT_STATUS_EXCEPTION with s->pc at this instruction. The region
++ * counts the store itself; mmu_exception charges the exception cycle.
++ */
++__attribute__((export_name("jit_store_helper")))
++int32_t jit_store_helper(uint32_t state_ptr, uint64_t vaddr, uint64_t val,
++                         uint32_t size_log2)
++{
++    RISCVCPUState *s = (RISCVCPUState *)(uintptr_t)state_ptr;
++    target_ulong addr = (target_ulong)vaddr;
++    uint32_t tlb_idx;
++    uint64_t inval;
++
++    if (size_log2 > 3)
++        return JIT_STORE_FAULT;
++    tlb_idx = (uint32_t)((addr >> PG_SHIFT) & (TLB_SIZE - 1));
++
++    inval = jit_stats.invalidations;
++    if (target_write_slow(s, addr, (mem_uint_t)val, (int)size_log2))
++        return JIT_STORE_FAULT;
++    if (jit_stats.invalidations != inval)
++        return JIT_STORE_INVALID;
++    /* A RAM store leaves a write-TLB entry for exactly this page. A device
++       (MMIO) write does not touch the entry, which may still map another
++       page, so compare the tag instead of testing for an empty slot. The
++       region must leave after an MMIO store: it can raise an interrupt. */
++    if (s->tlb_write[tlb_idx].vaddr != ((addr & ~(target_ulong)PG_MASK) ^ s->tlb_data_tag))
++        return JIT_STORE_SLOW;
++    return JIT_STORE_OK;
++}
++#endif
++
++#ifdef CONFIG_JIT
++/*
++ * Load helper for translated code, used when the inline read-TLB probe
++ * misses. TinyEMU flushes the TLBs on every privilege change, so without it
++ * regions would exit on the first load after each trap. The value goes to
++ * jit_load_value (single hart), where the region reads it with the same
++ * sign/zero-extending load it uses for the inline path.
++ *
++ * Returns JIT_STORE_OK, or JIT_STORE_FAULT with pending_exception set; the
++ * region then returns JIT_STATUS_EXCEPTION with s->pc at the load.
++ */
++static uint64_t jit_load_value;
++
++__attribute__((export_name("jit_load_value_ptr")))
++uint32_t jit_load_value_ptr(void)
++{
++    return (uint32_t)(uintptr_t)&jit_load_value;
++}
++
++__attribute__((export_name("jit_load_helper")))
++int32_t jit_load_helper(uint32_t state_ptr, uint64_t vaddr, uint32_t size_log2)
++{
++    RISCVCPUState *s = (RISCVCPUState *)(uintptr_t)state_ptr;
++    mem_uint_t val;
++
++    if (size_log2 > 3)
++        return JIT_STORE_FAULT;
++    if (target_read_slow(s, &val, (target_ulong)vaddr, (int)size_log2))
++        return JIT_STORE_FAULT;
++    jit_load_value = (uint64_t)val;
++    return JIT_STORE_OK;
++}
++#endif
++
+ /* Note: the value is not accurate when called in riscv_cpu_interp() */
+ static uint64_t glue(riscv_cpu_get_cycles, MAX_XLEN)(RISCVCPUState *s)
+ {
+@@ -1538,6 +2430,9 @@ static RISCVCPUState *glue(riscv_cpu_init, MAX_XLEN)(PhysMemoryMap *mem_map)
+ #endif
+     s->common.class_ptr = &glue(riscv_cpu_class, MAX_XLEN);
+     s->mem_map = mem_map;
++#ifdef CONFIG_JIT
++    jit_cpu_state = s;
++#endif
+     s->pc = 0x1000;
+     s->priv = PRV_M;
+     s->cur_xlen = MAX_XLEN;
+@@ -1558,6 +2453,7 @@ static RISCVCPUState *glue(riscv_cpu_init, MAX_XLEN)(PhysMemoryMap *mem_map)
+     s->misa |= MCPUID_C;
+ #endif
+     tlb_init(s);
++    tlb_update_tags(s);
+     return s;
+ }
+ 
+@@ -1587,6 +2483,14 @@ const RISCVCPUClass glue(riscv_cpu_class, MAX_XLEN) = {
+ };
+ 
+ #if CONFIG_RISCV_MAX_XLEN == MAX_XLEN
++void riscv_cpu_set_time_source(RISCVCPUState *s,
++                               uint64_t (*get_time)(void *opaque),
++                               void *opaque)
++{
++    s->get_time = get_time;
++    s->time_opaque = opaque;
++}
++
+ RISCVCPUState *riscv_cpu_init(PhysMemoryMap *mem_map, int max_xlen)
+ {
+     const RISCVCPUClass *c;
+diff --git a/riscv_cpu.h b/riscv_cpu.h
+index 6fb8b37..a2308e7 100644
+--- a/riscv_cpu.h
++++ b/riscv_cpu.h
+@@ -68,6 +68,10 @@ extern const RISCVCPUClass riscv_cpu_class64;
+ extern const RISCVCPUClass riscv_cpu_class128;
+ 
+ RISCVCPUState *riscv_cpu_init(PhysMemoryMap *mem_map, int max_xlen);
++/* Provide the CLINT mtime so the `time` CSR can be read directly. */
++void riscv_cpu_set_time_source(RISCVCPUState *s,
++                               uint64_t (*get_time)(void *opaque),
++                               void *opaque);
+ static inline void riscv_cpu_end(RISCVCPUState *s)
+ {
+     const RISCVCPUClass *c = ((RISCVCPUCommonState *)s)->class_ptr;
+diff --git a/riscv_cpu_priv.h b/riscv_cpu_priv.h
+index 983d8b8..75e6021 100644
+--- a/riscv_cpu_priv.h
++++ b/riscv_cpu_priv.h
+@@ -98,7 +98,10 @@ typedef uint128_t mem_uint_t;
+ #unsupported MLEN
+ #endif
+ 
+-#define TLB_SIZE 256
++/* 1024 direct-mapped entries per TLB (was 256): the guest working sets
++   (CPython heap, V8, kernel) thrashed the small TLB. Flushes stay O(1)
++   amortized thanks to the epoch in the TLB tag. */
++#define TLB_SIZE 1024
+ 
+ #define CAUSE_MISALIGNED_FETCH    0x0
+ #define CAUSE_FAULT_FETCH         0x1
+@@ -198,6 +201,22 @@ struct RISCVCPUState {
+     uint8_t fs; /* MSTATUS_FS value */
+     uint8_t mxl; /* MXL field in MISA register */
+     
++    /* Tagged TLBs: entries store (page ^ tag), where the tag encodes the
++       translation context (effective privilege, SUM, MXR for data; privilege
++       for code) in bits 3..6. A privilege or SUM/MXR/MPRV change only
++       switches the tag instead of flushing every TLB. Bits 3..6 never
++       overlap the alignment bits kept by the lookups (bits 0..2), and a
++       tagged lookup key can never equal the empty marker (-1). */
++    target_ulong tlb_data_tag;
++    target_ulong tlb_code_tag;
++    /* Flush epoch (0..30), part of the tag in bits 7..11: a full flush just
++       advances it; the arrays are only cleared when it wraps. */
++    uint32_t tlb_epoch;
++    /* Time source for the `time` CSR (the CLINT mtime). Without it, every
++       rdtime traps to M-mode for emulation. */
++    uint64_t (*get_time)(void *opaque);
++    void *time_opaque;
++
+     int32_t n_cycles; /* only used inside the CPU loop */
+     uint64_t insn_counter;
+     BOOL power_down_flag;
+@@ -254,7 +273,7 @@ static inline __exception int target_read_u ## size(RISCVCPUState *s, uint_type
+ {\
+     uint32_t tlb_idx;\
+     tlb_idx = (addr >> PG_SHIFT) & (TLB_SIZE - 1);\
+-    if (likely(s->tlb_read[tlb_idx].vaddr == (addr & ~(PG_MASK & ~((size / 8) - 1))))) { \
++    if (likely(s->tlb_read[tlb_idx].vaddr == ((addr & ~(PG_MASK & ~((size / 8) - 1))) ^ s->tlb_data_tag))) { \
+         *pval = *(uint_type *)(s->tlb_read[tlb_idx].mem_addend + (uintptr_t)addr);\
+     } else {\
+         mem_uint_t val;\
+@@ -272,7 +291,7 @@ static inline __exception int target_write_u ## size(RISCVCPUState *s, target_ul
+ {\
+     uint32_t tlb_idx;\
+     tlb_idx = (addr >> PG_SHIFT) & (TLB_SIZE - 1);\
+-    if (likely(s->tlb_write[tlb_idx].vaddr == (addr & ~(PG_MASK & ~((size / 8) - 1))))) { \
++    if (likely(s->tlb_write[tlb_idx].vaddr == ((addr & ~(PG_MASK & ~((size / 8) - 1))) ^ s->tlb_data_tag))) { \
+         *(uint_type *)(s->tlb_write[tlb_idx].mem_addend + (uintptr_t)addr) = val;\
+         return 0;\
+     } else {\
+diff --git a/riscv_cpu_template.h b/riscv_cpu_template.h
+index 24f7b81..2f596b6 100644
+--- a/riscv_cpu_template.h
++++ b/riscv_cpu_template.h
+@@ -34,6 +34,7 @@
+ #error unsupported XLEN
+ #endif
+ 
++#ifndef JIT_STEP_VARIANT /* helpers are shared with the single-step copy */
+ static inline intx_t glue(div, XLEN)(intx_t a, intx_t b)
+ {
+     if (b == 0) {
+@@ -169,6 +170,8 @@ static inline uintx_t glue(mulhsu, XLEN)(intx_t a, uintx_t b)
+ 
+ #endif
+ 
++#endif /* !JIT_STEP_VARIANT */
++
+ #define DUP2(F, n) F(n) F(n+1)
+ #define DUP4(F, n) DUP2(F, n) DUP2(F, n + 2)
+ #define DUP8(F, n) DUP4(F, n) DUP4(F, n + 4)
+@@ -188,8 +191,42 @@ static inline uintx_t glue(mulhsu, XLEN)(intx_t a, uintx_t b)
+ #define GET_PC() (target_ulong)((uintptr_t)code_ptr + code_to_pc_addend)
+ #define GET_INSN_COUNTER() (insn_counter_addend - s->n_cycles)
+ 
+-#define C_NEXT_INSN code_ptr += 2; break
+-#define NEXT_INSN code_ptr += 4; break
++/* The template is instantiated twice with CONFIG_JIT: the interpreter
++   proper, and (JIT_STEP_VARIANT) riscv_cpu_step_xNN, which retires exactly
++   one instruction for jit_step(). Keeping the single-step logic out of the
++   interpreter avoids a check after every instruction. */
++#undef JIT_SINGLE_STEP_EXIT
++#undef JIT_PROBE_HIT
++#undef JIT_SAMPLE_TICK
++#undef JIT_IRQ_CHECK
++#if defined(CONFIG_JIT) && defined(JIT_STEP_VARIANT)
++#define JIT_SINGLE_STEP_EXIT() do {                                         \
++        s->pc = GET_PC();                                               \
++        code_ptr = NULL;                                                \
++        code_end = NULL;                                                \
++        code_to_pc_addend = s->pc;                                      \
++    } while (0)
++#define JIT_PROBE_HIT(s, pc) FALSE
++#define JIT_SAMPLE_TICK(s, now) do { } while (0)
++/* jit_step must retire exactly the instruction at s->pc: no interrupts. */
++#define JIT_IRQ_CHECK 0
++#elif defined(CONFIG_JIT)
++#define JIT_SINGLE_STEP_EXIT() do { } while (0)
++#define JIT_PROBE_HIT(s, pc) (jit_region_enabled && jit_probe_hit((s), (pc)))
++#define JIT_SAMPLE_TICK(s, now) do { \
++        if (unlikely(jit_diag_enabled)) \
++            jit_sample_tick((s), (now)); \
++    } while (0)
++#define JIT_IRQ_CHECK 1
++#else
++#define JIT_SINGLE_STEP_EXIT() do { } while (0)
++#define JIT_PROBE_HIT(s, pc) FALSE
++#define JIT_SAMPLE_TICK(s, now) do { } while (0)
++#define JIT_IRQ_CHECK 1
++#endif
++
++#define C_NEXT_INSN code_ptr += 2; JIT_SINGLE_STEP_EXIT(); break
++#define NEXT_INSN code_ptr += 4; JIT_SINGLE_STEP_EXIT(); break
+ #define JUMP_INSN do {   \
+         code_ptr = NULL;           \
+         code_end = NULL;           \
+@@ -199,8 +236,14 @@ static inline uintx_t glue(mulhsu, XLEN)(intx_t a, uintx_t b)
+ #define FAST_JUMP_INSN do {                                               \
+         target_ulong new_pc__ = s->pc;                                  \
+         target_ulong old_pc__ = GET_PC();                               \
++        JIT_SAMPLE_TICK(s, GET_INSN_COUNTER());                         \
+         if (likely(s->n_cycles > 0 &&                                   \
+                    (s->mip & s->mie) == 0 &&                            \
++                   /* Only loop back-edges probe for regions: forward   \
++                      in-page targets are reached again through block   \
++                      boundaries, and the probe is the main cost of     \
++                      the JIT in interpreted code. */                   \
++                   !(new_pc__ <= old_pc__ && JIT_PROBE_HIT(s, new_pc__)) && \
+                    ((new_pc__ ^ old_pc__) & ~(target_ulong)PG_MASK) == 0)) { \
+             code_ptr = (uint8_t *)((uintptr_t)new_pc__ - code_to_pc_addend); \
+             goto jump_insn;                                             \
+@@ -208,8 +251,13 @@ static inline uintx_t glue(mulhsu, XLEN)(intx_t a, uintx_t b)
+         JUMP_INSN;                                                            \
+     } while (0)
+ 
++#ifdef JIT_STEP_VARIANT
++static void no_inline glue(riscv_cpu_step_x, XLEN)(RISCVCPUState *s,
++                                                 int n_cycles1)
++#else
+ static void no_inline glue(riscv_cpu_interp_x, XLEN)(RISCVCPUState *s,
+                                                    int n_cycles1)
++#endif
+ {
+     uint32_t opcode, insn, rd, rs1, rs2, funct3;
+     int32_t imm, cond, err;
+@@ -230,7 +278,7 @@ static void no_inline glue(riscv_cpu_interp_x, XLEN)(RISCVCPUState *s,
+     s->n_cycles = n_cycles1;
+ 
+     /* check pending interrupts */
+-    if (unlikely((s->mip & s->mie) != 0)) {
++    if (unlikely(JIT_IRQ_CHECK && (s->mip & s->mie) != 0)) {
+         if (raise_interrupt(s)) {
+             s->n_cycles--; 
+             goto done_interp;
+@@ -253,6 +301,9 @@ static void no_inline glue(riscv_cpu_interp_x, XLEN)(RISCVCPUState *s,
+             uint8_t *ptr;
+             
+             s->pc = GET_PC();
++#ifdef CONFIG_JIT
++            JIT_SAMPLE_TICK(s, GET_INSN_COUNTER());
++#endif
+             /* we test n_cycles only between blocks so that timer
+                interrupts only happen between the blocks. It is
+                important to reduce the translated code size. */
+@@ -260,24 +311,40 @@ static void no_inline glue(riscv_cpu_interp_x, XLEN)(RISCVCPUState *s,
+                 goto the_end;
+ 
+             /* check pending interrupts */
+-            if (unlikely((s->mip & s->mie) != 0)) {
++            /* jit_step must retire exactly the instruction at s->pc: taking an
++               interrupt here would move s->pc to the handler while the region
++               that called it continues with the next instruction. */
++            if (unlikely(JIT_IRQ_CHECK && (s->mip & s->mie) != 0)) {
+                 if (raise_interrupt(s)) {
+                     s->n_cycles--; 
+                     goto the_end;
+                 }
+             }
+     
+-#ifdef CONFIG_JIT
+-            if (initialized && jit_try_block((uint32_t)(uintptr_t)s)) {
+-                code_to_pc_addend = s->pc;
+-                code_ptr = NULL;
+-                code_end = NULL;
+-                continue;
++#if defined(CONFIG_JIT) && !defined(JIT_STEP_VARIANT)
++            /* CSR reads (rdinstret/rdcycle) use s->insn_counter directly, so
++               flush the live count before handing control to compiled code
++               and again after it returns. The interpreter's addend remains
++               valid because n_cycles is the only thing regions modify. */
++            s->insn_counter = GET_INSN_COUNTER();
++            {
++                int32_t jit_ret = jit_dispatch(s);
++                s->insn_counter = GET_INSN_COUNTER();
++                if (jit_ret != 0) {
++                    code_to_pc_addend = s->pc;
++                    code_ptr = NULL;
++                    code_end = NULL;
++                    if (jit_ret > 0)
++                        continue;
++                    if (jit_ret == -1)
++                        goto mmu_exception;
++                    goto the_end;
++                }
+             }
+ #endif
+             addr = s->pc;
+             tlb_idx = (addr >> PG_SHIFT) & (TLB_SIZE - 1);
+-            if (likely(s->tlb_code[tlb_idx].vaddr == (addr & ~PG_MASK))) {
++            if (likely(s->tlb_code[tlb_idx].vaddr == ((addr & ~PG_MASK) ^ s->tlb_code_tag))) {
+                 /* TLB match */ 
+                 ptr = (uint8_t *)(s->tlb_code[tlb_idx].mem_addend +
+                                   (uintptr_t)addr);
+@@ -1354,6 +1421,9 @@ static void no_inline glue(riscv_cpu_interp_x, XLEN)(RISCVCPUState *s,
+                         } else {
+                             tlb_flush_vaddr(s, s->reg[rs1]);
+                         }
++#ifdef CONFIG_JIT
++                        jit_flush_jump_cache();
++#endif
+                         /* the current code TLB may have been flushed */
+                         s->pc = GET_PC() + 4;
+                         JUMP_INSN;
+diff --git a/riscv_machine.c b/riscv_machine.c
+index 57e2580..98a27e7 100644
+--- a/riscv_machine.c
++++ b/riscv_machine.c
+@@ -108,6 +108,12 @@ static uint64_t rtc_get_time(RISCVMachine *m)
+     return val;
+ }
+ 
++/* Time source for the `time` CSR: the same value as the CLINT mtime. */
++static uint64_t riscv_machine_get_time(void *opaque)
++{
++    return rtc_get_time((RISCVMachine *)opaque);
++}
++
+ static uint32_t htif_read(void *opaque, uint32_t offset,
+                           int size_log2)
+ {
+@@ -831,6 +837,15 @@ static void riscv_flush_tlb_write_range(void *opaque, uint8_t *ram_addr,
+     riscv_cpu_flush_tlb_write_range_ram(s->cpu_state, ram_addr, ram_size);
+ }
+ 
++#ifdef CONFIG_JIT
++extern void riscv_cpu_jit_note_write(uint64_t paddr, size_t size);
++
++static void riscv_jit_note_ram_write(void *opaque, uint64_t paddr, size_t len)
++{
++    riscv_cpu_jit_note_write(paddr, len);
++}
++#endif
++
+ static void riscv_machine_set_defaults(VirtMachineParams *p)
+ {
+ }
+@@ -871,8 +886,13 @@ static VirtMachine *riscv_machine_init(const VirtMachineParams *p)
+     /* needed to handle the RAM dirty bits */
+     s->mem_map->opaque = s;
+     s->mem_map->flush_tlb_write_range = riscv_flush_tlb_write_range;
++#ifdef CONFIG_JIT
++    s->mem_map->notify_ram_write = riscv_jit_note_ram_write;
++#endif
+ 
+     s->cpu_state = riscv_cpu_init(s->mem_map, max_xlen);
++    if (s->cpu_state)
++        riscv_cpu_set_time_source(s->cpu_state, riscv_machine_get_time, s);
+     if (!s->cpu_state) {
+         vm_error("unsupported max_xlen=%d\n", max_xlen);
+         /* XXX: should free resources */
+diff --git a/temu.c b/temu.c
+index ef67dec..3a470d2 100644
+--- a/temu.c
++++ b/temu.c
+@@ -58,6 +58,11 @@
+ #include "wasi.h"
+ #endif
+ 
++#ifdef CONFIG_JIT
++extern void jit_poll(void);
++extern int initialized;
++#endif
++
+ extern char **environ;
+ 
+ #ifdef ON_BROWSER
+@@ -954,6 +959,13 @@ void virt_machine_run(VirtMachine *m, int enable_stdin)
+     emscripten_sleep(delay);
+ #endif
+     virt_machine_interp(m, MAX_EXEC_CYCLE);
++#ifdef CONFIG_JIT
++    /* Give the host a chance to install finished translations and sample the
++       JIT counters. Skip the Wizer initialization boot: no translations exist
++       yet and the host imports may not be installed. */
++    if (initialized)
++        jit_poll();
++#endif
+ }
+ 
+ /*******************************************************/
+@@ -1212,7 +1224,13 @@ void init_func_args(char *net)
+         p->console = console_init(allow_ctrlc);
+ #endif
+     }
++#ifdef CONFIG_ICOUNT_RTC
++    /* Deterministic replay mode: derive the RTC from retired instructions
++       instead of the host clock. Used by the trace-hash test harness. */
++    p->rtc_real_time = FALSE;
++#else
+     p->rtc_real_time = TRUE;
++#endif
+ 
+     s = virt_machine_init(p);
+     if (!s)

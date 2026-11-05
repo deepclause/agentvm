@@ -78,8 +78,14 @@ git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-9p-setattr-chmod.patch"
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-framebuffer.patch"
 # virtio-snd playback device.
 git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-virtio-snd.patch"
+# Region-JIT infrastructure (jump cache, physical map, page generations,
+# single-step helper, PC/trace samplers, deterministic RTC option).
+git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-jit-v2-core.patch"
 if [ "$PV_ACCEL" = "1" ]; then
     git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-pv-accel.patch"
+    # PV copy_page/clear_page write RAM directly; bump the JIT page
+    # generations so self-modifying guest code is never executed stale.
+    git -C "$WORK/tinyemu" apply "$HERE/patches/tinyemu-jit-v2-pv.patch"
 fi
 rm -rf "$WORK/tinyemu/.git"
 
@@ -181,6 +187,10 @@ old_cc = "-D_WASI_EMULATED_SIGNAL -DWASI -I/tools/wizer/include/"
 new_cc = "-D_WASI_EMULATED_SIGNAL -DWASI -DCONFIG_RISCV_ONLY_64 -DCONFIG_JIT"
 if pv_accel:
     new_cc += " -DCONFIG_PV_ACCEL"
+# Deterministic replay: derive the RTC from retired instructions instead of
+# the host clock. Used by the JIT trace-hash harness (Phase 0).
+if os.environ.get("ICOUNT_RTC", "0") == "1":
+    new_cc += " -DCONFIG_ICOUNT_RTC"
 new_cc += " -I/tools/wizer/include/"
 # In-WASM JIT dispatch: export the indirect function table so the host can
 # install compiled traces, and allow growing it.
@@ -222,6 +232,13 @@ open(p, "w").write(s)
 PY
 
 echo "==> Converting to WASM: $OUT (memory ${VM_MEMORY_SIZE_MB} MiB)"
+# Optional extra c2w/buildx flags, e.g. IPv4 host mappings on a host without
+# working IPv6:
+#   C2W_EXTRA_FLAGS='--extra-flag --add-host=archive.ubuntu.com:185.125.190.81'
+C2W_EXTRA_ARGS=()
+if [ -n "${C2W_EXTRA_FLAGS:-}" ]; then
+    read -r -a C2W_EXTRA_ARGS <<< "$C2W_EXTRA_FLAGS"
+fi
 "$C2W" --target-arch riscv64 \
     --build-arg "VM_MEMORY_SIZE_MB=${VM_MEMORY_SIZE_MB}" \
     --build-arg "LINUX_LOGLEVEL=3" \
@@ -229,6 +246,7 @@ echo "==> Converting to WASM: $OUT (memory ${VM_MEMORY_SIZE_MB} MiB)"
     --dockerfile "$WORK/Dockerfile.c2w" \
     --extra-flag "--build-context=tinyemu-patched=$WORK/tinyemu" \
     --extra-flag "--build-context=kernel-patches=$WORK/kernel-patches" \
+    "${C2W_EXTRA_ARGS[@]}" \
     "$IMAGE_NAME" \
     "$OUT"
 

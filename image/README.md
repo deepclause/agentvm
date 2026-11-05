@@ -87,6 +87,17 @@ These are deliberately conservative changes; npm remains
 dominated by interpreted RISC-V execution and guest filesystem metadata
 operations.
 
+## Region JIT infrastructure (opt-in)
+
+`patches/tinyemu-jit-v2-core.patch` adds the jump cache, physical map,
+per-page generations and the single-step interpreter used by the region JIT
+described in `docs/jit-plan.md`. It also removes the runtime of the older
+loop JIT (`jit_map`/`jit_hits`/`jit_try_block`); the older patches stay in
+the stack only for their accessor exports. Enable the new path at runtime with `AGENTVM_JIT_V2=1` after building
+this image. `ICOUNT_RTC=1 ./build.sh` additionally builds the deterministic
+RTC used by the trace-hash harness. See
+`docs/jit-implementation.md` for the full status and test commands.
+
 ## Why we patch TinyEMU
 
 Alpine's riscv64 `node` binary is built for `rv64gc` but contains the newer
