@@ -404,6 +404,28 @@ it, it must be passed on the command line or via a wrapper.
 Final numbers, build 16, JIT vs interpreter (best of 3): python-int-loop
 3.5x, node-startup 1.9x, python-startup 1.36x, fork-exec 1.35x, npm 1.12x.
 
+**Hot threshold (pi startup).** Translating eagerly is a loss for short
+processes: with the old threshold of 128 hits, `pi --version` took 25.6s for
+its first run (22.3s interpreted) and `npm --version` 12.0s (7.8s
+interpreted); the translator spent the run on code that executed a few
+hundred times. The default is now 2000 entries per PC
+(`AGENTVM_JIT_V2_HOT_THRESHOLD` still overrides it; tests use 1). Measured
+on the released image, region JIT on:
+
+| workload | interpreter | JIT, threshold 128 | JIT, threshold 2000 |
+|---|---|---|---|
+| `pi --version` (first / warm) | 23.4 / 23.4 | 25.6 / 16.6 | **18.7 / 16.9** |
+| `npm --version` | 7.8 / 7.5 | 10.0 / 7.1 | **8.0 / 6.0** |
+| `node -e 0` | 1.9 / 2.4 | 1.8 / 1.0 | **1.4 / 1.1** |
+| python-int-loop | 12.2 / 12.4 | 5.1 / 4.7 | 4.3 / 4.0 |
+
+`pi --version` is a CPU profile, not I/O: 53% in pi's own bundle,
+~12% compiling/linking ES modules (the image's V8 compile cache is being
+used and is worth ~9s: 22.5s with it, 31s without), 3.8% GC, the rest
+schema construction, syntax-highlighting grammars and undici setup. So the
+JIT is the lever that helps it; GC flags (`--max-semi-space-size`,
+`--max-old-space-size`) and every V8 tier flag made it slower.
+
 ## Tests
 
 ```bash

@@ -13,7 +13,8 @@ snapshot whose guest caches are already warm.
   installs with pre-compiled modules, and a single-step interpreter fallback
   for FP, AMO and CSR reads. On the shipped image: CPU-bound Python 2.9x,
   `node` startup 2.0x, `node` int loop 1.5x, `npm --version` 1.2x (warm).
-  Off by default.
+  On `pi --version` the JIT now takes 18.7s against 23.4s interpreted, and
+  `npm --version` is at parity for its first run. Off by default.
 - **Faster interpreter** (with or without the JIT): the single-step copy of
   the CPU loop is a separate instantiation, so the interpreter no longer
   checks a single-step flag after every instruction (7-18%); the TLBs are

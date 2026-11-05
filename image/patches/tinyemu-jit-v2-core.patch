@@ -30,7 +30,7 @@ index cc561b4..8f2ea8b 100644
  
  
 diff --git a/riscv_cpu.c b/riscv_cpu.c
-index 07ddfc6..3cad744 100644
+index 07ddfc6..f02bca2 100644
 --- a/riscv_cpu.c
 +++ b/riscv_cpu.c
 @@ -22,6 +22,7 @@
@@ -211,7 +211,7 @@ index 07ddfc6..3cad744 100644
          ptr = (uint8_t *)(s->tlb_code[tlb_idx].mem_addend +
                            (uintptr_t)addr);
      } else {
-@@ -788,6 +720,787 @@ static inline __exception int target_read_insn_u16(RISCVCPUState *s, uint16_t *p
+@@ -788,6 +720,792 @@ static inline __exception int target_read_insn_u16(RISCVCPUState *s, uint16_t *p
      return 0;
  }
  
@@ -246,7 +246,12 @@ index 07ddfc6..3cad744 100644
 +#define JIT_JC_BUCKETS       (1u << 10)
 +#define JIT_JC_BUCKET_ENTRIES 64
 +#define JIT_HOT_SIZE         (1u << 16)
-+#define JIT_REGION_HOT_THRESHOLD 128
++/* Entries a PC needs before it is translated. Translating eagerly costs a
++   short-lived process (npm, a one-shot CLI) more than it saves: with 128
++   `pi --version` took 25.6s for its first run against 22.3s interpreted,
++   and `npm --version` 12.0s against 7.8s; with 2000 both are faster than
++   the interpreter and hot code still reaches the JIT. */
++#define JIT_REGION_HOT_THRESHOLD 2000
 +/* Runtime value (jit_set_hot_threshold); tests use 1 to translate every
 +   dispatched PC. */
 +static uint32_t jit_hot_threshold = JIT_REGION_HOT_THRESHOLD;
@@ -999,7 +1004,7 @@ index 07ddfc6..3cad744 100644
  static void tlb_init(RISCVCPUState *s)
  {
      int i;
-@@ -799,9 +1512,24 @@ static void tlb_init(RISCVCPUState *s)
+@@ -799,9 +1517,24 @@ static void tlb_init(RISCVCPUState *s)
      }
  }
  
@@ -1025,7 +1030,7 @@ index 07ddfc6..3cad744 100644
  }
  
  static void tlb_flush_vaddr(RISCVCPUState *s, target_ulong vaddr)
-@@ -809,6 +1537,32 @@ static void tlb_flush_vaddr(RISCVCPUState *s, target_ulong vaddr)
+@@ -809,6 +1542,32 @@ static void tlb_flush_vaddr(RISCVCPUState *s, target_ulong vaddr)
      tlb_flush_all(s);
  }
  
@@ -1058,7 +1063,7 @@ index 07ddfc6..3cad744 100644
  /* XXX: inefficient but not critical as long as it is seldom used */
  static void glue(riscv_cpu_flush_tlb_write_range_ram,
                   MAX_XLEN)(RISCVCPUState *s,
-@@ -821,7 +1575,7 @@ static void glue(riscv_cpu_flush_tlb_write_range_ram,
+@@ -821,7 +1580,7 @@ static void glue(riscv_cpu_flush_tlb_write_range_ram,
      for(i = 0; i < TLB_SIZE; i++) {
          if (s->tlb_write[i].vaddr != -1) {
              ptr = (uint8_t *)(s->tlb_write[i].mem_addend +
@@ -1067,7 +1072,7 @@ index 07ddfc6..3cad744 100644
              if (ptr >= ram_ptr && ptr < ram_end) {
                  s->tlb_write[i].vaddr = -1;
              }
-@@ -879,12 +1633,11 @@ static void set_mstatus(RISCVCPUState *s, target_ulong val)
+@@ -879,12 +1638,11 @@ static void set_mstatus(RISCVCPUState *s, target_ulong val)
  {
      target_ulong mod, mask;
      
@@ -1084,7 +1089,7 @@ index 07ddfc6..3cad744 100644
      s->fs = (val >> MSTATUS_FS_SHIFT) & 3;
  
      mask = MSTATUS_MASK & ~MSTATUS_FS;
-@@ -900,6 +1653,7 @@ static void set_mstatus(RISCVCPUState *s, target_ulong val)
+@@ -900,6 +1658,7 @@ static void set_mstatus(RISCVCPUState *s, target_ulong val)
      }
  #endif
      s->mstatus = (s->mstatus & ~mask) | (val & mask);
@@ -1092,7 +1097,7 @@ index 07ddfc6..3cad744 100644
  }
  
  /* return -1 if invalid CSR. 0 if OK. 'will_write' indicate that the
-@@ -947,6 +1701,22 @@ static int csr_read(RISCVCPUState *s, target_ulong *pval, uint32_t csr,
+@@ -947,6 +1706,22 @@ static int csr_read(RISCVCPUState *s, target_ulong *pval, uint32_t csr,
          }
          val = (int64_t)s->insn_counter;
          break;
@@ -1115,7 +1120,7 @@ index 07ddfc6..3cad744 100644
      case 0xc80: /* mcycleh */
      case 0xc82: /* minstreth */
          if (s->cur_xlen != 32)
-@@ -1157,6 +1927,9 @@ static int csr_write(RISCVCPUState *s, uint32_t csr, target_ulong val)
+@@ -1157,6 +1932,9 @@ static int csr_write(RISCVCPUState *s, uint32_t csr, target_ulong val)
          }
  #endif
          tlb_flush_all(s);
@@ -1125,7 +1130,7 @@ index 07ddfc6..3cad744 100644
          return 2;
          
      case 0x300:
-@@ -1225,7 +1998,7 @@ static int csr_write(RISCVCPUState *s, uint32_t csr, target_ulong val)
+@@ -1225,7 +2003,7 @@ static int csr_write(RISCVCPUState *s, uint32_t csr, target_ulong val)
  static void set_priv(RISCVCPUState *s, int priv)
  {
      if (s->priv != priv) {
@@ -1134,7 +1139,7 @@ index 07ddfc6..3cad744 100644
  #if MAX_XLEN >= 64
          /* change the current xlen */
          {
-@@ -1241,6 +2014,7 @@ static void set_priv(RISCVCPUState *s, int priv)
+@@ -1241,6 +2019,7 @@ static void set_priv(RISCVCPUState *s, int priv)
  #endif
          s->priv = priv;
      }
@@ -1142,7 +1147,7 @@ index 07ddfc6..3cad744 100644
  }
  
  static void raise_exception2(RISCVCPUState *s, uint32_t cause,
-@@ -1458,6 +2232,13 @@ static inline uint32_t remu32(uint32_t a, uint32_t b)
+@@ -1458,6 +2237,13 @@ static inline uint32_t remu32(uint32_t a, uint32_t b)
  #if MAX_XLEN >= 64
  #define XLEN 64
  #include "riscv_cpu_template.h"
@@ -1156,7 +1161,7 @@ index 07ddfc6..3cad744 100644
  #endif
  
  #if MAX_XLEN >= 128
-@@ -1498,6 +2279,117 @@ static void glue(riscv_cpu_interp, MAX_XLEN)(RISCVCPUState *s, int n_cycles)
+@@ -1498,6 +2284,117 @@ static void glue(riscv_cpu_interp, MAX_XLEN)(RISCVCPUState *s, int n_cycles)
      }
  }
  
@@ -1274,7 +1279,7 @@ index 07ddfc6..3cad744 100644
  /* Note: the value is not accurate when called in riscv_cpu_interp() */
  static uint64_t glue(riscv_cpu_get_cycles, MAX_XLEN)(RISCVCPUState *s)
  {
-@@ -1538,6 +2430,9 @@ static RISCVCPUState *glue(riscv_cpu_init, MAX_XLEN)(PhysMemoryMap *mem_map)
+@@ -1538,6 +2435,9 @@ static RISCVCPUState *glue(riscv_cpu_init, MAX_XLEN)(PhysMemoryMap *mem_map)
  #endif
      s->common.class_ptr = &glue(riscv_cpu_class, MAX_XLEN);
      s->mem_map = mem_map;
@@ -1284,7 +1289,7 @@ index 07ddfc6..3cad744 100644
      s->pc = 0x1000;
      s->priv = PRV_M;
      s->cur_xlen = MAX_XLEN;
-@@ -1558,6 +2453,7 @@ static RISCVCPUState *glue(riscv_cpu_init, MAX_XLEN)(PhysMemoryMap *mem_map)
+@@ -1558,6 +2458,7 @@ static RISCVCPUState *glue(riscv_cpu_init, MAX_XLEN)(PhysMemoryMap *mem_map)
      s->misa |= MCPUID_C;
  #endif
      tlb_init(s);
@@ -1292,7 +1297,7 @@ index 07ddfc6..3cad744 100644
      return s;
  }
  
-@@ -1587,6 +2483,14 @@ const RISCVCPUClass glue(riscv_cpu_class, MAX_XLEN) = {
+@@ -1587,6 +2488,14 @@ const RISCVCPUClass glue(riscv_cpu_class, MAX_XLEN) = {
  };
  
  #if CONFIG_RISCV_MAX_XLEN == MAX_XLEN
