@@ -3,6 +3,11 @@ const { WASI } = require('node:wasi');
 const fs = require('node:fs');
 const { NetworkStack } = require('./network');
 const { RiscVBlockJit, BAIL_BIT, BAIL_MASK, isSupportedInstruction, branchOffset, jalOffset, LOOP_BUDGET } = require('./jit');
+const { RegionJitEngine } = require('./jit/engine');
+const { TranslationCache } = require('./jit/cache');
+const { HostJitStats, readStats } = require('./jit/stats');
+const { GuestPcSampler } = require('./jit/sampler');
+const { TraceRecorder } = require('./jit/trace');
 const refRun = require('./riscv-ref').run;
 const { expandCompressed } = require('./riscv-c');
 const { RingBufferReader } = require('./ringbuffer');
@@ -139,6 +144,9 @@ function drainInput() {
     }
 }
 const JIT_ENABLED = process.env.AGENTVM_JIT === '1';
+const JIT_V2_ENABLED = process.env.AGENTVM_JIT_V2 === '1';
+const JIT_V2_CACHE = process.env.AGENTVM_JIT_CACHE === '1';
+const JIT_STATS_PERIODIC = process.env.DEBUG_JIT_STATS === '1';
 const DEBUG_JIT = process.env.DEBUG_JIT === '1';
 // The hot threshold now lives in the emulator (JIT_HOT_THRESHOLD in
 // riscv_cpu.c): the C dispatcher only calls jit_compile after that many hits.
@@ -158,6 +166,30 @@ const JIT_INLINE = process.env.AGENTVM_JIT_NO_INLINE !== '1';
 const JIT_INLINE_MAX = Number(process.env.AGENTVM_JIT_INLINE_MAX || 6);
 // Differential verification against src/riscv-ref.js (debug only, slow).
 let jitFixed = null;
+// Region-JIT engine (v2). Created after the emulator instance exists; the
+// imports below are called from guest execution, so the indirection is safe.
+let jitEngine = null;
+let jitSampler = null;
+let jitTrace = null;
+let jitTraceHashes = [];
+let jitTracePosted = 0;
+let jitLastStatsAt = 0;
+const jitHostStats = new HostJitStats();
+
+function hostJitPoll() {
+    if (jitEngine) jitEngine.poll();
+    if (jitSampler) jitSampler.drain();
+    if (jitTrace) {
+        for (const h of jitTrace.drain()) jitTraceHashes.push(h.toString());
+    }
+    if (JIT_STATS_PERIODIC) {
+        const now = Date.now();
+        if (now - jitLastStatsAt >= 1000) {
+            jitLastStatsAt = now;
+            postJitStats(true);
+        }
+    }
+}
 
 async function start() {
     const wasmBuffer = fs.readFileSync(wasmPath);
@@ -1320,6 +1352,9 @@ async function start() {
 
     const originalPollOneoff = wasiImport.poll_oneoff;
     wasiImport.poll_oneoff = (in_ptr, out_ptr, nsubscriptions, nevents_ptr) => {
+        // The guest is about to sleep; this is also a safe point to install
+        // finished translations and drain the diagnostic rings.
+        hostJitPoll();
         if (!instance) return originalPollOneoff(in_ptr, out_ptr, nsubscriptions, nevents_ptr);
         drainInput();
         const view = new DataView(instance.exports.memory.buffer);
@@ -1667,6 +1702,12 @@ async function start() {
     const { instance: inst } = await WebAssembly.instantiate(wasmBuffer, {
         env: {
             jit_compile: (statePtr) => jitCompile(statePtr),
+            // Region-JIT v2 hooks. Images without the v2 patch do not import
+            // these, so providing them is harmless.
+            jit_request_region: (statePtr, paddr, entryOff, priv, fs, gen) => (
+                jitEngine ? jitEngine.request(statePtr, paddr, entryOff, priv, fs, gen) : 0
+            ),
+            jit_poll: hostJitPoll,
             // Compatibility with images built before in-WASM dispatch, which
             // import the old JS hook. Unused by the current image.
             jit_try_block: () => 0,
@@ -1760,7 +1801,52 @@ async function start() {
     });
     
     instance = inst;
-    if (JIT_ENABLED && instance.exports.__indirect_function_table) {
+    // Diagnostics are independent of the region JIT: an image built with
+    // tinyemu-jit-v2-core.patch can record PC samples and deterministic
+    // traces even when translations are disabled.
+    if (process.env.AGENTVM_JIT_SAMPLE === '1' && instance.exports.jit_sampler_enable) {
+        jitSampler = new GuestPcSampler(instance.exports);
+        jitSampler.start(Number(process.env.AGENTVM_JIT_SAMPLE_INTERVAL || (1 << 16)));
+    }
+    if (process.env.AGENTVM_JIT_TRACE === '1' && instance.exports.jit_trace_enable) {
+        jitTrace = new TraceRecorder(instance.exports);
+        jitTrace.start(Number(process.env.AGENTVM_JIT_TRACE_INTERVAL || (1 << 20)));
+    }
+
+    if (JIT_V2_ENABLED && !instance.exports.jit_region_set_enabled) {
+        parentPort.postMessage({
+            type: 'debug',
+            msg: 'AGENTVM_JIT_V2=1 but this image was built without tinyemu-jit-v2-core.patch; JIT disabled',
+        });
+    }
+    if (JIT_V2_ENABLED && instance.exports.jit_region_set_enabled &&
+        instance.exports.__indirect_function_table) {
+        let cache = null;
+        if (JIT_V2_CACHE) {
+            const vmVersion = process.env.AGENTVM_BUILD_ID || 'dev';
+            cache = new TranslationCache({ buildId: vmVersion });
+        }
+        jitEngine = new RegionJitEngine({
+            exports: instance.exports,
+            table: instance.exports.__indirect_function_table,
+            cache,
+            stats: jitHostStats,
+            debug: DEBUG_JIT ? (msg) => parentPort.postMessage({ type: 'debug', msg }) : undefined,
+        });
+        jitEngine.enable(true);
+        const hot = Number(process.env.AGENTVM_JIT_V2_HOT_THRESHOLD || 0);
+        if (hot > 0 && instance.exports.jit_set_hot_threshold) instance.exports.jit_set_hot_threshold(hot);
+        if (DEBUG_JIT) {
+            parentPort.postMessage({ type: 'debug', msg: 'region JIT v2 enabled' });
+        }
+    }
+    if (JIT_ENABLED && !JIT_V2_ENABLED && !instance.exports.jit_map_ptr) {
+        parentPort.postMessage({
+            type: 'debug',
+            msg: 'AGENTVM_JIT=1: this image no longer contains the loop JIT; use AGENTVM_JIT_V2=1',
+        });
+    }
+    if (JIT_ENABLED && !JIT_V2_ENABLED && instance.exports.jit_map_ptr && instance.exports.__indirect_function_table) {
         jitTable = instance.exports.__indirect_function_table;
         if (instance.exports.jit_set_enabled) instance.exports.jit_set_enabled(1);
     }
@@ -1781,10 +1867,38 @@ async function start() {
 
     try {
         wasi.start(instance);
+        postJitStats(true);
         parentPort.postMessage({ type: 'exit', code: 0 });
     } catch (e) {
+        postJitStats(true);
+        if (DEBUG_JIT && e && e.stack) {
+            parentPort.postMessage({ type: 'debug', msg: `fatal: ${e.stack}` });
+        }
         parentPort.postMessage({ type: 'exit', error: e.message });
     }
+}
+
+function postJitStats(includeRings) {
+    if (!jitEngine && !jitSampler && !jitTrace) return;
+    const host = jitHostStats.snapshot();
+    let guest = {};
+    try {
+        if (instance && instance.exports.jit_stats_ptr) {
+            guest = readStats(instance.exports.memory, Number(instance.exports.jit_stats_ptr()));
+        }
+    } catch {
+        // Stats are diagnostic only.
+    }
+    const message = { type: 'jit-stats', stats: { host, guest } };
+    if (includeRings && jitSampler) {
+        message.samples = jitSampler.snapshot().map((s) => ({ pc: s.pc.toString(), count: s.count.toString() }));
+    }
+    if (includeRings && jitTrace) {
+        message.trace = jitTraceHashes.slice(jitTracePosted);
+        jitTracePosted = jitTraceHashes.length;
+    }
+    if (DEBUG_JIT) parentPort.postMessage({ type: 'debug', msg: `JIT stats ${JSON.stringify(message.stats)}` });
+    parentPort.postMessage(message);
 }
 
 start();

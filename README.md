@@ -137,6 +137,16 @@ Remove or list live port forwards.
 ### `vm.snapshotRoot()`
 Optional tar backup of the guest root (minus `/workspace`, `/proc`, `/sys`, `/dev`, `/run`) to `<persistentRootDir>/root.tar`. Not used by the default ext4-overlay persistence path.
 
+### JIT diagnostics
+
+Set `AGENTVM_JIT_V2=1` to enable the region JIT (requires an image built with
+`image/patches/tinyemu-jit-v2-core.patch`). `vm.getJitStats()` returns host
+compile/install counters and the guest dispatch/invalidation counters;
+`AGENTVM_JIT_SAMPLE=1` and `AGENTVM_JIT_TRACE=1` additionally collect the
+guest-PC sample ring and the deterministic trace ring. See
+[docs/jit-implementation.md](docs/jit-implementation.md) for details and the
+benchmark harness.
+
 ## Features
 
 - **Full Linux VM**: Runs Alpine Linux with Python in a WASM-based emulator

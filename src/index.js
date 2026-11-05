@@ -78,7 +78,8 @@ class AgentVM {
      * @param {string} [options.persistentRootDir] - HOST directory where the overlay image (`upper.img`) lives. Defaults to `<workspaceHost>/.agentvm` when a `/workspace` mount is present, otherwise it must be supplied.
      */
     constructor(options = {}) {
-        this.wasmPath = options.wasmPath || path.resolve(__dirname, '../agentvm-alpine-python.wasm');
+        this.wasmPath = options.wasmPath || process.env.AGENTVM_WASM ||
+            path.resolve(__dirname, '../agentvm-alpine-python.wasm');
         this.mounts = options.mounts || {};
         this.network = options.network !== false; // Default to true
         this.networkEnabled = this.network;
@@ -308,6 +309,10 @@ class AgentVM {
                 } else if (msg.type === 'debug') {
                     // Worker debug messages
                     if (this.debug) console.log('[Worker]', msg.msg);
+                } else if (msg.type === 'jit-stats') {
+                    this.jitStats = msg.stats;
+                    if (msg.samples) this.jitSamples = msg.samples;
+                    if (msg.trace) this.jitTrace = (this.jitTrace || []).concat(msg.trace);
                 } else if (msg.type === 'exit') {
                     if (!this.destroyed && !this.interactive) {
                         console.error('VM Exited unexpectedly:', msg.error);
@@ -1570,8 +1575,32 @@ class AgentVM {
     // Note: Worker-side flow control (tcp-resume) removed - using ring buffer backpressure only
 
     /**
+     * Return the most recent JIT diagnostics collected by the worker. The
+     * object contains host compile/install counters and the guest-side
+     * dispatch/invalidation counters. Returns null when the JIT was disabled.
+     */
+    getJitStats() {
+        return this.jitStats || null;
+    }
+
+    /**
+     * Return guest-PC samples collected with AGENTVM_JIT_SAMPLE=1.
+     */
+    getJitSamples() {
+        return this.jitSamples || null;
+    }
+
+    /**
+     * Return the deterministic trace hashes collected with
+     * AGENTVM_JIT_TRACE=1 (requires an image built with CONFIG_ICOUNT_RTC).
+     */
+    getJitTrace() {
+        return this.jitTrace || null;
+    }
+
+    /**
      * Executes a command in the VM.
-     * @param {string} command 
+     * @param {string} command
      * @returns {Promise<{stdout: string, stderr: string, exitCode: number}>}
      */
     async exec(command) {
