@@ -366,24 +366,40 @@ reading this.
   are emulator bugs to look at separately. The self-modifying `rvc`/`fence_i`
   tests pass, which also exercises invalidation.
 
-**V8 tiers and npm** (plan open question 1). Under the region JIT,
-V8-generated code is what makes short Node processes slow: every process
-produces fresh code that has to be translated again. Region JIT on, seconds
-(first/best of 3, same VM):
+**V8 tiers and npm** (plan open question 1). Under the region JIT, short Node
+processes are slowed by V8-generated code: every process produces fresh code
+that has to be translated again. V8 tier flags were measured twice, with very
+different results.
+
+Before the warm snapshot (build 16, region JIT on, seconds first/warm):
 
 | node flags | npm --version | node -e 0 | 1M-iteration loop |
 |---|---|---|---|
 | (default) | 14.5 / 6.3 | 0.85 / 0.80 | 1.11 / 0.89 |
 | `--jitless` | 6.9 / 5.5 | 0.93 / 0.82 | 1.73 / 1.73 |
 | `--no-sparkplug` | 6.8 / 6.1 | 0.86 / 0.84 | 0.93 / 0.93 |
-| `--no-opt --no-maglev` | 7.1 / 5.7 | 0.84 / 0.82 | 1.33 / 1.26 |
 
-`--no-sparkplug` (no baseline compiler) halves the first `npm` run and keeps
-hot-loop speed. `--jitless` is best for npm but halves hot-loop speed.
-Without the region JIT, both flags make npm slower. Node rejects
-`--no-sparkplug` in `NODE_OPTIONS`, so using it needs a guest `node` wrapper
-(e.g. `/usr/local/bin/node` → `exec /usr/bin/node --no-sparkplug "$@"`).
-Not done automatically.
+That suggested `--no-sparkplug` as a win. **On the released image (0.5.0,
+warm snapshot) the same flags are a clear loss** — the first run's cost was
+mostly cold I/O, and once the page cache is warm, Sparkplug's baseline code
+(translated once by the region JIT) beats leaving functions in Ignition.
+Fresh VM per row, two rounds, seconds (first/warm):
+
+| node flags | npm --version (JIT on) | node -e 0 (JIT on) | loop (JIT on) | npm (JIT off) |
+|---|---|---|---|---|
+| (default) | 8.0-11.2 / 6.0-8.4 | 0.83-1.00 / 0.77-0.88 | 0.95 / 0.92 | 6.9-7.4 / 6.2-6.8 |
+| `--no-sparkplug` | 9.4-11.8 / 6.9-7.5 | 0.92-0.93 / 0.88 | 0.98-1.01 / 1.01 | 7.8-8.3 / 7.2-7.4 |
+| `--always-sparkplug` | 14.6-15.3 / 8.7-10.7 | 1.04-1.20 / 0.95-1.18 | 1.08-1.27 / 1.04-1.31 | — |
+| `--no-maglev` | 10.8-14.3 / 8.5-10.3 | 0.92-0.94 / 0.89-1.02 | 0.95-2.07 / 1.67-2.07 | — |
+| `--max-opt=1` | 13.2-13.5 / 7.1-8.0 | 0.96-0.98 / 0.93-1.26 | 1.46-1.49 / 1.50-1.92 | — |
+
+`pi --version` is affected the same way: 19.5 s / 15.8 s (JIT on) with the
+default wrapper, 29.8 s / 16.5 s with `--no-sparkplug`.
+
+So the guest Node keeps its default tiering; no flag is added to the image's
+`/usr/local/bin/node` wrapper (which carries `--single-threaded-gc` only).
+Node rejects `--no-sparkplug` in `NODE_OPTIONS`, so if a workload ever needs
+it, it must be passed on the command line or via a wrapper.
 
 Final numbers, build 16, JIT vs interpreter (best of 3): python-int-loop
 3.5x, node-startup 1.9x, python-startup 1.36x, fork-exec 1.35x, npm 1.12x.
