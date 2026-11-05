@@ -137,15 +137,22 @@ Remove or list live port forwards.
 ### `vm.snapshotRoot()`
 Optional tar backup of the guest root (minus `/workspace`, `/proc`, `/sys`, `/dev`, `/run`) to `<persistentRootDir>/root.tar`. Not used by the default ext4-overlay persistence path.
 
-### JIT diagnostics
+### Region JIT (experimental, opt-in)
 
-Set `AGENTVM_JIT_V2=1` to enable the region JIT (requires an image built with
-`image/patches/tinyemu-jit-v2-core.patch`). `vm.getJitStats()` returns host
-compile/install counters and the guest dispatch/invalidation counters;
-`AGENTVM_JIT_SAMPLE=1` and `AGENTVM_JIT_TRACE=1` additionally collect the
-guest-PC sample ring and the deterministic trace ring. See
-[docs/jit-implementation.md](docs/jit-implementation.md) for details and the
-benchmark harness.
+Set `AGENTVM_JIT_V2=1` to translate hot guest code to WebAssembly. With the
+shipped image it speeds up CPU-bound Python about 3x and `node` startup about
+2x once warm; short `npm` runs are roughly break-even. It is off by default.
+Translation runs in a background compiler worker. `vm.getJitStats()` returns
+host compile/install counters and guest dispatch/invalidation counters.
+
+Useful knobs (all optional): `AGENTVM_JIT_V2_VERIFY=1` (lockstep-check every
+translated region against the interpreter; slow, for debugging),
+`AGENTVM_JIT_V2_PROFILE=1` (region exit profile), `AGENTVM_JIT_V2_CHAIN=1`
+(region chaining), `AGENTVM_JIT_V2_HOT_THRESHOLD=N`,
+`AGENTVM_JIT_V2_COALESCE=0`, `AGENTVM_JIT_SAMPLE=1` / `AGENTVM_JIT_TRACE=1`
+(guest-PC sample and deterministic trace rings). `AGENTVM_WASM` overrides the
+default image path. See [docs/jit-implementation.md](docs/jit-implementation.md)
+for design, measurements and the test/benchmark harnesses.
 
 ## Features
 

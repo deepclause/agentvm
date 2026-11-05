@@ -248,7 +248,9 @@ if os.environ.get("WARMUP", "1") == "1":
         "command -v node >/dev/null && node -e 0",
         "command -v npm >/dev/null && npm --version",
         "command -v git >/dev/null && git --version",
-        "command -v pi >/dev/null && pi --version",
+        # The pi image sets NODE_COMPILE_CACHE in its environment; warm the
+        # same files the real `pi` startup reads.
+        "command -v pi >/dev/null && NODE_COMPILE_CACHE=/usr/local/lib/pi-cache pi --version",
     ])
     cmds = os.environ.get("WARMUP_CMDS", default_cmds)
     script = [
