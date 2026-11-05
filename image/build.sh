@@ -228,6 +228,64 @@ new_wizer = (
 )
 assert s.count(old_wizer) == 1, "unexpected TinyEMU wizer stage"
 s = s.replace(old_wizer, new_wizer)
+
+# Pre-snapshot warm-up. c2w's init runs the boot config's cmd_pre_run
+# commands before the Wizer snapshot point, so anything they pull into guest
+# RAM (page cache and dentry/negative-dentry caches of the container image
+# on the ISO9660 root, kernel slab caches) is part of the snapshot. On a cold
+# VM, the first run of python3/node/npm otherwise spends seconds of guest
+# kernel time on file reads and path lookups. The warm-up runs the configured
+# commands once in a chroot of the container image; every step is optional
+# and the script always succeeds, because a failing pre-run command would
+# stop init from booting.
+if os.environ.get("WARMUP", "1") == "1":
+    default_cmds = "; ".join([
+        "command -v python3 >/dev/null && python3 -c \"import importlib, importlib.util; "
+        "[importlib.import_module(m) for m in ('asyncio http.client json re ssl email unittest "
+        "xml.etree.ElementTree subprocess pathlib urllib.request argparse logging typing "
+        "dataclasses datetime collections itertools functools shutil tempfile glob hashlib "
+        "base64 csv sqlite3 socket threading').split() if importlib.util.find_spec(m)]\"",
+        "command -v node >/dev/null && node -e 0",
+        "command -v npm >/dev/null && npm --version",
+        "command -v git >/dev/null && git --version",
+        "command -v pi >/dev/null && pi --version",
+    ])
+    cmds = os.environ.get("WARMUP_CMDS", default_cmds)
+    script = [
+        "#!/bin/sh",
+        "# AgentVM pre-snapshot warm-up (see image/build.sh). Always exits 0.",
+        "# (init mounts a tmpfs over /etc before pre-run commands: keep files in /sbin)",
+        "R=/oci/rootfs",
+        "[ -d $R/usr ] || exit 0",
+        "mount -t proc proc $R/proc 2>/dev/null",
+        "mount -o bind /dev $R/dev 2>/dev/null",
+        "mount -t tmpfs tmpfs $R/tmp 2>/dev/null",
+        "T=; command -v timeout >/dev/null 2>&1 && T=\"timeout 600\"",
+        "$T chroot $R /usr/bin/env -i HOME=/tmp PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin "
+        "/bin/sh -c \"$(cat /sbin/agentvm-warmup.cmds)\" >/dev/null 2>&1",
+        "umount $R/tmp 2>/dev/null; umount $R/dev 2>/dev/null; umount $R/proc 2>/dev/null",
+        "exit 0",
+    ]
+    def sq(x):
+        return "'" + x.replace("'", "'\\''") + "'"
+    write_script = (
+        "RUN printf '%s\\n' " + " ".join(sq(l) for l in script) +
+        " > /rootfs/sbin/agentvm-warmup && chmod 755 /rootfs/sbin/agentvm-warmup && "
+        "printf '%s\\n' " + sq(cmds) + " > /rootfs/sbin/agentvm-warmup.cmds\n"
+    )
+    # The riscv64 VM rootfs stage (the Dockerfile has one per guest arch).
+    tini = "COPY --link --from=tini-riscv64-dev /out/tini /rootfs/sbin/tini\n"
+    iso = "RUN mkdir /out/ && mkisofs -R -o /out/rootfs.bin /rootfs/\n"
+    i = s.index(tini)
+    j = s.index(iso, i)
+    s = s[:j] + write_script + s[j:]
+    initcfg = "RUN mv initconfig.json /out/oci/\n"
+    assert s.count(initcfg) == 1, "unexpected create-spec stage"
+    s = s.replace(initcfg, initcfg +
+        "RUN if grep -q '\"cmd_pre_run\":\\[' /out/oci/initconfig.json; then "
+        "sed -i 's#\"cmd_pre_run\":\\[#\"cmd_pre_run\":[[\"/sbin/agentvm-warmup\"],#' /out/oci/initconfig.json; "
+        "else sed -i 's#^{#{\"cmd_pre_run\":[[\"/sbin/agentvm-warmup\"]],#' /out/oci/initconfig.json; fi && "
+        "grep -o '\"cmd_pre_run\":[^]]*]' /out/oci/initconfig.json\n")
 open(p, "w").write(s)
 PY
 
