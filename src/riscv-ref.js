@@ -6,8 +6,28 @@
 // semantics with explicit 64-bit wrapping.
 
 const M64 = (1n << 64n) - 1n;
+const MIN64 = -(1n << 63n);
 const sext = (v, bits) => BigInt.asIntN(bits, BigInt(v));
 const wrap64 = (v) => BigInt.asIntN(64, v);
+
+function div64(a, b) {
+    if (b === 0n) return -1n;
+    if (a === MIN64 && b === -1n) return a;
+    return a / b;
+}
+function divu64(a, b) {
+    if (b === 0n) return M64;
+    return BigInt.asUintN(64, a) / BigInt.asUintN(64, b);
+}
+function rem64(a, b) {
+    if (b === 0n) return a;
+    if (a === MIN64 && b === -1n) return 0n;
+    return a % b;
+}
+function remu64(a, b) {
+    if (b === 0n) return a;
+    return BigInt.asUintN(64, a) % BigInt.asUintN(64, b);
+}
 
 function memSizeWord(sizeLog2) { return 1 << sizeLog2; }
 
@@ -51,6 +71,19 @@ function step(insn, regs, mem, addr, size) {
             break;
         }
         case 0x33: // OP
+            if (funct7 === 0x01) { // RV64M
+                switch (funct3) {
+                    case 0: set(a * b); break;
+                    case 1: set(wrap64((a * b) >> 64n)); break;
+                    case 2: set(wrap64((a * BigInt.asUintN(64, b)) >> 64n)); break;
+                    case 3: set(wrap64((BigInt.asUintN(64, a) * BigInt.asUintN(64, b)) >> 64n)); break;
+                    case 4: set(div64(a, b)); break;
+                    case 5: set(divu64(a, b)); break;
+                    case 6: set(rem64(a, b)); break;
+                    case 7: set(remu64(a, b)); break;
+                }
+                break;
+            }
             switch (funct3) {
                 case 0: set(funct7 === 0x20 ? a - b : a + b); break;
                 case 1: set(a << (b & 63n)); break;
@@ -64,6 +97,17 @@ function step(insn, regs, mem, addr, size) {
             break;
         case 0x3b: { // OP-32
             const sh = b & 0x1fn;
+            if (funct7 === 0x01) { // RV64M W-forms
+                const wa = w32(a), wb = w32(b);
+                switch (funct3) {
+                    case 0: set(sext(w32(a) * w32(b), 32)); break;
+                    case 4: set(sext(w32(div64(wa, wb)), 32)); break;
+                    case 5: set(sext(w32(divu64(BigInt.asUintN(32, wa), BigInt.asUintN(32, wb))), 32)); break;
+                    case 6: set(sext(w32(rem64(wa, wb)), 32)); break;
+                    case 7: set(sext(w32(remu64(BigInt.asUintN(32, wa), BigInt.asUintN(32, wb))), 32)); break;
+                }
+                break;
+            }
             switch (funct3) {
                 case 0: set(sext(w32(funct7 === 0x20 ? a - b : a + b), 32)); break;
                 case 1: set(sext(w32(a) << sh, 32)); break;
@@ -136,4 +180,4 @@ function run(insns, sizes, regs, mem, startPc) {
     return { next: startPc + off };
 }
 
-module.exports = { run, M64 };
+module.exports = { run, step, M64 };
