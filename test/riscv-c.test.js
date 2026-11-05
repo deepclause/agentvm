@@ -33,7 +33,22 @@ async function main() {
         [0xdde8, 0x06a5ae23], // c.sw a0, 124(a1)
         [0xfde8, 0x0ea5bc23], // c.sd a0, 248(a1)
         [0x4498, 0x0084a703], // c.lw a0, 0(a1)
+        // llvm-mc verified, asymmetric offsets: all-ones immediates above
+        // cannot detect permuted offset fields.
+        [0xf022, 0x02813023], // c.sdsp s0, 32(sp)
+        [0xf406, 0x02113423], // c.sdsp ra, 40(sp)
+        [0x69b8, 0x0505b703], // c.ld a4, 80(a1)
+        [0xe13c, 0x04f53023], // c.sd a5, 64(a0)
+        [0x60a6, 0x04813083], // c.ldsp ra, 72(sp)
+        [0x4516, 0x04412503], // c.lwsp a0, 68(sp)
+        [0xc32e, 0x08b12223], // c.swsp a1, 132(sp)
+        [0x6144, 0x08053483], // c.ld s1, 128(a0)
     ];
+    assert.strictEqual(hex(expandCompressed(0x0001)), hex(0x00000013), 'c.nop is addi x0, x0, 0');
+    // Reserved encodings must not decode.
+    assert.strictEqual(expandCompressed(0x6101), null, 'c.addi16sp 0 is reserved');
+    assert.strictEqual(expandCompressed(0x6002), null, 'c.ldsp x0 is reserved');
+    assert.strictEqual(expandCompressed(0x4002), null, 'c.lwsp x0 is reserved');
     for (const [insn, expected] of cases) {
         const actual = expandCompressed(insn);
         assert.strictEqual(hex(actual), hex(expected), `expand ${hex(insn)}`);

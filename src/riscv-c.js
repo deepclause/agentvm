@@ -50,16 +50,16 @@ function expandCompressed(insn) {
                 const imm = (((insn >> 10) & 7) << 3) | (((insn >> 5) & 1) << 6) | (((insn >> 6) & 1) << 2);
                 return encI(rd1, rs1, 2, imm, 0x03);
             }
-            case 3: { // C.LD
-                const imm = (((insn >> 10) & 7) << 3) | (((insn >> 5) & 1) << 7) | (((insn >> 6) & 1) << 6);
+            case 3: { // C.LD (uimm[5:3]=inst[12:10], uimm[7:6]=inst[6:5])
+                const imm = (((insn >> 10) & 7) << 3) | (((insn >> 5) & 3) << 6);
                 return encI(rd1, rs1, 3, imm, 0x03);
             }
             case 6: { // C.SW
                 const imm = (((insn >> 10) & 7) << 3) | (((insn >> 5) & 1) << 6) | (((insn >> 6) & 1) << 2);
                 return encS(rs1, rd1, 2, imm);
             }
-            case 7: { // C.SD
-                const imm = (((insn >> 10) & 7) << 3) | (((insn >> 5) & 1) << 7) | (((insn >> 6) & 1) << 6);
+            case 7: { // C.SD (uimm[5:3]=inst[12:10], uimm[7:6]=inst[6:5])
+                const imm = (((insn >> 10) & 7) << 3) | (((insn >> 5) & 3) << 6);
                 return encS(rs1, rd1, 3, imm);
             }
             default:
@@ -71,8 +71,8 @@ function expandCompressed(insn) {
         const rd = (insn >> 7) & 0x1f;
         const imm6 = sext(((insn >> 12) & 1) << 5 | ((insn >> 2) & 0x1f), 6);
         switch (funct3) {
-            case 0: // C.NOP / C.ADDI
-                return rd === 0 ? null : encI(rd, rd, 0, imm6);
+            case 0: // C.NOP / C.ADDI (rd=x0 forms are hints: nop)
+                return rd === 0 ? encI(0, 0, 0, 0) : encI(rd, rd, 0, imm6);
             case 1: // C.ADDIW (RV64)
                 return rd === 0 ? null : encI(rd, rd, 0, imm6, 0x1b);
             case 2: // C.LI
@@ -83,6 +83,7 @@ function expandCompressed(insn) {
                         (((insn >> 12) & 1) << 9) | (((insn >> 3) & 3) << 7) | (((insn >> 5) & 1) << 6) | (((insn >> 2) & 1) << 5) | (((insn >> 6) & 1) << 4),
                         10,
                     );
+                    if (imm10 === 0) return null; // reserved
                     return encI(2, 2, 0, imm10);
                 }
                 if (rd === 0) return null;
@@ -147,12 +148,14 @@ function expandCompressed(insn) {
                 const shamt = ((insn >> 2) & 0x1f) | (((insn >> 12) & 1) << 5);
                 return encI(rd, rd, 1, shamt);
             }
-            case 2: { // C.LWSP (CI: offset field = {inst[12], inst[6:2]}, scaled by 4)
-                const imm = ((((insn >> 12) & 1) << 5) | ((insn >> 2) & 0x1f)) << 2;
+            case 2: { // C.LWSP (uimm[5]=inst[12], uimm[4:2]=inst[6:4], uimm[7:6]=inst[3:2])
+                if (rd === 0) return null;
+                const imm = (((insn >> 12) & 1) << 5) | (((insn >> 4) & 7) << 2) | (((insn >> 2) & 3) << 6);
                 return encI(rd, 2, 2, imm, 0x03);
             }
-            case 3: { // C.LDSP (CI: same field, scaled by 8)
-                const imm = ((((insn >> 12) & 1) << 5) | ((insn >> 2) & 0x1f)) << 3;
+            case 3: { // C.LDSP (uimm[5]=inst[12], uimm[4:3]=inst[6:5], uimm[8:6]=inst[4:2])
+                if (rd === 0) return null;
+                const imm = (((insn >> 12) & 1) << 5) | (((insn >> 5) & 3) << 3) | (((insn >> 2) & 7) << 6);
                 return encI(rd, 2, 3, imm, 0x03);
             }
             case 4: { // C.JR / C.MV / C.EBREAK / C.JALR / C.ADD
@@ -168,12 +171,12 @@ function expandCompressed(insn) {
                 if (rs2 !== 0 && rs1 !== 0) return encR(rs1, rs1, rs2, 0, 0); // C.ADD
                 return null;
             }
-            case 6: { // C.SWSP (CSS: offset = inst[12:7], scaled by 4)
-                const imm = ((insn >> 7) & 0x3f) << 2;
+            case 6: { // C.SWSP (uimm[5:2]=inst[12:9], uimm[7:6]=inst[8:7])
+                const imm = (((insn >> 9) & 0xf) << 2) | (((insn >> 7) & 3) << 6);
                 return encS(2, rs2, 2, imm);
             }
-            case 7: { // C.SDSP (CSS: same field, scaled by 8)
-                const imm = ((insn >> 7) & 0x3f) << 3;
+            case 7: { // C.SDSP (uimm[5:3]=inst[12:10], uimm[8:6]=inst[9:7])
+                const imm = (((insn >> 10) & 7) << 3) | (((insn >> 7) & 7) << 6);
                 return encS(2, rs2, 3, imm);
             }
             default:
