@@ -1,0 +1,79 @@
+diff --git a/temu.c b/temu.c
+index 92cb196..ef8fea3 100644
+--- a/temu.c
++++ b/temu.c
+@@ -1003,6 +1003,74 @@ static BOOL net_poll_cb(void *arg)
+ FSVirtFile *info;
+ int initialized = FALSE;
+ VirtMachine *s;
++
++/* ---- AgentVM virtual framebuffer + input ---------------------------------
++   framebuffer: fb_dev is created by virt_machine_init only when the config has
++   a display0 device. fb_dirty() returns the guest's write damage; fb_refresh()
++   walks it and calls the host_fb_draw import for each damaged rectangle.
++   input: virtio-input keyboard (evdev keycodes) and absolute tablet. */
++__attribute__((export_name("fb_ptr")))
++uint32_t fb_ptr(void)
++{
++    return (s && s->fb_dev) ? (uint32_t)(uintptr_t)s->fb_dev->fb_data : 0;
++}
++
++__attribute__((export_name("fb_width")))
++int fb_width(void)
++{
++    return (s && s->fb_dev) ? s->fb_dev->width : 0;
++}
++
++__attribute__((export_name("fb_height")))
++int fb_height(void)
++{
++    return (s && s->fb_dev) ? s->fb_dev->height : 0;
++}
++
++__attribute__((export_name("fb_stride")))
++int fb_stride(void)
++{
++    return (s && s->fb_dev) ? s->fb_dev->stride : 0;
++}
++
++__attribute__((import_module("env"), import_name("host_fb_draw")))
++void host_fb_draw(int x, int y, int w, int h);
++
++static void fb_host_redraw(FBDevice *fb_dev, void *opaque,
++                           int x, int y, int w, int h)
++{
++    host_fb_draw(x, y, w, h);
++}
++
++/* Emit the damaged rectangles (host_fb_draw per rectangle). */
++__attribute__((export_name("fb_refresh")))
++void fb_refresh(void)
++{
++    if (s && s->fb_dev && s->fb_dev->refresh)
++        s->fb_dev->refresh(s->fb_dev, fb_host_redraw, NULL);
++}
++
++/* keycode is a Linux evdev keycode; buttons 1=left 2=right 4=middle. */
++__attribute__((export_name("input_key")))
++void input_key(int down, int keycode)
++{
++    if (s)
++        vm_send_key_event(s, down, (uint16_t)keycode);
++}
++
++__attribute__((export_name("input_mouse")))
++void input_mouse(int x, int y, int buttons)
++{
++    if (!s)
++        return;
++    if (vm_mouse_is_absolute(s)) {
++        int w = s->fb_dev ? s->fb_dev->width : 1024;
++        int h = s->fb_dev ? s->fb_dev->height : 768;
++        x = (x * 32768) / w;
++        y = (y * 32768) / h;
++    }
++    vm_send_mouse_event(s, x, y, 0, (unsigned int)buttons);
++}
+ VirtMachineParams p_s, *p = &p_s;
+ 
+ void init_func_args(char *net)

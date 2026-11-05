@@ -11,9 +11,37 @@ RUN apk add --no-cache \
         nodejs npm \
         bash curl git \
         coreutils \
-        tmux
+        tmux \
+        e2fsprogs \
+        alsa-utils alsa-lib \
+        jansson fzf
+
+# Build hax (https://usehax.dev) from source; there are no riscv64 binaries.
+RUN apk add --no-cache \
+        build-base meson samurai curl-dev jansson-dev python3 && \
+    git clone https://github.com/OleksandrChekhovskyi/hax.git /tmp/hax && \
+    cd /tmp/hax && \
+    make && \
+    make install && \
+    rm -rf /tmp/hax && \
+    apk del build-base meson samurai curl-dev jansson-dev python3
 
 COPY --link preinstalled/usrlocal /usr/local
+
+# Speed up pi's TypeScript extension loading. pi compiles extensions with
+# jiti, whose bundled Babel transform costs ~4s to load plus ~2s/KB under
+# emulation (~21s for an 8.5KB extension). Install a shim as the `jiti`
+# package (the real one is kept as `jiti-real`) that injects an esbuild
+# transform, which is native and transforms the same file in milliseconds (~5s
+# cold, 0.3s warm). Falls back to Babel if esbuild is missing. See
+# image/pi-jiti-shim/.
+COPY --link pi-jiti-shim /tmp/pi-jiti-shim
+RUN set -eux; \
+    NM=/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/node_modules; \
+    if [ -d "$NM/jiti" ] && [ ! -d "$NM/jiti-real" ]; then mv "$NM/jiti" "$NM/jiti-real"; fi; \
+    rm -rf "$NM/jiti"; \
+    cp -r /tmp/pi-jiti-shim "$NM/jiti"; \
+    rm -rf /tmp/pi-jiti-shim
 
 # V8's concurrent GC threads contend on the emulated single hart. Disabling
 # concurrent GC measurably speeds Node CPU work and short-lived CLI startup.
@@ -27,3 +55,12 @@ RUN rm -f /usr/local/bin/pi && \
     chmod +x /usr/local/bin/node
 
 CMD ["/bin/sh"]
+
+# Under emulation, parsing/compiling the 7.6 MB ESM pi bundle is ~28% of `pi`
+# startup. V8's compile cache persists the bytecode and supports ESM (bytenode
+# does not), so pre-populate it at build time. The cache is keyed by source
+# content and V8 version; a stale entry is simply re-populated at runtime.
+ENV NODE_COMPILE_CACHE=/usr/local/lib/pi-cache
+RUN /usr/bin/node --single-threaded-gc \
+        /usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js --version \
+        >/dev/null 2>&1 || true

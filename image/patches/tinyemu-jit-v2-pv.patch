@@ -1,0 +1,22 @@
+--- a/riscv_cpu.c
++++ b/riscv_cpu.c
+@@ -2189,6 +2189,9 @@
+             chunk = len;
+         memset(pr->phys_mem + (uintptr_t)(paddr - pr->addr), val, chunk);
+         phys_mem_set_dirty_bit(pr, paddr - pr->addr);
++#ifdef CONFIG_JIT
++        jit_note_write_range(paddr, chunk);
++#endif
+         dst += chunk;
+         len -= chunk;
+     }
+@@ -2220,6 +2223,9 @@
+         memcpy(prd->phys_mem + (uintptr_t)(pd - prd->addr),
+                prs->phys_mem + (uintptr_t)(ps - prs->addr), chunk);
+         phys_mem_set_dirty_bit(prd, pd - prd->addr);
++#ifdef CONFIG_JIT
++        jit_note_write_range(pd, chunk);
++#endif
+         dst += chunk;
+         src += chunk;
+         len -= chunk;

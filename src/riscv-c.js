@@ -11,11 +11,11 @@ function sext(value, bits) {
     return (value << shift) >> shift;
 }
 
-function encI(rd, rs1, funct3, imm) {
-    return (((imm & 0xfff) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0x13) >>> 0;
+function encI(rd, rs1, funct3, imm, opcode = 0x13) {
+    return (((imm & 0xfff) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode) >>> 0;
 }
-function encR(rd, rs1, rs2, funct3, funct7) {
-    return ((funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0x33) >>> 0;
+function encR(rd, rs1, rs2, funct3, funct7, opcode = 0x33) {
+    return ((funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode) >>> 0;
 }
 function encS(rs1, rs2, funct3, imm) {
     imm &= 0xfff;
@@ -41,25 +41,25 @@ function expandCompressed(insn) {
         const rd1 = 8 + ((insn >> 2) & 7);
         const rs1 = 8 + ((insn >> 7) & 7);
         switch (funct3) {
-            case 0: { // C.ADDI4SPN
-                const imm = (((insn >> 12) & 3) << 4) | (((insn >> 7) & 0xf) << 6) | (((insn >> 5) & 1) << 3) | (((insn >> 6) & 1) << 2);
+            case 0: { // C.ADDI4SPN (imm[5:4]=inst[12:11], imm[9:6]=inst[10:7], imm[3]=inst[5], imm[2]=inst[6])
+                const imm = (((insn >> 11) & 3) << 4) | (((insn >> 7) & 0xf) << 6) | (((insn >> 5) & 1) << 3) | (((insn >> 6) & 1) << 2);
                 if (imm === 0) return null;
                 return encI(rd1, 2, 0, imm);
             }
             case 2: { // C.LW
                 const imm = (((insn >> 10) & 7) << 3) | (((insn >> 5) & 1) << 6) | (((insn >> 6) & 1) << 2);
-                return encI(rd1, rs1, 2, imm);
+                return encI(rd1, rs1, 2, imm, 0x03);
             }
-            case 3: { // C.LD
-                const imm = (((insn >> 10) & 7) << 3) | (((insn >> 5) & 1) << 7) | (((insn >> 6) & 1) << 6);
-                return encI(rd1, rs1, 3, imm);
+            case 3: { // C.LD (uimm[5:3]=inst[12:10], uimm[7:6]=inst[6:5])
+                const imm = (((insn >> 10) & 7) << 3) | (((insn >> 5) & 3) << 6);
+                return encI(rd1, rs1, 3, imm, 0x03);
             }
             case 6: { // C.SW
                 const imm = (((insn >> 10) & 7) << 3) | (((insn >> 5) & 1) << 6) | (((insn >> 6) & 1) << 2);
                 return encS(rs1, rd1, 2, imm);
             }
-            case 7: { // C.SD
-                const imm = (((insn >> 10) & 7) << 3) | (((insn >> 5) & 1) << 7) | (((insn >> 6) & 1) << 6);
+            case 7: { // C.SD (uimm[5:3]=inst[12:10], uimm[7:6]=inst[6:5])
+                const imm = (((insn >> 10) & 7) << 3) | (((insn >> 5) & 3) << 6);
                 return encS(rs1, rd1, 3, imm);
             }
             default:
@@ -71,8 +71,10 @@ function expandCompressed(insn) {
         const rd = (insn >> 7) & 0x1f;
         const imm6 = sext(((insn >> 12) & 1) << 5 | ((insn >> 2) & 0x1f), 6);
         switch (funct3) {
-            case 0: // C.NOP / C.ADDI
-                return rd === 0 ? null : encI(rd, rd, 0, imm6);
+            case 0: // C.NOP / C.ADDI (rd=x0 forms are hints: nop)
+                return rd === 0 ? encI(0, 0, 0, 0) : encI(rd, rd, 0, imm6);
+            case 1: // C.ADDIW (RV64)
+                return rd === 0 ? null : encI(rd, rd, 0, imm6, 0x1b);
             case 2: // C.LI
                 return rd === 0 ? null : encI(rd, 0, 0, imm6);
             case 3: { // C.ADDI16SP / C.LUI
@@ -81,29 +83,33 @@ function expandCompressed(insn) {
                         (((insn >> 12) & 1) << 9) | (((insn >> 3) & 3) << 7) | (((insn >> 5) & 1) << 6) | (((insn >> 2) & 1) << 5) | (((insn >> 6) & 1) << 4),
                         10,
                     );
+                    if (imm10 === 0) return null; // reserved
                     return encI(2, 2, 0, imm10);
                 }
                 if (rd === 0) return null;
-                return (((imm6 & 0x3f) << 12) & 0xfffff000 | (rd << 7) | 0x37) >>> 0;
+                return ((imm6 << 12) | (rd << 7) | 0x37) >>> 0;
             }
-            case 4: { // C.SRLI / C.SRAI / C.ANDI (bit12=0) and register ops (bit12=1)
-                const bit12 = (insn >> 12) & 1;
-                if (bit12 === 0) {
+            case 4: { // shifts/andi (bits[11:10]!=11) and register ops (bits[11:10]==11)
+                const sub = (insn >> 10) & 3;
+                if (sub !== 3) {
                     const rd1 = 8 + ((insn >> 7) & 7);
                     const shamt = ((insn >> 2) & 0x1f) | (((insn >> 12) & 1) << 5);
-                    const sub = (insn >> 10) & 3;
-                    if (sub === 0) return encI(rd1, rd1, 5, shamt); // srli
-                    if (sub === 1) return encI(rd1, rd1, 5, 0x400 | shamt); // srai (funct7=0x20)
-                    if (sub === 2) return encI(rd1, rd1, 7, imm6); // andi
-                    return null;
+                    if (sub === 0) return encI(rd1, rd1, 5, shamt);            // srli
+                    if (sub === 1) return encI(rd1, rd1, 5, 0x400 | shamt);    // srai
+                    return encI(rd1, rd1, 7, sext(shamt, 6));                  // andi
                 }
                 const r1 = 8 + ((insn >> 7) & 7);
                 const r2 = 8 + ((insn >> 2) & 7);
-                const funct = (insn >> 5) & 3;
-                if (funct === 0) return encR(r1, r1, r2, 0, 0x20); // sub
-                if (funct === 1) return encR(r1, r1, r2, 4, 0);    // xor
-                if (funct === 2) return encR(r1, r1, r2, 6, 0);    // or
-                if (funct === 3) return encR(r1, r1, r2, 7, 0);    // and
+                const funct2 = (insn >> 5) & 3;
+                const is32 = (insn >> 12) & 1;
+                if (!is32) {
+                    if (funct2 === 0) return encR(r1, r1, r2, 0, 0x20); // sub
+                    if (funct2 === 1) return encR(r1, r1, r2, 4, 0);    // xor
+                    if (funct2 === 2) return encR(r1, r1, r2, 6, 0);    // or
+                    return encR(r1, r1, r2, 7, 0);                       // and
+                }
+                if (funct2 === 0) return encR(r1, r1, r2, 0, 0x20, 0x3b); // subw
+                if (funct2 === 1) return encR(r1, r1, r2, 0, 0x00, 0x3b); // addw
                 return null;
             }
             case 5: { // C.J
@@ -142,13 +148,15 @@ function expandCompressed(insn) {
                 const shamt = ((insn >> 2) & 0x1f) | (((insn >> 12) & 1) << 5);
                 return encI(rd, rd, 1, shamt);
             }
-            case 2: { // C.LWSP
-                const imm = (((insn >> 12) & 1) << 5) | (((insn >> 4) & 7) << 6) | (((insn >> 2) & 3) << 2);
-                return encI(rd, 2, 2, imm);
+            case 2: { // C.LWSP (uimm[5]=inst[12], uimm[4:2]=inst[6:4], uimm[7:6]=inst[3:2])
+                if (rd === 0) return null;
+                const imm = (((insn >> 12) & 1) << 5) | (((insn >> 4) & 7) << 2) | (((insn >> 2) & 3) << 6);
+                return encI(rd, 2, 2, imm, 0x03);
             }
-            case 3: { // C.LDSP
-                const imm = (((insn >> 12) & 1) << 5) | (((insn >> 4) & 7) << 6) | (((insn >> 2) & 3) << 3);
-                return encI(rd, 2, 3, imm);
+            case 3: { // C.LDSP (uimm[5]=inst[12], uimm[4:3]=inst[6:5], uimm[8:6]=inst[4:2])
+                if (rd === 0) return null;
+                const imm = (((insn >> 12) & 1) << 5) | (((insn >> 5) & 3) << 3) | (((insn >> 2) & 7) << 6);
+                return encI(rd, 2, 3, imm, 0x03);
             }
             case 4: { // C.JR / C.MV / C.EBREAK / C.JALR / C.ADD
                 const bit12 = (insn >> 12) & 1;
@@ -163,12 +171,12 @@ function expandCompressed(insn) {
                 if (rs2 !== 0 && rs1 !== 0) return encR(rs1, rs1, rs2, 0, 0); // C.ADD
                 return null;
             }
-            case 6: { // C.SWSP
-                const imm = (((insn >> 12) & 1) << 5) | (((insn >> 7) & 7) << 6) | (((insn >> 9) & 3) << 2);
+            case 6: { // C.SWSP (uimm[5:2]=inst[12:9], uimm[7:6]=inst[8:7])
+                const imm = (((insn >> 9) & 0xf) << 2) | (((insn >> 7) & 3) << 6);
                 return encS(2, rs2, 2, imm);
             }
-            case 7: { // C.SDSP
-                const imm = (((insn >> 12) & 1) << 5) | (((insn >> 7) & 7) << 6) | (((insn >> 9) & 3) << 3);
+            case 7: { // C.SDSP (uimm[5:3]=inst[12:10], uimm[8:6]=inst[9:7])
+                const imm = (((insn >> 10) & 7) << 3) | (((insn >> 7) & 7) << 6);
                 return encS(2, rs2, 3, imm);
             }
             default:

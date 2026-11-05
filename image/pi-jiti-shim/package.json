@@ -1,0 +1,10 @@
+{
+  "name": "jiti",
+  "version": "2.7.0-agentvm.1",
+  "description": "AgentVM jiti shim: esbuild transform instead of bundled Babel",
+  "main": "index.cjs",
+  "exports": {
+    ".": { "require": "./index.cjs", "import": "./index.mjs" },
+    "./static": { "import": "./static.mjs" }
+  }
+}

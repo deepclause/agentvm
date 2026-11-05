@@ -1,0 +1,40 @@
+Accept (no-op) mode changes on the 9p mount instead of failing.
+
+TinyEMU's 9p server `fs_setattr` returned `P9_ENOTSUP` for `P9_SETATTR_MODE`,
+and `chmod(2)` is a wasi-libc stub anyway (WASI preview1 has no chmod). Guests
+therefore saw `chmod` fail with "Protocol error" (EPROTO) on `/workspace`, which
+breaks ordinary tooling — npm's `node_modules/.bin/*` shims, `git`, `install`,
+etc.
+
+Making the mode branch succeed is safe on this mount: the Linux 9p client
+updates the guest inode's in-memory mode from the request, and that is what the
+guest's permission/exec checks consult (the host mode bits behind the WASI
+preopen are not meaningful — creation mode bits are already dropped). The
+`ctime_updated` flag also short-circuits the `P9_SETATTR_CTIME` branch, which
+had the same `P9_ENOTSUP` stub.
+
+The `P9_SETATTR_UID|GID` (chown) branch is left as-is; extend the same way only
+if a workload needs `chown`.
+
+diff --git a/fs_disk.c b/fs_disk.c
+--- a/fs_disk.c
++++ b/fs_disk.c
+@@ -582,10 +582,14 @@
+     }
+     /* must be done after uid change for suid */
+     if (mask & P9_SETATTR_MODE) {
+-        return P9_ENOTSUP; // TODO
+-//        if (chmod(f->path, mode) < 0)
+-//            return -errno_to_p9(errno);
+-//        ctime_updated = TRUE;
++        /* WASI preview1 has no chmod (wasi-libc stubs it with ENOTSUP), so a
++           real chmod() cannot be issued here. Accept the request instead of
++           failing with P9_ENOTSUP: the Linux 9p client updates the guest
++           inode's in-memory mode from the request, which is what permission
++           and exec checks use. Tools that chmod on the mount (npm's
++           node_modules/.bin/*, git, install, ...) therefore work instead of
++           failing with "Protocol error". */
++        ctime_updated = TRUE;
+     }
+     if (mask & P9_SETATTR_SIZE) {
+         if (truncate(f->path, size) < 0)

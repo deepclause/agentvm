@@ -1,0 +1,145 @@
+diff --git a/riscv_cpu.c b/riscv_cpu.c
+index 4386ce4..6bb513b 100644
+--- a/riscv_cpu.c
++++ b/riscv_cpu.c
+@@ -1340,6 +1340,120 @@ static inline uint32_t remu32(uint32_t a, uint32_t b)
+ }
+ #endif
+ 
++/*
++ * Paravirtual bulk-memory acceleration.
++ *
++ * A custom-0 instruction (opcode 0x0b) with funct7 == PV_TAG is treated as a
++ * hypercall into the emulator. Arguments are passed in the standard ABI
++ * argument registers a0..a2 (x10..x12); the result is returned in a0:
++ *
++ *     0  success
++ *     1  unsupported / not plain RAM -> caller must run the software path
++ *
++ * The guest only uses this for semantically trivial data movement (page
++ * clear/copy, bulk memset/memcpy) where the emulator can touch guest RAM
++ * directly instead of interpreting hundreds of loads/stores. Everything the
++ * guest can observe is identical: the emulator writes the very same guest
++ * physical memory.
++ */
++#ifdef CONFIG_PV_ACCEL
++#define PV_TAG           0x70
++#define PV_OP_MEMSET     0
++#define PV_OP_MEMCPY     1
++#define PV_OP_CLEAR_PAGE 2
++#define PV_OP_COPY_PAGE  3
++
++#define PV_MAX_BYTES     (64 * 1024)
++#define PV_PAGE_SIZE     (1 << PG_SHIFT)
++
++/* memset a guest virtual range. Returns 0 on success, 1 to fall back. */
++static long pv_memset_guest(RISCVCPUState *s, target_ulong dst,
++                            uint8_t val, size_t len)
++{
++    while (len > 0) {
++        target_ulong paddr;
++        PhysMemoryRange *pr;
++        size_t chunk;
++
++        if (get_phys_addr(s, &paddr, dst, ACCESS_WRITE))
++            return 1;
++        pr = get_phys_mem_range(s->mem_map, paddr);
++        if (!pr || !pr->is_ram)
++            return 1;
++        chunk = PV_PAGE_SIZE - (size_t)(paddr & (PV_PAGE_SIZE - 1));
++        if (chunk > len)
++            chunk = len;
++        memset(pr->phys_mem + (uintptr_t)(paddr - pr->addr), val, chunk);
++        phys_mem_set_dirty_bit(pr, paddr - pr->addr);
++        dst += chunk;
++        len -= chunk;
++    }
++    return 0;
++}
++
++/* copy a guest virtual range. Returns 0 on success, 1 to fall back. */
++static long pv_memcpy_guest(RISCVCPUState *s, target_ulong dst,
++                            target_ulong src, size_t len)
++{
++    while (len > 0) {
++        target_ulong pd, ps;
++        PhysMemoryRange *prd, *prs;
++        size_t cd, cs, chunk;
++
++        if (get_phys_addr(s, &pd, dst, ACCESS_WRITE))
++            return 1;
++        if (get_phys_addr(s, &ps, src, ACCESS_READ))
++            return 1;
++        prd = get_phys_mem_range(s->mem_map, pd);
++        prs = get_phys_mem_range(s->mem_map, ps);
++        if (!prd || !prd->is_ram || !prs || !prs->is_ram)
++            return 1;
++        cd = PV_PAGE_SIZE - (size_t)(pd & (PV_PAGE_SIZE - 1));
++        cs = PV_PAGE_SIZE - (size_t)(ps & (PV_PAGE_SIZE - 1));
++        chunk = cd < cs ? cd : cs;
++        if (chunk > len)
++            chunk = len;
++        memcpy(prd->phys_mem + (uintptr_t)(pd - prd->addr),
++               prs->phys_mem + (uintptr_t)(ps - prs->addr), chunk);
++        phys_mem_set_dirty_bit(prd, pd - prd->addr);
++        dst += chunk;
++        src += chunk;
++        len -= chunk;
++    }
++    return 0;
++}
++
++/* Called from the interpreter for custom-0 with funct7 == PV_TAG. */
++static void pv_dispatch(RISCVCPUState *s, uint32_t insn)
++{
++    uint32_t op = (insn >> 12) & 7;
++    target_ulong a0 = s->reg[10];
++    target_ulong a1 = s->reg[11];
++    target_ulong a2 = s->reg[12];
++    long ret = 1;
++
++    switch (op) {
++    case PV_OP_MEMSET:
++        if (a2 <= PV_MAX_BYTES)
++            ret = pv_memset_guest(s, a0, (uint8_t)a1, (size_t)a2);
++        break;
++    case PV_OP_MEMCPY:
++        if (a2 <= PV_MAX_BYTES)
++            ret = pv_memcpy_guest(s, a0, a1, (size_t)a2);
++        break;
++    case PV_OP_CLEAR_PAGE:
++        ret = pv_memset_guest(s, a0, 0, PV_PAGE_SIZE);
++        break;
++    case PV_OP_COPY_PAGE:
++        ret = pv_memcpy_guest(s, a0, a1, PV_PAGE_SIZE);
++        break;
++    default:
++        break;
++    }
++    s->reg[10] = (target_ulong)ret;
++}
++#endif /* CONFIG_PV_ACCEL */
++
+ #ifndef CONFIG_RISCV_ONLY_64
+ #define XLEN 32
+ #include "riscv_cpu_template.h"
+diff --git a/riscv_cpu_template.h b/riscv_cpu_template.h
+index 24f7b81..f4a78c5 100644
+--- a/riscv_cpu_template.h
++++ b/riscv_cpu_template.h
+@@ -1727,6 +1727,15 @@ static void no_inline glue(riscv_cpu_interp_x, XLEN)(RISCVCPUState *s,
+                 goto illegal_insn;
+             }
+             NEXT_INSN;
++#endif
++#ifdef CONFIG_PV_ACCEL
++        case 0x0b: /* custom-0: paravirtual bulk-memory hypercall */
++            if (((insn >> 25) & 0x7f) == PV_TAG) {
++                pv_dispatch(s, insn);
++                code_ptr += 4;
++                break;
++            }
++            goto illegal_insn;
+ #endif
+         default:
+             goto illegal_insn;
